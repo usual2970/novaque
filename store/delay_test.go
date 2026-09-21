@@ -26,14 +26,14 @@ func TestValidatePublishDelay(t *testing.T) {
 	})
 
 	t.Run("over max", func(t *testing.T) {
-		err := ValidatePublishDelay(PublishOpts{Delay: MaxDelay + time.Second, TTL: 61 * 24 * time.Hour}, now)
+		err := ValidatePublishDelay(PublishOpts{Delay: MaxDelay + time.Second, TTL: 91 * 24 * time.Hour}, now)
 		if !errors.Is(err, ErrDelayTooLong) {
 			t.Fatalf("got %v", err)
 		}
 	})
 
 	t.Run("max delay with longer ttl ok", func(t *testing.T) {
-		err := ValidatePublishDelay(PublishOpts{Delay: MaxDelay, TTL: 61 * 24 * time.Hour}, now)
+		err := ValidatePublishDelay(PublishOpts{Delay: MaxDelay, TTL: 91 * 24 * time.Hour}, now)
 		if err != nil {
 			t.Fatal(err)
 		}

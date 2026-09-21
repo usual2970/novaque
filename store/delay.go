@@ -7,7 +7,7 @@ import (
 )
 
 // MaxDelay is the maximum relative publish delay (NSQ-style deferred publish cap).
-const MaxDelay = 60 * 24 * time.Hour
+const MaxDelay = 90 * 24 * time.Hour
 
 // DefaultPublishTTL matches the MySQL driver's fallback when TTL and ExpiresAt are unset.
 const DefaultPublishTTL = 7 * 24 * time.Hour

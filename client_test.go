@@ -194,7 +194,7 @@ func TestPublishDelayValidation(t *testing.T) {
 		}
 		_, err = c.Publish(ctx, "t", []byte("x"), novaque.PublishOpts{
 			Delay: novaque.MaxDelay + time.Second,
-			TTL:   61 * 24 * time.Hour,
+			TTL:   91 * 24 * time.Hour,
 		})
 		if !errors.Is(err, novaque.ErrDelayTooLong) {
 			t.Fatalf("got %v", err)
@@ -242,7 +242,7 @@ func TestPublishDelayValidation(t *testing.T) {
 		}
 		_, err = c.Publish(ctx, "t", []byte("x"), novaque.PublishOpts{
 			Delay: novaque.MaxDelay,
-			TTL:   61 * 24 * time.Hour,
+			TTL:   91 * 24 * time.Hour,
 		})
 		if err != nil {
 			t.Fatal(err)
