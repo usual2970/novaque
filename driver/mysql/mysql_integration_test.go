@@ -149,7 +149,7 @@ func TestClaimCompeteAndLeaseRedelivery(t *testing.T) {
 	}
 
 	d := c1[0]
-	time.Sleep(1200 * time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 	if _, err := s.ReapExpiredLeases(ctx, 100); err != nil {
 		t.Fatal(err)
 	}

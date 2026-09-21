@@ -22,10 +22,7 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 	if leaseFor <= 0 {
 		leaseFor = 30 * time.Second
 	}
-	leaseSeconds := int64(leaseFor / time.Second)
-	if leaseSeconds < 1 {
-		leaseSeconds = 1
-	}
+	leaseSec := durationSec(leaseFor)
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -39,8 +36,8 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 		FROM novaque_deliveries
 		WHERE channel_id = ?
 		  AND status = ?
-		  AND available_at <= NOW(3)
-		  AND expires_at > NOW(3)
+		  AND available_at <= `+sqlNow+`
+		  AND expires_at > `+sqlNow+`
 		ORDER BY available_at ASC, id ASC
 		LIMIT ?
 		FOR UPDATE SKIP LOCKED`,
@@ -78,9 +75,9 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 			    attempts = attempts + 1,
 			    lease_owner = ?,
 			    lease_token = ?,
-			    lease_until = DATE_ADD(NOW(3), INTERVAL ? SECOND)
+			    lease_until = `+sqlNow+` + ?
 			WHERE id = ? AND status = ?`,
-			store.StatusInFlight, owner, token, leaseSeconds, id, store.StatusPending)
+			store.StatusInFlight, owner, token, leaseSec, id, store.StatusPending)
 		if err != nil {
 			return nil, err
 		}
@@ -124,11 +121,17 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 	byID := make(map[int64]store.Delivery, len(claimedIDs))
 	for bodyRows.Next() {
 		var d store.Delivery
+		var availableSec int64
+		var leaseUntilSec sql.NullInt64
 		if err := bodyRows.Scan(
 			&d.ID, &d.MessageID, &d.ChannelID, &d.Topic, &d.Channel, &d.Body,
-			&d.Status, &d.Attempts, &d.MaxAttempts, &d.LeaseToken, &d.AvailableAt, &d.LeaseUntil,
+			&d.Status, &d.Attempts, &d.MaxAttempts, &d.LeaseToken, &availableSec, &leaseUntilSec,
 		); err != nil {
 			return nil, err
+		}
+		d.AvailableAt = secToTime(availableSec)
+		if leaseUntilSec.Valid {
+			d.LeaseUntil = secToTime(leaseUntilSec.Int64)
 		}
 		if tok, ok := tokens[d.ID]; ok {
 			d.LeaseToken = tok
@@ -191,7 +194,7 @@ func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string
 	if availableAt.IsZero() {
 		res, err = s.db.ExecContext(ctx, `
 			UPDATE novaque_deliveries
-			SET status = ?, available_at = NOW(3),
+			SET status = ?, available_at = `+sqlNow+`,
 			    lease_owner = NULL, lease_token = NULL, lease_until = NULL
 			WHERE id = ? AND lease_token = ? AND status = ?`,
 			store.StatusPending, deliveryID, leaseToken, store.StatusInFlight)
@@ -201,7 +204,7 @@ func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string
 			SET status = ?, available_at = ?,
 			    lease_owner = NULL, lease_token = NULL, lease_until = NULL
 			WHERE id = ? AND lease_token = ? AND status = ?`,
-			store.StatusPending, availableAt.UTC(), deliveryID, leaseToken, store.StatusInFlight)
+			store.StatusPending, timeToSec(availableAt), deliveryID, leaseToken, store.StatusInFlight)
 	}
 	if err != nil {
 		return err

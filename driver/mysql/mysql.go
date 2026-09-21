@@ -60,7 +60,7 @@ func (s *Store) ensureDeliveryExpiresAt(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `
 		ALTER TABLE novaque_deliveries
-		ADD COLUMN expires_at DATETIME(3) NOT NULL DEFAULT '2099-01-01 00:00:00.000' AFTER available_at`); err != nil {
+		ADD COLUMN expires_at BIGINT NOT NULL DEFAULT 0 AFTER available_at`); err != nil {
 		return fmt.Errorf("add deliveries.expires_at: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `
@@ -166,13 +166,9 @@ func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts st
 	var messageID int64
 	switch {
 	case opts.TTL > 0:
-		secs := int64(opts.TTL / time.Second)
-		if secs < 1 {
-			secs = 1
-		}
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO novaque_messages (topic_id, body, expires_at)
-			VALUES (?, ?, DATE_ADD(NOW(3), INTERVAL ? SECOND))`, topicID, body, secs)
+			VALUES (?, ?, `+sqlNow+` + ?)`, topicID, body, durationSec(opts.TTL))
 		if err != nil {
 			return 0, err
 		}
@@ -183,7 +179,7 @@ func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts st
 	case !opts.ExpiresAt.IsZero():
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO novaque_messages (topic_id, body, expires_at) VALUES (?, ?, ?)`,
-			topicID, body, opts.ExpiresAt.UTC())
+			topicID, body, timeToSec(opts.ExpiresAt))
 		if err != nil {
 			return 0, err
 		}
@@ -194,7 +190,7 @@ func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts st
 	default:
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO novaque_messages (topic_id, body, expires_at)
-			VALUES (?, ?, DATE_ADD(NOW(3), INTERVAL ? SECOND))`, topicID, body, int64(7*24*3600))
+			VALUES (?, ?, `+sqlNow+` + ?)`, topicID, body, durationSec(7*24*time.Hour))
 		if err != nil {
 			return 0, err
 		}
@@ -208,7 +204,7 @@ func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts st
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO novaque_deliveries
 		  (message_id, channel_id, status, available_at, attempts, max_attempts, expires_at)
-		SELECT ?, c.id, ?, NOW(3), 0, ?, m.expires_at
+		SELECT ?, c.id, ?, `+sqlNow+`, 0, ?, m.expires_at
 		FROM novaque_channels c
 		INNER JOIN novaque_messages m ON m.id = ?
 		WHERE c.topic_id = ?`,

@@ -1,8 +1,9 @@
 -- novaque MySQL schema (MySQL >= 8.0.1 / InnoDB)
+-- All clocks are Unix seconds (BIGINT), compared against DB time via UNIX_TIMESTAMP().
 CREATE TABLE IF NOT EXISTS novaque_topics (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(64) NOT NULL,
-  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  created_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP()),
   UNIQUE KEY uk_novaque_topics_name (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -10,7 +11,7 @@ CREATE TABLE IF NOT EXISTS novaque_channels (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   topic_id BIGINT NOT NULL,
   name VARCHAR(64) NOT NULL,
-  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  created_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP()),
   UNIQUE KEY uk_novaque_channels_topic_name (topic_id, name),
   CONSTRAINT fk_novaque_channels_topic FOREIGN KEY (topic_id) REFERENCES novaque_topics (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -19,8 +20,8 @@ CREATE TABLE IF NOT EXISTS novaque_messages (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   topic_id BIGINT NOT NULL,
   body LONGBLOB NOT NULL,
-  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  expires_at DATETIME(3) NOT NULL,
+  created_at BIGINT NOT NULL DEFAULT (UNIX_TIMESTAMP()),
+  expires_at BIGINT NOT NULL,
   CONSTRAINT fk_novaque_messages_topic FOREIGN KEY (topic_id) REFERENCES novaque_topics (id),
   KEY idx_novaque_messages_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -31,11 +32,11 @@ CREATE TABLE IF NOT EXISTS novaque_deliveries (
   message_id BIGINT NOT NULL,
   channel_id BIGINT NOT NULL,
   status VARCHAR(16) NOT NULL,
-  available_at DATETIME(3) NOT NULL,
-  expires_at DATETIME(3) NOT NULL,
+  available_at BIGINT NOT NULL,
+  expires_at BIGINT NOT NULL,
   attempts INT NOT NULL DEFAULT 0,
   max_attempts INT NOT NULL,
-  lease_until DATETIME(3) NULL,
+  lease_until BIGINT NULL,
   lease_owner VARCHAR(128) NULL,
   lease_token VARCHAR(64) NULL,
   CONSTRAINT fk_novaque_deliveries_message FOREIGN KEY (message_id) REFERENCES novaque_messages (id) ON DELETE CASCADE,

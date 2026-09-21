@@ -13,9 +13,9 @@ func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error)
 	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE novaque_deliveries
-		SET status = ?, available_at = NOW(3),
+		SET status = ?, available_at = `+sqlNow+`,
 		    lease_owner = NULL, lease_token = NULL, lease_until = NULL
-		WHERE status = ? AND lease_until IS NOT NULL AND lease_until < NOW(3)
+		WHERE status = ? AND lease_until IS NOT NULL AND lease_until < `+sqlNow+`
 		ORDER BY lease_until ASC
 		LIMIT ?`,
 		store.StatusPending, store.StatusInFlight, limit)
@@ -37,10 +37,10 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 		  SELECT id FROM (
 		    SELECT d.id
 		    FROM novaque_deliveries d
-		    WHERE d.expires_at < NOW(3)
+		    WHERE d.expires_at < `+sqlNow+`
 		      AND (
 		        d.status IN (?, ?)
-		        OR (d.status = ? AND (d.lease_until IS NULL OR d.lease_until < NOW(3)))
+		        OR (d.status = ? AND (d.lease_until IS NULL OR d.lease_until < `+sqlNow+`))
 		      )
 		    ORDER BY d.expires_at ASC
 		    LIMIT ?
@@ -58,7 +58,7 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 		  SELECT id FROM (
 		    SELECT m.id
 		    FROM novaque_messages m
-		    WHERE m.expires_at < NOW(3)
+		    WHERE m.expires_at < `+sqlNow+`
 		      AND NOT EXISTS (
 		        SELECT 1 FROM novaque_deliveries d WHERE d.message_id = m.id
 		      )

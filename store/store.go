@@ -32,7 +32,7 @@ type Delivery struct {
 
 // PublishOpts controls per-publish retention and poison caps.
 type PublishOpts struct {
-	// TTL is relative retention from DB NOW(); preferred over ExpiresAt.
+	// TTL is relative retention from DB clock (Unix seconds); preferred over ExpiresAt.
 	TTL time.Duration
 	// ExpiresAt is an absolute expiry; used only when TTL is zero and ExpiresAt is set.
 	ExpiresAt   time.Time
@@ -55,7 +55,7 @@ type Store interface {
 	// Claim leases up to limit eligible deliveries for a known channel id
 	// (callers must EnsureChannel once — Client caches via CachingStore; hot path must not re-resolve names).
 	// Drivers increment attempts on claim; deliveries past MaxAttempts become dead
-	// and are not returned. leaseFor is applied using database time.
+	// and are not returned. leaseFor is applied using database Unix seconds.
 	Claim(ctx context.Context, channelID int64, owner string, leaseFor time.Duration, limit int) ([]Delivery, error)
 
 	// Ack completes a delivery when lease_token still matches.
