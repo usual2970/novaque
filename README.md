@@ -108,6 +108,7 @@ Publisher ──Publish──▶ topic ──fan-out──▶ channel A ──co
 | `ReapInterval` | 1s | expired-lease reaper tick |
 | `PurgeInterval` | 5s | TTL cleanup tick |
 | `MaintenanceBatch` | 100 | rows per reaper/purge pass |
+| `Logger` | zap Nop (silent) | structured operational logs; inject e.g. `Zap(yourZapLogger)` |
 
 ### PublishOpts
 
@@ -122,6 +123,23 @@ Publisher ──Publish──▶ topic ──fan-out──▶ channel A ──co
 Example: a 2-day delay needs an explicit TTL longer than 2 days (default TTL is 7d, so omit is fine; an 8-day delay needs `TTL` > 8d).
 
 Size `*sql.DB` `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroom. Use a **primary-writable** DSN (no read replicas) for claim/ack/publish.
+
+### Logging
+
+`Options.Logger` takes the public `Logger` interface — `Debug`/`Info`/`Warn`/`Error(msg, ...zap.Field)` plus `With` for child loggers. When unset, novaque binds a **silent `zap.NewNop()` default**: the library produces no console noise until you inject one.
+
+```go
+client, err := novaque.Open(mysqldriver.New(db), novaque.Options{
+	Logger: novaque.Zap(zapLogger), // adapt your configured *zap.Logger
+})
+```
+
+- **Lifecycle `Info`** — Client and Consumer Start/Shutdown, once per actual transition (duplicate Start / Shutdown-when-not-started stay silent).
+- **Hot path `Debug`** — successful publish (`topic`, `message_id`) and non-empty claim (`topic`, `channel`, `count`). Expect high volume if you enable Debug in production.
+- **`Error` only for swallowed failures** — claim backoff, reap, purge, and final ack/requeue after retries. Errors returned to your caller (e.g. Publish) are not duplicate-logged; shutdown cancels are silent.
+- **Payload privacy** — message bodies are **never logged**; only ids, topic, channel, counts, and errors.
+
+The quick start's stdlib `log.Printf` is caller-side printing, separate from this library logging.
 
 ## Guarantees
 
@@ -140,6 +158,7 @@ Size `*sql.DB` `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroo
 ```
 novaque/
   client.go           # Client, Consumer, Publish / Subscribe
+  logger.go           # Logger interface, zap adapter, silent Nop default
   store/
     store.go          # Store interface (dialect-agnostic)
     cached.go         # WithCache — memoize EnsureTopic / EnsureChannel
@@ -176,6 +195,6 @@ Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
 ## Status / non-goals
 
-Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, loadtest.
+Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), loadtest.
 
 Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, admin UI, deferred requeue/backoff.
