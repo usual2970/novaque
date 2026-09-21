@@ -41,39 +41,10 @@ type fakeStore struct {
 	claimN      int
 }
 
-func (f *fakeStore) setFailClaim(v bool) {
+// setFlag flips a failure/block toggle under mu (toggles are read by client loops).
+func (f *fakeStore) setFlag(flag *bool, v bool) {
 	f.mu.Lock()
-	f.failClaim = v
-	f.mu.Unlock()
-}
-
-func (f *fakeStore) setClaimBlock(v bool) {
-	f.mu.Lock()
-	f.claimBlock = v
-	f.mu.Unlock()
-}
-
-func (f *fakeStore) setFailAck(v bool) {
-	f.mu.Lock()
-	f.failAck = v
-	f.mu.Unlock()
-}
-
-func (f *fakeStore) setFailRequeue(v bool) {
-	f.mu.Lock()
-	f.failRequeue = v
-	f.mu.Unlock()
-}
-
-func (f *fakeStore) setFailReap(v bool) {
-	f.mu.Lock()
-	f.failReap = v
-	f.mu.Unlock()
-}
-
-func (f *fakeStore) setFailPurge(v bool) {
-	f.mu.Lock()
-	f.failPurge = v
+	*flag = v
 	f.mu.Unlock()
 }
 
@@ -734,7 +705,7 @@ func TestClaimLogsDebugOnceAndSilentWhenEmpty(t *testing.T) {
 func TestClaimErrorLogsErrorThenRecovers(t *testing.T) {
 	ctx := context.Background()
 	f := newFake()
-	f.setFailClaim(true)
+	f.setFlag(&f.failClaim, true)
 	spy := newSpyLogger()
 	c, err := novaque.Open(f, novaque.Options{Logger: spy, PollInterval: 5 * time.Millisecond})
 	if err != nil {
@@ -754,7 +725,7 @@ func TestClaimErrorLogsErrorThenRecovers(t *testing.T) {
 	})
 
 	// Flip back to healthy and queue work: a later claim must succeed.
-	f.setFailClaim(false)
+	f.setFlag(&f.failClaim, false)
 	f.enqueueClaim(delivery(50, "jobs", "worker"))
 	waitFor(t, 5*time.Second, "claim Debug after recovery", func() bool {
 		return spy.sink.count("debug", "claimed") >= 1
@@ -770,7 +741,7 @@ func TestClaimErrorLogsErrorThenRecovers(t *testing.T) {
 func TestAckFailureAfterRetriesLogsError(t *testing.T) {
 	ctx := context.Background()
 	f := newFake()
-	f.setFailAck(true)
+	f.setFlag(&f.failAck, true)
 	spy := newSpyLogger()
 	c, err := novaque.Open(f, novaque.Options{Logger: spy, PollInterval: 5 * time.Millisecond})
 	if err != nil {
@@ -812,7 +783,7 @@ func TestAckFailureAfterRetriesLogsError(t *testing.T) {
 func TestRequeueFailureAfterRetriesLogsError(t *testing.T) {
 	ctx := context.Background()
 	f := newFake()
-	f.setFailRequeue(true)
+	f.setFlag(&f.failRequeue, true)
 	spy := newSpyLogger()
 	c, err := novaque.Open(f, novaque.Options{Logger: spy, PollInterval: 5 * time.Millisecond})
 	if err != nil {
@@ -882,8 +853,8 @@ func TestPublishErrorReturnedNotErrorLogged(t *testing.T) {
 func TestReapAndPurgeErrorsLogged(t *testing.T) {
 	ctx := context.Background()
 	f := newFake()
-	f.setFailReap(true)
-	f.setFailPurge(true)
+	f.setFlag(&f.failReap, true)
+	f.setFlag(&f.failPurge, true)
 	spy := newSpyLogger()
 	c, err := novaque.Open(f, novaque.Options{
 		Logger:        spy,
@@ -911,7 +882,7 @@ func TestReapAndPurgeErrorsLogged(t *testing.T) {
 func TestCanceledContextClaimErrorNotLogged(t *testing.T) {
 	ctx := context.Background()
 	f := newFake()
-	f.setClaimBlock(true) // Claim blocks until ctx is done, then returns ctx.Err()
+	f.setFlag(&f.claimBlock, true) // Claim blocks until ctx is done, then returns ctx.Err()
 	spy := newSpyLogger()
 	c, err := novaque.Open(f, novaque.Options{Logger: spy, PollInterval: 5 * time.Millisecond})
 	if err != nil {

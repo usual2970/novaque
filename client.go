@@ -66,7 +66,6 @@ func (o Options) withDefaults() Options {
 type Client struct {
 	store store.Store
 	opts  Options
-	log   Logger
 
 	mu      sync.Mutex
 	started bool
@@ -76,10 +75,10 @@ type Client struct {
 
 // logger returns the Client's Logger; never nil (silent Nop fallback).
 func (c *Client) logger() Logger {
-	if c.log == nil {
+	if c.opts.Logger == nil {
 		return defaultLogger()
 	}
-	return c.log
+	return c.opts.Logger
 }
 
 // Open constructs a Client from any Store implementation (e.g. mysql.New(db)).
@@ -88,8 +87,7 @@ func Open(s store.Store, opts Options) (*Client, error) {
 	if s == nil {
 		return nil, errors.New("novaque: store is nil")
 	}
-	o := opts.withDefaults()
-	return &Client{store: store.WithCache(s), opts: o, log: o.Logger}, nil
+	return &Client{store: store.WithCache(s), opts: opts.withDefaults()}, nil
 }
 
 // Migrate applies the store's schema.
@@ -320,10 +318,15 @@ func (co *Consumer) Start(ctx context.Context) error {
 	co.mu.Unlock()
 
 	// Log after the transition and outside the mutex: duplicate Start stays silent.
-	co.client.logger().Info("consumer started",
+	co.logger().Info("consumer started")
+	return nil
+}
+
+// logger returns a child Logger tagged with this Consumer's topic/channel.
+func (co *Consumer) logger() Logger {
+	return co.client.logger().With(
 		zap.String("topic", co.topic),
 		zap.String("channel", co.channel))
-	return nil
 }
 
 // Shutdown stops the poller and waits for in-flight handlers.
@@ -346,9 +349,7 @@ func (co *Consumer) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
-		co.client.logger().Info("consumer shutdown",
-			zap.String("topic", co.topic),
-			zap.String("channel", co.channel))
+		co.logger().Info("consumer shutdown")
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -361,9 +362,7 @@ func (co *Consumer) pollLoop(ctx context.Context, work chan<- store.Delivery, ma
 
 	base := co.client.opts.PollInterval
 	owner := co.owner + "#poller"
-	lg := co.client.logger().With(
-		zap.String("topic", co.topic),
-		zap.String("channel", co.channel))
+	lg := co.logger()
 	for {
 		select {
 		case <-ctx.Done():
@@ -445,10 +444,7 @@ func (co *Consumer) dispatch(d store.Delivery) {
 			return co.client.store.Ack(ctx, msg.deliveryID, msg.leaseToken)
 		}); ferr != nil {
 			// Swallowed failure after retries (or ackCtx deadline).
-			co.client.logger().Error("ack failed",
-				zap.String("op", "ack"),
-				zap.Int64("delivery_id", msg.deliveryID),
-				zap.NamedError("err", ferr))
+			logFinishError(co.client.logger(), "ack failed", "ack", msg.deliveryID, ferr)
 		}
 		return
 	}
@@ -457,11 +453,16 @@ func (co *Consumer) dispatch(d store.Delivery) {
 	}); ferr != nil {
 		// Swallowed failure after retries (or ackCtx deadline). The handler's own
 		// error is intentionally not logged; only the Requeue failure is.
-		co.client.logger().Error("requeue failed",
-			zap.String("op", "requeue"),
-			zap.Int64("delivery_id", msg.deliveryID),
-			zap.NamedError("err", ferr))
+		logFinishError(co.client.logger(), "requeue failed", "requeue", msg.deliveryID, ferr)
 	}
+}
+
+// logFinishError reports a swallowed ack/requeue failure after retries.
+func logFinishError(lg Logger, msg, op string, deliveryID int64, err error) {
+	lg.Error(msg,
+		zap.String("op", op),
+		zap.Int64("delivery_id", deliveryID),
+		zap.NamedError("err", err))
 }
 
 func finishWithRetry(ctx context.Context, fn func(context.Context) error) error {
