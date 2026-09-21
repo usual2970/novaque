@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/usual2970/novaque/store"
 )
 
@@ -98,8 +100,8 @@ func (c *Client) Migrate(ctx context.Context) error {
 // Start begins shared reaper and TTL maintenance loops (exactly once per Client).
 func (c *Client) Start(ctx context.Context) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.started {
+		c.mu.Unlock()
 		return nil
 	}
 	base := ctx
@@ -113,6 +115,10 @@ func (c *Client) Start(ctx context.Context) error {
 	c.wg.Add(2)
 	go c.loopReap(runCtx)
 	go c.loopPurge(runCtx)
+	c.mu.Unlock()
+
+	// Log after the transition and outside the mutex: duplicate Start stays silent.
+	c.logger().Info("client started")
 	return nil
 }
 
@@ -137,6 +143,7 @@ func (c *Client) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		c.logger().Info("client shutdown")
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -152,7 +159,10 @@ func (c *Client) loopReap(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_, _ = c.store.ReapExpiredLeases(ctx, c.opts.MaintenanceBatch)
+			if _, err := c.store.ReapExpiredLeases(ctx, c.opts.MaintenanceBatch); err != nil && ctx.Err() == nil {
+				// Swallowed failure: only surface when not caused by shutdown cancel.
+				c.logger().Error("reap failed", zap.String("op", "reap"), zap.NamedError("err", err))
+			}
 		}
 	}
 }
@@ -166,7 +176,10 @@ func (c *Client) loopPurge(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_, _ = c.store.PurgeExpired(ctx, c.opts.MaintenanceBatch)
+			if _, err := c.store.PurgeExpired(ctx, c.opts.MaintenanceBatch); err != nil && ctx.Err() == nil {
+				// Swallowed failure: only surface when not caused by shutdown cancel.
+				c.logger().Error("purge failed", zap.String("op", "purge"), zap.NamedError("err", err))
+			}
 		}
 	}
 }
@@ -212,6 +225,7 @@ func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts Pu
 	if err != nil {
 		return 0, fmt.Errorf("novaque publish: %w", err)
 	}
+	c.logger().Debug("published", zap.String("topic", topic), zap.Int64("message_id", id))
 	return id, nil
 }
 
@@ -281,8 +295,8 @@ func (c *Client) SubscribeAndStart(ctx context.Context, topic, channel string, h
 // Start launches one batch poller and MaxInFlight handler workers.
 func (co *Consumer) Start(ctx context.Context) error {
 	co.mu.Lock()
-	defer co.mu.Unlock()
 	if co.started {
+		co.mu.Unlock()
 		return nil
 	}
 	base := ctx
@@ -303,6 +317,12 @@ func (co *Consumer) Start(ctx context.Context) error {
 		go co.handleLoop(runCtx, work)
 	}
 	go co.pollLoop(runCtx, work, n)
+	co.mu.Unlock()
+
+	// Log after the transition and outside the mutex: duplicate Start stays silent.
+	co.client.logger().Info("consumer started",
+		zap.String("topic", co.topic),
+		zap.String("channel", co.channel))
 	return nil
 }
 
@@ -326,6 +346,9 @@ func (co *Consumer) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		co.client.logger().Info("consumer shutdown",
+			zap.String("topic", co.topic),
+			zap.String("channel", co.channel))
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -338,6 +361,9 @@ func (co *Consumer) pollLoop(ctx context.Context, work chan<- store.Delivery, ma
 
 	base := co.client.opts.PollInterval
 	owner := co.owner + "#poller"
+	lg := co.client.logger().With(
+		zap.String("topic", co.topic),
+		zap.String("channel", co.channel))
 	for {
 		select {
 		case <-ctx.Done():
@@ -357,6 +383,10 @@ func (co *Consumer) pollLoop(ctx context.Context, work chan<- store.Delivery, ma
 
 		claimed, err := co.client.store.Claim(ctx, co.channelID, owner, co.client.opts.DefaultLease, free)
 		if err != nil {
+			// Swallowed failure: skip Error when caused by shutdown cancel (noise).
+			if ctx.Err() == nil {
+				lg.Error("claim failed", zap.String("op", "claim"), zap.NamedError("err", err))
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -372,6 +402,7 @@ func (co *Consumer) pollLoop(ctx context.Context, work chan<- store.Delivery, ma
 			}
 			continue
 		}
+		lg.Debug("claimed", zap.Int("count", len(claimed)))
 		for _, d := range claimed {
 			select {
 			case <-ctx.Done():
@@ -410,14 +441,27 @@ func (co *Consumer) dispatch(d store.Delivery) {
 	ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer ackCancel()
 	if err == nil {
-		_ = finishWithRetry(ackCtx, func(ctx context.Context) error {
+		if ferr := finishWithRetry(ackCtx, func(ctx context.Context) error {
 			return co.client.store.Ack(ctx, msg.deliveryID, msg.leaseToken)
-		})
+		}); ferr != nil {
+			// Swallowed failure after retries (or ackCtx deadline).
+			co.client.logger().Error("ack failed",
+				zap.String("op", "ack"),
+				zap.Int64("delivery_id", msg.deliveryID),
+				zap.NamedError("err", ferr))
+		}
 		return
 	}
-	_ = finishWithRetry(ackCtx, func(ctx context.Context) error {
+	if ferr := finishWithRetry(ackCtx, func(ctx context.Context) error {
 		return co.client.store.Requeue(ctx, msg.deliveryID, msg.leaseToken, time.Time{})
-	})
+	}); ferr != nil {
+		// Swallowed failure after retries (or ackCtx deadline). The handler's own
+		// error is intentionally not logged; only the Requeue failure is.
+		co.client.logger().Error("requeue failed",
+			zap.String("op", "requeue"),
+			zap.Int64("delivery_id", msg.deliveryID),
+			zap.NamedError("err", ferr))
+	}
 }
 
 func finishWithRetry(ctx context.Context, fn func(context.Context) error) error {
