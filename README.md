@@ -65,6 +65,19 @@ func main() {
 }
 ```
 
+## Local load test
+
+```bash
+# starts MySQL 8 via Docker/testcontainers
+go run ./cmd/loadtest
+
+# or point at an existing instance
+NOVAQUE_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/novaque?parseTime=true&loc=UTC' \
+  go run ./cmd/loadtest -n 10000 -publishers 8 -max-inflight 32
+```
+
+Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
+
 ## Guarantees (MVP)
 
 | Behavior | Contract |
