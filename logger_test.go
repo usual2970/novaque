@@ -33,6 +33,17 @@ func (nopStore) Ack(context.Context, int64, string) error                { retur
 func (nopStore) Requeue(context.Context, int64, string, time.Time) error { return nil }
 func (nopStore) ReapExpiredLeases(context.Context, int) (int64, error)   { return 0, nil }
 func (nopStore) PurgeExpired(context.Context, int) (int64, error)        { return 0, nil }
+func (nopStore) ChannelCounters(context.Context, int64) (store.ChannelCounters, error) {
+	return store.ChannelCounters{}, nil
+}
+func (nopStore) TopicCounters(context.Context, int64) (store.ChannelCounters, error) {
+	return store.ChannelCounters{}, nil
+}
+func (nopStore) ChannelBacklog(context.Context, int64) (store.ChannelBacklog, error) {
+	return store.ChannelBacklog{}, nil
+}
+func (nopStore) PruneStats(context.Context, int) (int64, error) { return 0, nil }
+func (nopStore) FlushStats(context.Context) error               { return nil }
 
 // recEntry is one recorded call on a recordingLogger.
 type recEntry struct {

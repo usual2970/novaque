@@ -87,3 +87,25 @@ func (c *CachingStore) ReapExpiredLeases(ctx context.Context, limit int) (int64,
 func (c *CachingStore) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 	return c.Inner.PurgeExpired(ctx, limit)
 }
+
+// Stats reads, backlog counts, and prune are pure passthroughs: counters and
+// delivery rows mutate constantly, so CachingStore must never memoize them.
+func (c *CachingStore) ChannelCounters(ctx context.Context, channelID int64) (ChannelCounters, error) {
+	return c.Inner.ChannelCounters(ctx, channelID)
+}
+
+func (c *CachingStore) TopicCounters(ctx context.Context, topicID int64) (ChannelCounters, error) {
+	return c.Inner.TopicCounters(ctx, topicID)
+}
+
+func (c *CachingStore) ChannelBacklog(ctx context.Context, channelID int64) (ChannelBacklog, error) {
+	return c.Inner.ChannelBacklog(ctx, channelID)
+}
+
+func (c *CachingStore) PruneStats(ctx context.Context, retentionDays int) (int64, error) {
+	return c.Inner.PruneStats(ctx, retentionDays)
+}
+
+func (c *CachingStore) FlushStats(ctx context.Context) error {
+	return c.Inner.FlushStats(ctx)
+}

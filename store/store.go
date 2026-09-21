@@ -42,6 +42,29 @@ type PublishOpts struct {
 	MaxAttempts int // zero = driver/client default
 }
 
+// ChannelCounters are summed day-bucket event counters (UTC) for one channel
+// or topic. Values only grow within a retained day and may fall when the
+// retention prune removes old day buckets; they are never decremented by
+// ack deletes or message TTL purges.
+type ChannelCounters struct {
+	Publish int64
+	Claim   int64
+	Ack     int64
+	Requeue int64
+	Dead    int64
+	Purge   int64
+}
+
+// ChannelBacklog is a live snapshot of delivery row counts for one channel.
+// Ready is the claimable slice of Pending (delayed publishes count as Pending
+// only until available_at passes the DB clock).
+type ChannelBacklog struct {
+	Pending  int64
+	Ready    int64
+	InFlight int64
+	Dead     int64
+}
+
 // Store is the persistence seam used by Client, Consumer, and maintenance loops.
 // Method names must stay dialect-agnostic (no SKIP LOCKED / MySQL identifiers).
 type Store interface {
@@ -72,4 +95,28 @@ type Store interface {
 
 	// PurgeExpired deletes expired messages and their non-live deliveries.
 	PurgeExpired(ctx context.Context, limit int) (affected int64, err error)
+
+	// ChannelCounters sums the retained day-bucket event counters for one
+	// channel (channelID must come from EnsureChannel). Zero counters are
+	// returned for a channel with no recorded events.
+	ChannelCounters(ctx context.Context, channelID int64) (ChannelCounters, error)
+
+	// TopicCounters rolls up the retained day-bucket event counters over every
+	// row stored for a topic (per-channel rows plus the zero-channel sentinel
+	// row that records zero-channel publishes), so a plain SUM is correct.
+	TopicCounters(ctx context.Context, topicID int64) (ChannelCounters, error)
+
+	// ChannelBacklog returns live pending / ready / in_flight / dead delivery
+	// counts for one channel (channelID must come from EnsureChannel).
+	ChannelBacklog(ctx context.Context, channelID int64) (ChannelBacklog, error)
+
+	// PruneStats deletes day-bucket counter rows older than retentionDays
+	// (UTC days, boundary from the DB clock) and returns rows deleted.
+	PruneStats(ctx context.Context, retentionDays int) (deleted int64, err error)
+
+	// FlushStats drains any buffered counter deltas into the stats table.
+	// Drivers may buffer increments in-process and apply them in batches
+	// instead of writing counters inside mutation transactions; a no-op
+	// return is valid when nothing is buffered.
+	FlushStats(ctx context.Context) error
 }

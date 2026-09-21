@@ -185,6 +185,19 @@ func (f *fakeStore) PurgeExpired(context.Context, int) (int64, error) {
 	return 0, nil
 }
 
+// Stats stubs: reads return zero values until Client wiring (U3) needs more.
+func (f *fakeStore) ChannelCounters(context.Context, int64) (store.ChannelCounters, error) {
+	return store.ChannelCounters{}, nil
+}
+func (f *fakeStore) TopicCounters(context.Context, int64) (store.ChannelCounters, error) {
+	return store.ChannelCounters{}, nil
+}
+func (f *fakeStore) ChannelBacklog(context.Context, int64) (store.ChannelBacklog, error) {
+	return store.ChannelBacklog{}, nil
+}
+func (f *fakeStore) PruneStats(context.Context, int) (int64, error) { return 0, nil }
+func (f *fakeStore) FlushStats(context.Context) error               { return nil }
+
 func TestOpenRejectsNilStore(t *testing.T) {
 	if _, err := novaque.Open(nil, novaque.Options{}); err == nil {
 		t.Fatal("expected error")

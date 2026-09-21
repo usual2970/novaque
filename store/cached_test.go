@@ -16,6 +16,12 @@ type countingStore struct {
 	topics       sync.Map
 	channels     sync.Map
 	nextID       atomic.Int64
+
+	channelCountersCalls atomic.Int64
+	topicCountersCalls   atomic.Int64
+	backlogCalls         atomic.Int64
+	pruneCalls           atomic.Int64
+	flushCalls           atomic.Int64
 }
 
 func newCounting() *countingStore {
@@ -64,6 +70,27 @@ func (c *countingStore) Requeue(context.Context, int64, string, time.Time) error
 func (c *countingStore) ReapExpiredLeases(context.Context, int) (int64, error) { return 0, nil }
 func (c *countingStore) PurgeExpired(context.Context, int) (int64, error)      { return 0, nil }
 
+func (c *countingStore) ChannelCounters(_ context.Context, channelID int64) (store.ChannelCounters, error) {
+	c.channelCountersCalls.Add(1)
+	return store.ChannelCounters{Publish: channelID}, nil
+}
+func (c *countingStore) TopicCounters(_ context.Context, topicID int64) (store.ChannelCounters, error) {
+	c.topicCountersCalls.Add(1)
+	return store.ChannelCounters{Publish: topicID}, nil
+}
+func (c *countingStore) ChannelBacklog(_ context.Context, channelID int64) (store.ChannelBacklog, error) {
+	c.backlogCalls.Add(1)
+	return store.ChannelBacklog{Pending: channelID}, nil
+}
+func (c *countingStore) PruneStats(_ context.Context, retentionDays int) (int64, error) {
+	c.pruneCalls.Add(1)
+	return int64(retentionDays), nil
+}
+func (c *countingStore) FlushStats(context.Context) error {
+	c.flushCalls.Add(1)
+	return nil
+}
+
 func TestCachingStoreMemoizesEnsure(t *testing.T) {
 	inner := newCounting()
 	s := store.WithCache(inner)
@@ -97,6 +124,49 @@ func TestCachingStoreMemoizesEnsure(t *testing.T) {
 	}
 	if n := inner.channelCalls.Load(); n != 1 {
 		t.Fatalf("EnsureChannel inner calls = %d, want 1", n)
+	}
+}
+
+// TestCachingStorePassesThroughStatsAndBacklog covers R7: stats reads, backlog
+// COUNTs, prune, and flush are never memoized — every call must reach the
+// inner Store.
+func TestCachingStorePassesThroughStatsAndBacklog(t *testing.T) {
+	inner := newCounting()
+	s := store.WithCache(inner)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := s.ChannelCounters(ctx, 7); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.TopicCounters(ctx, 5); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ChannelBacklog(ctx, 7); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.PruneStats(ctx, 30); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.FlushStats(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if n := inner.channelCountersCalls.Load(); n != 2 {
+		t.Fatalf("ChannelCounters inner calls = %d, want 2", n)
+	}
+	if n := inner.topicCountersCalls.Load(); n != 2 {
+		t.Fatalf("TopicCounters inner calls = %d, want 2", n)
+	}
+	if n := inner.backlogCalls.Load(); n != 2 {
+		t.Fatalf("ChannelBacklog inner calls = %d, want 2", n)
+	}
+	if n := inner.pruneCalls.Load(); n != 2 {
+		t.Fatalf("PruneStats inner calls = %d, want 2", n)
+	}
+	if n := inner.flushCalls.Load(); n != 2 {
+		t.Fatalf("FlushStats inner calls = %d, want 2", n)
 	}
 }
 

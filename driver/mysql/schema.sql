@@ -43,3 +43,20 @@ CREATE TABLE IF NOT EXISTS novaque_deliveries (
   CONSTRAINT fk_novaque_deliveries_channel FOREIGN KEY (channel_id) REFERENCES novaque_channels (id),
   KEY idx_novaque_deliveries_claim (channel_id, status, available_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Day-bucket event counters (UTC day; the one non-Unix-second clock on purpose).
+-- channel_id = 0 is the sentinel for topic-only publish rows (zero-channel
+-- publishes); no FK to channels so the sentinel and pruning stay cheap.
+-- The purge counter is the `purged` column (PURGE is reserved in MySQL 8).
+CREATE TABLE IF NOT EXISTS novaque_stats_daily (
+  day_utc DATE NOT NULL,
+  topic_id BIGINT NOT NULL,
+  channel_id BIGINT NOT NULL,
+  publish BIGINT NOT NULL DEFAULT 0,
+  claim BIGINT NOT NULL DEFAULT 0,
+  ack BIGINT NOT NULL DEFAULT 0,
+  requeue BIGINT NOT NULL DEFAULT 0,
+  dead BIGINT NOT NULL DEFAULT 0,
+  purged BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (day_utc, topic_id, channel_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
