@@ -4,12 +4,13 @@ package mysql_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
-	"novaque/driver/mysql"
-	"novaque/internal/testmysql"
-	"novaque/store"
+	"github.com/usual2970/novaque/driver/mysql"
+	"github.com/usual2970/novaque/internal/testmysql"
+	"github.com/usual2970/novaque/store"
 )
 
 func TestMigrateIdempotentAndUniqueChannel(t *testing.T) {
@@ -170,3 +171,115 @@ func TestClaimCompeteAndLeaseRedelivery(t *testing.T) {
 		t.Fatal("expected stale ack to fail")
 	}
 }
+
+func TestPublishDelayClaimAndReject(t *testing.T) {
+	db := testmysql.Open(t)
+	s := mysql.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "delay_" + time.Now().Format("150405.000")
+	aID, err := s.EnsureChannel(ctx, topic, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bID, err := s.EnsureChannel(ctx, topic, "B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.Publish(ctx, topicID, []byte("too-long"), store.PublishOpts{
+		Delay: 8 * 24 * time.Hour,
+		TTL:   7 * 24 * time.Hour,
+	})
+	if !errors.Is(err, store.ErrDelayExceedsTTL) {
+		t.Fatalf("want ErrDelayExceedsTTL, got %v", err)
+	}
+
+	msgID, err := s.Publish(ctx, topicID, []byte("later"), store.PublishOpts{
+		Delay:       2 * time.Second,
+		TTL:         time.Hour,
+		MaxAttempts: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgID == 0 {
+		t.Fatal("expected message id")
+	}
+
+	earlyA, err := s.Claim(ctx, aID, "w1", 10*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlyB, err := s.Claim(ctx, bID, "w1", 10*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(earlyA) != 0 || len(earlyB) != 0 {
+		t.Fatalf("expected empty claims before delay, got A=%d B=%d", len(earlyA), len(earlyB))
+	}
+
+	time.Sleep(2500 * time.Millisecond)
+
+	readyA, err := s.Claim(ctx, aID, "w1", 10*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyB, err := s.Claim(ctx, bID, "w1", 10*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(readyA) != 1 || len(readyB) != 1 {
+		t.Fatalf("want one delivery each after delay, got A=%d B=%d", len(readyA), len(readyB))
+	}
+	if string(readyA[0].Body) != "later" || string(readyB[0].Body) != "later" {
+		t.Fatalf("bodies %#v %#v", readyA[0].Body, readyB[0].Body)
+	}
+
+	// Immediate requeue after delayed claim (AE7).
+	if err := s.Requeue(ctx, readyA[0].ID, readyA[0].LeaseToken, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.Claim(ctx, aID, "w2", 10*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 || again[0].MessageID != readyA[0].MessageID {
+		t.Fatalf("expected immediate reclaim, got %#v", again)
+	}
+}
+
+func TestPublishNoDelayStillImmediate(t *testing.T) {
+	db := testmysql.Open(t)
+	s := mysql.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "nodelay_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish(ctx, topicID, []byte("now"), store.PublishOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Claim(ctx, chID, "w", 10*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want immediate claim, got %d", len(got))
+	}
+}
+

@@ -7,8 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"novaque"
-	"novaque/store"
+	"github.com/usual2970/novaque"
+
+	"github.com/usual2970/novaque/store"
 )
 
 // fakeStore is an in-memory Store for domain unit tests (no MySQL import).
@@ -20,6 +21,8 @@ type fakeStore struct {
 	nextID   int64
 
 	failPublish bool
+	lastOpts    store.PublishOpts
+	publishN    int
 }
 
 type fakeMsg struct {
@@ -67,12 +70,14 @@ func (f *fakeStore) EnsureChannel(ctx context.Context, topic, channel string) (i
 	return id, nil
 }
 
-func (f *fakeStore) Publish(_ context.Context, topicID int64, body []byte, _ store.PublishOpts) (int64, error) {
+func (f *fakeStore) Publish(_ context.Context, topicID int64, body []byte, opts store.PublishOpts) (int64, error) {
 	if f.failPublish {
 		return 0, errors.New("boom")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastOpts = opts
+	f.publishN++
 	var topic string
 	for name, id := range f.topics {
 		if id == topicID {
@@ -140,6 +145,127 @@ func TestPublishErrorSurfaced(t *testing.T) {
 	if _, err := c.Publish(context.Background(), "t", []byte("x"), novaque.PublishOpts{}); err == nil {
 		t.Fatal("expected error")
 	}
+}
+
+func TestPublishDelayValidation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("forwards delay", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Publish(ctx, "t", []byte("x"), novaque.PublishOpts{
+			Delay: time.Hour,
+			TTL:   2 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.publishN != 1 || f.lastOpts.Delay != time.Hour || f.lastOpts.TTL != 2*time.Hour {
+			t.Fatalf("opts %#v n=%d", f.lastOpts, f.publishN)
+		}
+	})
+
+	t.Run("zero delay", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Publish(ctx, "t", []byte("x"), novaque.PublishOpts{}); err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.lastOpts.Delay != 0 {
+			t.Fatalf("delay %v", f.lastOpts.Delay)
+		}
+	})
+
+	t.Run("over max", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Publish(ctx, "t", []byte("x"), novaque.PublishOpts{
+			Delay: novaque.MaxDelay + time.Second,
+			TTL:   61 * 24 * time.Hour,
+		})
+		if !errors.Is(err, novaque.ErrDelayTooLong) {
+			t.Fatalf("got %v", err)
+		}
+		if f.publishN != 0 {
+			t.Fatal("store should not be called")
+		}
+	})
+
+	t.Run("negative", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Publish(ctx, "t", []byte("x"), novaque.PublishOpts{Delay: -time.Second, TTL: time.Hour})
+		if !errors.Is(err, novaque.ErrDelayNegative) {
+			t.Fatalf("got %v", err)
+		}
+		if f.publishN != 0 {
+			t.Fatal("store should not be called")
+		}
+	})
+
+	t.Run("default ttl vs long delay", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{}) // DefaultTTL 7d
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Publish(ctx, "t", []byte("x"), novaque.PublishOpts{Delay: 8 * 24 * time.Hour})
+		if !errors.Is(err, novaque.ErrDelayExceedsTTL) {
+			t.Fatalf("got %v", err)
+		}
+		if f.publishN != 0 {
+			t.Fatal("store should not be called")
+		}
+	})
+
+	t.Run("max delay accepted", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Publish(ctx, "t", []byte("x"), novaque.PublishOpts{
+			Delay: novaque.MaxDelay,
+			TTL:   61 * 24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("same second collapse", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Publish(ctx, "t", []byte("x"), novaque.PublishOpts{
+			Delay: 2 * time.Second,
+			TTL:   2500 * time.Millisecond,
+		})
+		if !errors.Is(err, novaque.ErrDelayExceedsTTL) {
+			t.Fatalf("got %v", err)
+		}
+		if f.publishN != 0 {
+			t.Fatal("store should not be called")
+		}
+	})
 }
 
 var _ store.Store = (*fakeStore)(nil)

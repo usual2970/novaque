@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"novaque/store"
+	"github.com/usual2970/novaque/store"
 )
 
 // Claim leases eligible deliveries by channel id (no name lookup on the hot path).

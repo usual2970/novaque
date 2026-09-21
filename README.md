@@ -38,7 +38,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"novaque"
-	mysqldriver "novaque/driver/mysql"
+	mysqldriver "github.com/usual2970/novaque/driver/mysql"
 )
 
 func main() {
@@ -109,6 +109,18 @@ Publisher ──Publish──▶ topic ──fan-out──▶ channel A ──co
 | `PurgeInterval` | 5s | TTL cleanup tick |
 | `MaintenanceBatch` | 100 | rows per reaper/purge pass |
 
+### PublishOpts
+
+| Field | Role |
+|-------|------|
+| `TTL` | retention from publish time (overrides `DefaultTTL` when set) |
+| `Delay` | relative defer until first claim (NSQ `DPUB`-style); max **60 days** (`MaxDelay`) |
+| `MaxAttempts` | poison threshold for this message |
+
+`Delay` must be **strictly less than** effective TTL (after `DefaultTTL` fill), measured in whole Unix seconds — otherwise Publish returns `ErrDelayExceedsTTL`. Over-max returns `ErrDelayTooLong`; negative returns `ErrDelayNegative`. Handler failure still requeues **immediately** (publish delay only).
+
+Example: a 2-day delay needs an explicit TTL longer than 2 days (default TTL is 7d, so omit is fine; an 8-day delay needs `TTL` > 8d).
+
 Size `*sql.DB` `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroom. Use a **primary-writable** DSN (no read replicas) for claim/ack/publish.
 
 ## Guarantees
@@ -121,6 +133,7 @@ Size `*sql.DB` `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroo
 | Compete | Multi-process safe via `FOR UPDATE SKIP LOCKED` |
 | Poison | After `max_attempts` claims → `dead`, not returned |
 | TTL | `Client.Start` purges expired messages/deliveries |
+| Delay | Relative publish defer via `available_at`; max 60d; requires TTL > Delay |
 
 ## Architecture
 
@@ -163,6 +176,6 @@ Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
 ## Status / non-goals
 
-Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, reaper, TTL, in-process name cache, loadtest.
+Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 60d), reaper, TTL, in-process name cache, loadtest.
 
-Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, admin UI.
+Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, admin UI, deferred requeue/backoff.

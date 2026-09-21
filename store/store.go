@@ -30,12 +30,15 @@ type Delivery struct {
 	LeaseUntil  time.Time
 }
 
-// PublishOpts controls per-publish retention and poison caps.
+// PublishOpts controls per-publish retention, delay, and poison caps.
 type PublishOpts struct {
 	// TTL is relative retention from DB clock (Unix seconds); preferred over ExpiresAt.
 	TTL time.Duration
 	// ExpiresAt is an absolute expiry; used only when TTL is zero and ExpiresAt is set.
-	ExpiresAt   time.Time
+	ExpiresAt time.Time
+	// Delay is relative time until deliveries become claimable (NSQ DPUB-style). Zero = immediate.
+	// Must be <= MaxDelay and leave a non-empty claim window before effective expiry.
+	Delay       time.Duration
 	MaxAttempts int // zero = driver/client default
 }
 

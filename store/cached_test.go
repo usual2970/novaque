@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"novaque/store"
+	"github.com/usual2970/novaque/store"
 )
 
 type countingStore struct {
@@ -53,6 +53,7 @@ func (c *countingStore) EnsureChannel(ctx context.Context, topic, channel string
 func (c *countingStore) Publish(context.Context, int64, []byte, store.PublishOpts) (int64, error) {
 	return 1, nil
 }
+
 func (c *countingStore) Claim(context.Context, int64, string, time.Duration, int) ([]store.Delivery, error) {
 	return nil, nil
 }

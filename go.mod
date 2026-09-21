@@ -1,4 +1,4 @@
-module novaque
+module github.com/usual2970/novaque
 
 go 1.26.5
 

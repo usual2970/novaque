@@ -19,8 +19,9 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"novaque"
-	mysqldriver "novaque/driver/mysql"
+	"github.com/usual2970/novaque"
+
+	mysqldriver "github.com/usual2970/novaque/driver/mysql"
 )
 
 func main() {

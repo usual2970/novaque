@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"novaque"
-	mysqldriver "novaque/driver/mysql"
-	"novaque/internal/testmysql"
+	"github.com/usual2970/novaque"
+	mysqldriver "github.com/usual2970/novaque/driver/mysql"
+	"github.com/usual2970/novaque/internal/testmysql"
 )
 
 func TestClientConsumerEndToEnd(t *testing.T) {

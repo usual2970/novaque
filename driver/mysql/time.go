@@ -1,16 +1,16 @@
 package mysql
 
-import "time"
+import (
+	"time"
+
+	"github.com/usual2970/novaque/store"
+)
 
 // sqlNow is the database clock as Unix seconds (SIGNED BIGINT).
 const sqlNow = "UNIX_TIMESTAMP()"
 
 func durationSec(d time.Duration) int64 {
-	sec := int64(d / time.Second)
-	if sec < 1 {
-		return 1
-	}
-	return sec
+	return store.DurationSec(d)
 }
 
 func timeToSec(t time.Time) int64 {

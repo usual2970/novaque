@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"novaque/store"
+	"github.com/usual2970/novaque/store"
 )
 
 // Options configure Client defaults.
@@ -154,9 +154,20 @@ func (c *Client) loopPurge(ctx context.Context) {
 	}
 }
 
+// MaxDelay is the maximum publish Delay (re-export of store.MaxDelay).
+const MaxDelay = store.MaxDelay
+
+// Sentinel errors for publish Delay validation (re-exported from store).
+var (
+	ErrDelayNegative   = store.ErrDelayNegative
+	ErrDelayTooLong    = store.ErrDelayTooLong
+	ErrDelayExceedsTTL = store.ErrDelayExceedsTTL
+)
+
 // PublishOpts are per-message publish options.
 type PublishOpts struct {
 	TTL         time.Duration
+	Delay       time.Duration // relative; 0 = immediate; max MaxDelay
 	MaxAttempts int
 }
 
@@ -166,13 +177,19 @@ func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts Pu
 	if err != nil {
 		return 0, fmt.Errorf("novaque publish: %w", err)
 	}
-	po := store.PublishOpts{MaxAttempts: opts.MaxAttempts}
+	po := store.PublishOpts{
+		MaxAttempts: opts.MaxAttempts,
+		Delay:       opts.Delay,
+	}
 	if po.MaxAttempts <= 0 {
 		po.MaxAttempts = c.opts.DefaultMaxAttempts
 	}
 	po.TTL = opts.TTL
 	if po.TTL <= 0 {
 		po.TTL = c.opts.DefaultTTL
+	}
+	if err := store.ValidatePublishDelay(po, time.Now().Unix()); err != nil {
+		return 0, fmt.Errorf("novaque publish: %w", err)
 	}
 	id, err := c.store.Publish(ctx, topicID, body, po)
 	if err != nil {

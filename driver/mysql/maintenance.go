@@ -3,7 +3,7 @@ package mysql
 import (
 	"context"
 
-	"novaque/store"
+	"github.com/usual2970/novaque/store"
 )
 
 // ReapExpiredLeases resets expired in_flight deliveries to pending (DB time).

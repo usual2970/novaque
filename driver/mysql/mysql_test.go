@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"novaque/driver/mysql"
-	"novaque/store"
+	"github.com/usual2970/novaque/driver/mysql"
+	"github.com/usual2970/novaque/store"
 )
 
 func TestStoreImplementsInterface(t *testing.T) {

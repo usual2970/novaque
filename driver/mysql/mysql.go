@@ -7,9 +7,8 @@ import (
 	"embed"
 	"fmt"
 	"strings"
-	"time"
 
-	"novaque/store"
+	"github.com/usual2970/novaque/store"
 )
 
 //go:embed schema.sql
@@ -163,12 +162,28 @@ func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts st
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var nowUnix int64
+	if err := tx.QueryRowContext(ctx, `SELECT `+sqlNow).Scan(&nowUnix); err != nil {
+		return 0, err
+	}
+	if err := store.ValidatePublishDelay(opts, nowUnix); err != nil {
+		return 0, err
+	}
+
+	ttlSec := store.DurationSec(store.DefaultPublishTTL)
+	switch {
+	case opts.TTL > 0:
+		ttlSec = store.DurationSec(opts.TTL)
+	case !opts.ExpiresAt.IsZero():
+		ttlSec = 0 // absolute path below
+	}
+
 	var messageID int64
 	switch {
 	case opts.TTL > 0:
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO novaque_messages (topic_id, body, expires_at)
-			VALUES (?, ?, `+sqlNow+` + ?)`, topicID, body, durationSec(opts.TTL))
+			VALUES (?, ?, ? + ?)`, topicID, body, nowUnix, ttlSec)
 		if err != nil {
 			return 0, err
 		}
@@ -190,7 +205,7 @@ func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts st
 	default:
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO novaque_messages (topic_id, body, expires_at)
-			VALUES (?, ?, `+sqlNow+` + ?)`, topicID, body, durationSec(7*24*time.Hour))
+			VALUES (?, ?, ? + ?)`, topicID, body, nowUnix, ttlSec)
 		if err != nil {
 			return 0, err
 		}
@@ -200,15 +215,18 @@ func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts st
 		}
 	}
 
+	delaySec := store.DelaySec(opts.Delay)
+	availableAt := nowUnix + delaySec
+
 	// Single-statement fan-out; copy message expires_at onto each delivery (claim hot path).
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO novaque_deliveries
 		  (message_id, channel_id, status, available_at, attempts, max_attempts, expires_at)
-		SELECT ?, c.id, ?, `+sqlNow+`, 0, ?, m.expires_at
+		SELECT ?, c.id, ?, ?, 0, ?, m.expires_at
 		FROM novaque_channels c
 		INNER JOIN novaque_messages m ON m.id = ?
 		WHERE c.topic_id = ?`,
-		messageID, store.StatusPending, maxAttempts, messageID, topicID)
+		messageID, store.StatusPending, availableAt, maxAttempts, messageID, topicID)
 	if err != nil {
 		return 0, err
 	}
