@@ -54,7 +54,11 @@ func TestPublishFanoutAndNoRetroactive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgID, err := s.Publish(ctx, topic, []byte("hello"), store.PublishOpts{
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgID, err := s.Publish(ctx, topicID, []byte("hello"), store.PublishOpts{
 		TTL:         time.Hour,
 		MaxAttempts: 5,
 	})
@@ -92,7 +96,7 @@ func TestPublishFanoutAndNoRetroactive(t *testing.T) {
 		t.Fatalf("late channel should have 0 historical deliveries, got %d", len(late))
 	}
 
-	if _, err := s.Publish(ctx, topic, []byte("next"), store.PublishOpts{TTL: time.Hour}); err != nil {
+	if _, err := s.Publish(ctx, topicID, []byte("next"), store.PublishOpts{TTL: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	late2, err := s.Claim(ctx, lateID, "w1", 10*time.Second, 10)
@@ -116,8 +120,12 @@ func TestClaimCompeteAndLeaseRedelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 4; i++ {
-		if _, err := s.Publish(ctx, topic, []byte{byte(i)}, store.PublishOpts{TTL: time.Hour}); err != nil {
+		if _, err := s.Publish(ctx, topicID, []byte{byte(i)}, store.PublishOpts{TTL: time.Hour}); err != nil {
 			t.Fatal(err)
 		}
 	}

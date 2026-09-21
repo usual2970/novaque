@@ -1,19 +1,31 @@
 # novaque
 
-Go library for **NSQ-style pub/sub** on a relational database. Callers supply a DB connection; novaque embeds into your process.
+Embeddable Go library for **NSQ-style pub/sub** on a relational database.
 
-- **Topology:** topic → channels (fan-out); multiple consumers on one channel compete
-- **Delivery:** at-least-once with explicit ack; handlers must be idempotent
-- **MVP driver:** MySQL ≥ 8.0.1 (InnoDB, `SKIP LOCKED`)
-- **Extensibility:** domain code depends on `store.Store` interfaces; Postgres/SQLite drivers can be added later under `driver/`
+You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. Topics fan out to channels; consumers on the same channel compete. Delivery is **at-least-once** with lease + ack.
+
+| | |
+|---|---|
+| Topology | topic → channels (multicast); compete within a channel |
+| Durability | rows in MySQL (MVP); claim with `SKIP LOCKED` |
+| Extensibility | `store.Store` seam — Postgres/SQLite drivers can plug in later |
+| Form | library module, not a long-running service |
 
 ## Install
 
+Module path is currently `novaque` (GitHub: [usual2970/novaque](https://github.com/usual2970/novaque)).
+
 ```bash
-go get novaque@latest   # when published; for local submodule use a replace directive
+# clone / submodule, then in your app:
+go get novaque@v0.0.1
+
+# or local replace
+# replace novaque => ../novaque
 ```
 
-## Quick start (MySQL)
+Requires **Go 1.22+** and, for the shipped driver, **MySQL ≥ 8.0.1** (InnoDB).
+
+## Quick start
 
 ```go
 package main
@@ -30,12 +42,16 @@ import (
 )
 
 func main() {
-	db, err := sql.Open("mysql", "user:pass@tcp(127.0.0.1:3306)/app?parseTime=true&loc=UTC")
+	db, err := sql.Open("mysql",
+		"user:pass@tcp(127.0.0.1:3306)/app?parseTime=true&loc=UTC")
 	if err != nil {
 		log.Fatal(err)
 	}
-	store := mysqldriver.New(db)
-	client, err := novaque.Open(store, novaque.Options{})
+	db.SetMaxOpenConns(32)
+
+	client, err := novaque.Open(mysqldriver.New(db), novaque.Options{
+		MaxInFlight: 8, // concurrent handlers per consumer
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -43,69 +59,110 @@ func main() {
 	if err := client.Migrate(ctx); err != nil {
 		log.Fatal(err)
 	}
-	if err := client.Start(ctx); err != nil { // reaper + TTL
+	if err := client.Start(ctx); err != nil { // lease reaper + TTL purge
 		log.Fatal(err)
 	}
 	defer client.Shutdown(context.Background())
 
-	cons, err := client.Subscribe("events", "indexer", func(ctx context.Context, msg *novaque.Message) error {
-		log.Printf("got %s attempt=%d", msg.Body, msg.Attempts)
-		return nil // ack; return error to requeue
-	})
+	cons, err := client.SubscribeAndStart(ctx, "events", "indexer",
+		func(ctx context.Context, msg *novaque.Message) error {
+			log.Printf("got %s attempt=%d", msg.Body, msg.Attempts)
+			return nil // nil → ack; error → requeue
+		})
 	if err != nil {
 		log.Fatal(err)
 	}
-	_ = cons.Start(ctx) // launches Options.MaxInFlight concurrent workers
 	defer cons.Shutdown(context.Background())
 
-	if _, err := client.Publish(ctx, "events", []byte(`{"ok":true}`), novaque.PublishOpts{}); err != nil {
+	if _, err := client.Publish(ctx, "events", []byte(`{"ok":true}`),
+		novaque.PublishOpts{}); err != nil {
 		log.Fatal(err)
 	}
 	time.Sleep(time.Second)
 }
 ```
 
-## Local load test
+`Subscribe` + `Start` is available when you need to wire several consumers before polling.
+
+## Concepts
+
+```
+Publisher ──Publish──▶ topic ──fan-out──▶ channel A ──compete──▶ consumers
+                                   └──▶ channel B ──compete──▶ consumers
+```
+
+- **Topic** — named stream; created lazily on first publish/subscribe.
+- **Channel** — named subscription on a topic; each existing channel gets its own delivery row at publish time.
+- **Late subscribe** — a channel created after messages were published does **not** receive history.
+- **Handler** — must be **idempotent** (at-least-once; crash before ack → redelivery after lease expiry).
+
+## Options
+
+| Field | Default | Role |
+|-------|---------|------|
+| `DefaultTTL` | 7d | message retention when publish omits TTL |
+| `DefaultLease` | 30s | claim lease duration |
+| `DefaultMaxAttempts` | 5 | poison threshold (then `dead`) |
+| `PollInterval` | 200ms | consumer idle poll base (+ jitter) |
+| `MaxInFlight` | 1 | handler workers + batch claim size per consumer |
+| `ReapInterval` | 1s | expired-lease reaper tick |
+| `PurgeInterval` | 5s | TTL cleanup tick |
+| `MaintenanceBatch` | 100 | rows per reaper/purge pass |
+
+Size `*sql.DB` `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroom. Use a **primary-writable** DSN (no read replicas) for claim/ack/publish.
+
+## Guarantees
+
+| Behavior | Contract |
+|----------|----------|
+| Fan-out | One pending delivery per **existing** channel, same transaction as the message |
+| Late channel | No retroactive history |
+| Delivery | At-least-once; ack requires matching `lease_token` |
+| Compete | Multi-process safe via `FOR UPDATE SKIP LOCKED` |
+| Poison | After `max_attempts` claims → `dead`, not returned |
+| TTL | `Client.Start` purges expired messages/deliveries |
+
+## Architecture
+
+```
+novaque/
+  client.go           # Client, Consumer, Publish / Subscribe
+  store/
+    store.go          # Store interface (dialect-agnostic)
+    cached.go         # WithCache — memoize EnsureTopic / EnsureChannel
+  driver/mysql/       # MySQL Store + schema.sql
+  cmd/loadtest/       # local publish/consume stress tool
+  internal/testmysql/ # testcontainers helper (integration tests)
+```
+
+- Domain code talks only to `store.Store`; MySQL SQL/locking stays in `driver/mysql`.
+- `Open` wraps the driver with `store.WithCache` so steady-state publish/subscribe skips name→id round-trips.
+- Claim path uses **channel id** and denormalized `expires_at` on `novaque_deliveries` (no hot-path JOIN).
+- Each consumer runs **one batch poller** + `MaxInFlight` workers (Solid Queue–style), not N independent empty polls.
+
+## Testing
 
 ```bash
-# starts MySQL 8 via Docker/testcontainers
+go test ./...
+
+# needs Docker
+go test -tags=integration ./...
+```
+
+### Load test
+
+```bash
+# boots MySQL 8 via testcontainers
 go run ./cmd/loadtest
 
-# or point at an existing instance
 NOVAQUE_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/novaque?parseTime=true&loc=UTC' \
   go run ./cmd/loadtest -n 10000 -publishers 8 -max-inflight 32
 ```
 
 Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
-## Guarantees (MVP)
+## Status / non-goals
 
-| Behavior | Contract |
-|----------|----------|
-| Fan-out | Every **existing** channel gets a copy at publish time |
-| Late subscribe | Channels created later do **not** receive historical messages |
-| Delivery | At-least-once; lease expiry redelivers; ack requires matching lease token |
-| Poison | After `max_attempts` claims, delivery is marked `dead` |
-| Backend | Only MySQL driver ships; use `store.Store` for fakes/tests |
+Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, reaper, TTL, in-process name cache, loadtest.
 
-## Concurrency
-
-- **In-process:** set `Options.MaxInFlight` (default 1). `Start` runs **one batch poller** (claims up to free slots) plus that many handler workers — Solid Queue–style, not N independent empty polls.
-- **Multi-node:** more processes on the same channel compete via `SKIP LOCKED`.
-- **Hot path:** `Subscribe` caches `channel_id`; claim scans only `novaque_deliveries` (`expires_at` denormalized); idle polls use jitter.
-- Size `*sql.DB` pool ≥ `MaxInFlight` (plus publish/reaper headroom).
-- **API:** `Subscribe` then `Start` when wiring many consumers; `SubscribeAndStart` for the simple path.
-## Layout
-
-```
-novaque/
-  store/           # Store interface (dialect-agnostic)
-  driver/mysql/    # MySQL implementation
-  client.go        # Client / Consumer / Publish
-```
-
-## Requirements
-
-- Go 1.22+
-- MySQL ≥ 8.0.1 for the MySQL driver
-- Claim/ack/publish must hit a primary-writable connection (no read replicas)
+Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, admin UI.

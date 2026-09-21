@@ -144,14 +144,13 @@ func (s *Store) EnsureChannel(ctx context.Context, topic, channel string) (int64
 	return id, err
 }
 
-// Publish inserts message + per-channel deliveries atomically.
-func (s *Store) Publish(ctx context.Context, topic string, body []byte, opts store.PublishOpts) (int64, error) {
+// Publish inserts message + per-channel deliveries atomically for a known topic id.
+func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts store.PublishOpts) (int64, error) {
 	if body == nil {
 		body = []byte{}
 	}
-	topicID, err := s.EnsureTopic(ctx, topic)
-	if err != nil {
-		return 0, err
+	if topicID <= 0 {
+		return 0, fmt.Errorf("mysql: invalid topic id %d", topicID)
 	}
 	maxAttempts := opts.MaxAttempts
 	if maxAttempts <= 0 {

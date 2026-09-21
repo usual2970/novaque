@@ -67,12 +67,19 @@ func (f *fakeStore) EnsureChannel(ctx context.Context, topic, channel string) (i
 	return id, nil
 }
 
-func (f *fakeStore) Publish(_ context.Context, topic string, body []byte, _ store.PublishOpts) (int64, error) {
+func (f *fakeStore) Publish(_ context.Context, topicID int64, body []byte, _ store.PublishOpts) (int64, error) {
 	if f.failPublish {
 		return 0, errors.New("boom")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var topic string
+	for name, id := range f.topics {
+		if id == topicID {
+			topic = name
+			break
+		}
+	}
 	var chans []string
 	for name := range f.channels[topic] {
 		chans = append(chans, name)

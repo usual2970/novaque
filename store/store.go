@@ -48,11 +48,12 @@ type Store interface {
 	EnsureChannel(ctx context.Context, topic, channel string) (channelID int64, err error)
 
 	// Publish inserts a message and one pending delivery per existing channel
-	// in a single transaction. Zero channels still inserts the message row.
-	Publish(ctx context.Context, topic string, body []byte, opts PublishOpts) (messageID int64, err error)
+	// in a single transaction. topicID must come from EnsureTopic (callers /
+	// CachingStore should resolve names once). Zero channels still inserts the message row.
+	Publish(ctx context.Context, topicID int64, body []byte, opts PublishOpts) (messageID int64, err error)
 
 	// Claim leases up to limit eligible deliveries for a known channel id
-	// (callers must Resolve/EnsureChannel once and cache the id — hot path must not re-resolve names).
+	// (callers must EnsureChannel once — Client caches via CachingStore; hot path must not re-resolve names).
 	// Drivers increment attempts on claim; deliveries past MaxAttempts become dead
 	// and are not returned. leaseFor is applied using database time.
 	Claim(ctx context.Context, channelID int64, owner string, leaseFor time.Duration, limit int) ([]Delivery, error)

@@ -65,11 +65,12 @@ type Client struct {
 }
 
 // Open constructs a Client from any Store implementation (e.g. mysql.New(db)).
+// EnsureTopic/EnsureChannel results are memoized in process for all drivers.
 func Open(s store.Store, opts Options) (*Client, error) {
 	if s == nil {
 		return nil, errors.New("novaque: store is nil")
 	}
-	return &Client{store: s, opts: opts.withDefaults()}, nil
+	return &Client{store: store.WithCache(s), opts: opts.withDefaults()}, nil
 }
 
 // Migrate applies the store's schema.
@@ -161,6 +162,10 @@ type PublishOpts struct {
 
 // Publish fans out body to all existing channels on topic.
 func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts PublishOpts) (int64, error) {
+	topicID, err := c.store.EnsureTopic(ctx, topic)
+	if err != nil {
+		return 0, fmt.Errorf("novaque publish: %w", err)
+	}
 	po := store.PublishOpts{MaxAttempts: opts.MaxAttempts}
 	if po.MaxAttempts <= 0 {
 		po.MaxAttempts = c.opts.DefaultMaxAttempts
@@ -169,7 +174,7 @@ func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts Pu
 	if po.TTL <= 0 {
 		po.TTL = c.opts.DefaultTTL
 	}
-	id, err := c.store.Publish(ctx, topic, body, po)
+	id, err := c.store.Publish(ctx, topicID, body, po)
 	if err != nil {
 		return 0, fmt.Errorf("novaque publish: %w", err)
 	}
