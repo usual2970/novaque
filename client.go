@@ -253,6 +253,10 @@ type ChannelBacklog = store.ChannelBacklog
 // prune removes old days. They are buffered in-process and flushed every
 // StatsFlushInterval, so reads are eventually consistent within that window;
 // call FlushStats first to force a drain.
+//
+// Like Publish/Subscribe, the read creates the named topic and channel when
+// they do not exist yet (create-on-read) — a typo'd name therefore shows zeros
+// AND permanently joins future publish fan-out. Double-check names.
 func (c *Client) ChannelCounters(ctx context.Context, topic, channel string) (ChannelCounters, error) {
 	channelID, err := c.store.EnsureChannel(ctx, topic, channel)
 	if err != nil {
@@ -267,7 +271,8 @@ func (c *Client) ChannelCounters(ctx context.Context, topic, channel string) (Ch
 
 // TopicCounters rolls the day-bucket counters up over a whole topic: every
 // per-channel row plus the topic-level row that zero-channel publishes count
-// on. Eventual-consistency window as per ChannelCounters.
+// on. Eventual-consistency window as per ChannelCounters. The read creates the
+// topic when missing (see ChannelCounters).
 func (c *Client) TopicCounters(ctx context.Context, topic string) (ChannelCounters, error) {
 	topicID, err := c.store.EnsureTopic(ctx, topic)
 	if err != nil {
@@ -282,8 +287,10 @@ func (c *Client) TopicCounters(ctx context.Context, topic string) (ChannelCounte
 
 // ChannelBacklog returns the live delivery counts for one channel right now:
 // pending, ready (the claimable slice of pending — delayed publishes are
-// excluded until available_at passes), in_flight, and dead. Backlog is a live
-// row count, not a day bucket, so it needs no flush.
+// excluded until available_at passes, and expired-but-unpurged rows are not
+// claimable), in_flight, and dead. Backlog is a live row count, not a day
+// bucket, so it needs no flush. The read creates the topic and channel when
+// missing (see ChannelCounters).
 func (c *Client) ChannelBacklog(ctx context.Context, topic, channel string) (ChannelBacklog, error) {
 	channelID, err := c.store.EnsureChannel(ctx, topic, channel)
 	if err != nil {
