@@ -7,6 +7,7 @@ import (
 	"embed"
 	"fmt"
 	"strings"
+	"time"
 
 	"novaque/store"
 )
@@ -137,7 +138,23 @@ func (s *Store) Publish(ctx context.Context, topic string, body []byte, opts sto
 	defer func() { _ = tx.Rollback() }()
 
 	var messageID int64
-	if !opts.ExpiresAt.IsZero() {
+	switch {
+	case opts.TTL > 0:
+		secs := int64(opts.TTL / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO novaque_messages (topic_id, body, expires_at)
+			VALUES (?, ?, DATE_ADD(NOW(3), INTERVAL ? SECOND))`, topicID, body, secs)
+		if err != nil {
+			return 0, err
+		}
+		messageID, err = res.LastInsertId()
+		if err != nil {
+			return 0, err
+		}
+	case !opts.ExpiresAt.IsZero():
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO novaque_messages (topic_id, body, expires_at) VALUES (?, ?, ?)`,
 			topicID, body, opts.ExpiresAt.UTC())
@@ -148,10 +165,10 @@ func (s *Store) Publish(ctx context.Context, topic string, body []byte, opts sto
 		if err != nil {
 			return 0, err
 		}
-	} else {
+	default:
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO novaque_messages (topic_id, body, expires_at)
-			VALUES (?, ?, DATE_ADD(NOW(3), INTERVAL 7 DAY))`, topicID, body)
+			VALUES (?, ?, DATE_ADD(NOW(3), INTERVAL ? SECOND))`, topicID, body, int64(7*24*3600))
 		if err != nil {
 			return 0, err
 		}
@@ -161,35 +178,16 @@ func (s *Store) Publish(ctx context.Context, topic string, body []byte, opts sto
 		}
 	}
 
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM novaque_channels WHERE topic_id = ?`, topicID)
+	// Single-statement fan-out snapshot of channels visible at insert time.
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO novaque_deliveries
+		  (message_id, channel_id, status, available_at, attempts, max_attempts)
+		SELECT ?, c.id, ?, NOW(3), 0, ?
+		FROM novaque_channels c
+		WHERE c.topic_id = ?`,
+		messageID, store.StatusPending, maxAttempts, topicID)
 	if err != nil {
 		return 0, err
-	}
-	var channelIDs []int64
-	for rows.Next() {
-		var channelID int64
-		if err := rows.Scan(&channelID); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		channelIDs = append(channelIDs, channelID)
-	}
-	if err := rows.Close(); err != nil {
-		return 0, err
-	}
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-
-	for _, channelID := range channelIDs {
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO novaque_deliveries
-			  (message_id, channel_id, status, available_at, attempts, max_attempts)
-			VALUES (?, ?, ?, NOW(3), 0, ?)`,
-			messageID, channelID, store.StatusPending, maxAttempts)
-		if err != nil {
-			return 0, err
-		}
 	}
 
 	if err := tx.Commit(); err != nil {

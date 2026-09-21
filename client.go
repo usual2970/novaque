@@ -12,14 +12,14 @@ import (
 
 // Options configure Client defaults.
 type Options struct {
-	DefaultTTL        time.Duration
-	DefaultLease      time.Duration
+	DefaultTTL         time.Duration
+	DefaultLease       time.Duration
 	DefaultMaxAttempts int
-	PollInterval      time.Duration
-	MaxInFlight       int
-	ReapInterval      time.Duration
-	PurgeInterval     time.Duration
-	MaintenanceBatch  int
+	PollInterval       time.Duration
+	MaxInFlight        int
+	ReapInterval       time.Duration
+	PurgeInterval      time.Duration
+	MaintenanceBatch   int
 }
 
 func (o Options) withDefaults() Options {
@@ -81,7 +81,11 @@ func (c *Client) Start(ctx context.Context) error {
 	if c.started {
 		return nil
 	}
-	runCtx, cancel := context.WithCancel(context.Background())
+	base := ctx
+	if base == nil {
+		base = context.Background()
+	}
+	runCtx, cancel := context.WithCancel(base)
 	c.stop = cancel
 	c.started = true
 
@@ -158,11 +162,10 @@ func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts Pu
 	if po.MaxAttempts <= 0 {
 		po.MaxAttempts = c.opts.DefaultMaxAttempts
 	}
-	ttl := opts.TTL
-	if ttl <= 0 {
-		ttl = c.opts.DefaultTTL
+	po.TTL = opts.TTL
+	if po.TTL <= 0 {
+		po.TTL = c.opts.DefaultTTL
 	}
-	po.ExpiresAt = time.Now().UTC().Add(ttl)
 	id, err := c.store.Publish(ctx, topic, body, po)
 	if err != nil {
 		return 0, fmt.Errorf("novaque publish: %w", err)
@@ -225,7 +228,11 @@ func (co *Consumer) Start(ctx context.Context) error {
 	if co.started {
 		return nil
 	}
-	runCtx, cancel := context.WithCancel(context.Background())
+	base := ctx
+	if base == nil {
+		base = context.Background()
+	}
+	runCtx, cancel := context.WithCancel(base)
 	co.stop = cancel
 	co.started = true
 	co.wg.Add(1)
@@ -269,7 +276,8 @@ func (co *Consumer) loop(ctx context.Context) {
 		default:
 		}
 
-		claimed, err := co.client.store.Claim(ctx, co.topic, co.channel, co.owner, co.client.opts.DefaultLease, co.client.opts.MaxInFlight)
+		// Claim one at a time so MaxInFlight>1 does not hoard leases during serial handling.
+		claimed, err := co.client.store.Claim(ctx, co.topic, co.channel, co.owner, co.client.opts.DefaultLease, 1)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -287,28 +295,47 @@ func (co *Consumer) loop(ctx context.Context) {
 			continue
 		}
 
-		for _, d := range claimed {
-			msg := &Message{
-				client:     co.client,
-				deliveryID: d.ID,
-				leaseToken: d.LeaseToken,
-				MessageID:  d.MessageID,
-				Topic:      d.Topic,
-				Channel:    d.Channel,
-				Body:       d.Body,
-				Attempts:   d.Attempts,
-			}
-			hctx, cancel := context.WithTimeout(ctx, co.client.opts.DefaultLease)
-			err := co.handler(hctx, msg)
-			cancel()
+		d := claimed[0]
+		msg := &Message{
+			client:     co.client,
+			deliveryID: d.ID,
+			leaseToken: d.LeaseToken,
+			MessageID:  d.MessageID,
+			Topic:      d.Topic,
+			Channel:    d.Channel,
+			Body:       d.Body,
+			Attempts:   d.Attempts,
+		}
+		hctx, cancel := context.WithTimeout(ctx, co.client.opts.DefaultLease)
+		err = co.handler(hctx, msg)
+		cancel()
 
-			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err == nil {
-				_ = co.client.store.Ack(ackCtx, msg.deliveryID, msg.leaseToken)
-			} else {
-				_ = co.client.store.Requeue(ackCtx, msg.deliveryID, msg.leaseToken, time.Time{})
-			}
-			ackCancel()
+		ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err == nil {
+			_ = finishWithRetry(ackCtx, func(ctx context.Context) error {
+				return co.client.store.Ack(ctx, msg.deliveryID, msg.leaseToken)
+			})
+		} else {
+			_ = finishWithRetry(ackCtx, func(ctx context.Context) error {
+				return co.client.store.Requeue(ctx, msg.deliveryID, msg.leaseToken, time.Time{})
+			})
+		}
+		ackCancel()
+	}
+}
+
+func finishWithRetry(ctx context.Context, fn func(context.Context) error) error {
+	var err error
+	for i := 0; i < 3; i++ {
+		err = fn(ctx)
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
 		}
 	}
+	return err
 }

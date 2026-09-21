@@ -16,24 +16,27 @@ const (
 
 // Delivery is one channel's copy of a published message, possibly claimed.
 type Delivery struct {
-	ID         int64
-	MessageID  int64
-	ChannelID  int64
-	Topic      string
-	Channel    string
-	Body       []byte
-	Status     string
-	Attempts   int
+	ID          int64
+	MessageID   int64
+	ChannelID   int64
+	Topic       string
+	Channel     string
+	Body        []byte
+	Status      string
+	Attempts    int
 	MaxAttempts int
-	LeaseToken string
+	LeaseToken  string
 	AvailableAt time.Time
 	LeaseUntil  time.Time
 }
 
 // PublishOpts controls per-publish retention and poison caps.
 type PublishOpts struct {
-	ExpiresAt   time.Time // zero = driver/client default
-	MaxAttempts int       // zero = driver/client default
+	// TTL is relative retention from DB NOW(); preferred over ExpiresAt.
+	TTL time.Duration
+	// ExpiresAt is an absolute expiry; used only when TTL is zero and ExpiresAt is set.
+	ExpiresAt   time.Time
+	MaxAttempts int // zero = driver/client default
 }
 
 // Store is the persistence seam used by Client, Consumer, and maintenance loops.

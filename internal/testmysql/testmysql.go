@@ -16,8 +16,8 @@ import (
 )
 
 var (
-	once sync.Once
-	dsn  string
+	once    sync.Once
+	dsn     string
 	errOnce error
 )
 
