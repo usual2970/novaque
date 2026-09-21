@@ -25,12 +25,14 @@ CREATE TABLE IF NOT EXISTS novaque_messages (
   KEY idx_novaque_messages_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Hot path: pending rows only; expires_at denormalized to avoid JOIN on claim.
 CREATE TABLE IF NOT EXISTS novaque_deliveries (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   message_id BIGINT NOT NULL,
   channel_id BIGINT NOT NULL,
   status VARCHAR(16) NOT NULL,
   available_at DATETIME(3) NOT NULL,
+  expires_at DATETIME(3) NOT NULL,
   attempts INT NOT NULL DEFAULT 0,
   max_attempts INT NOT NULL,
   lease_until DATETIME(3) NULL,

@@ -77,11 +77,11 @@ func main() {
 
 ## Concurrency
 
-- **In-process:** set `Options.MaxInFlight` (default 1). `Consumer.Start` runs that many workers; each claims **one** message at a time so leases match active handlers.
-- **Multi-node:** run more processes against the same DB/channel; they compete via `SKIP LOCKED`.
-- **API:** prefer `Subscribe` then `Start` when wiring many consumers under load; use `SubscribeAndStart` for the simple path.
+- **In-process:** set `Options.MaxInFlight` (default 1). `Start` runs **one batch poller** (claims up to free slots) plus that many handler workers — Solid Queue–style, not N independent empty polls.
+- **Multi-node:** more processes on the same channel compete via `SKIP LOCKED`.
+- **Hot path:** `Subscribe` caches `channel_id`; claim scans only `novaque_deliveries` (`expires_at` denormalized); idle polls use jitter.
 - Size `*sql.DB` pool ≥ `MaxInFlight` (plus publish/reaper headroom).
-
+- **API:** `Subscribe` then `Start` when wiring many consumers; `SubscribeAndStart` for the simple path.
 ## Layout
 
 ```

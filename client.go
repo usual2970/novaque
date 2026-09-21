@@ -194,12 +194,12 @@ type Message struct {
 
 // Consumer polls a topic/channel and dispatches to Handler.
 type Consumer struct {
-	client  *Client
-	topic   string
-	channel string
-	handler Handler
-
-	owner string
+	client    *Client
+	topic     string
+	channel   string
+	channelID int64
+	handler   Handler
+	owner     string
 
 	mu      sync.Mutex
 	started bool
@@ -208,26 +208,26 @@ type Consumer struct {
 }
 
 // Subscribe ensures topic/channel and returns a Consumer (not yet started).
-// Call Start to launch MaxInFlight concurrent workers; this split lets you
-// wire many subscriptions before opening the floodgates under load.
+// Call Start to open a batch claimer + MaxInFlight handlers (Solid Queue–style).
 func (c *Client) Subscribe(topic, channel string, handler Handler) (*Consumer, error) {
 	if handler == nil {
 		return nil, errors.New("novaque: handler is nil")
 	}
-	if _, err := c.store.EnsureChannel(context.Background(), topic, channel); err != nil {
+	id, err := c.store.EnsureChannel(context.Background(), topic, channel)
+	if err != nil {
 		return nil, err
 	}
 	return &Consumer{
-		client:  c,
-		topic:   topic,
-		channel: channel,
-		handler: handler,
-		owner:   newOwnerID(),
+		client:    c,
+		topic:     topic,
+		channel:   channel,
+		channelID: id,
+		handler:   handler,
+		owner:     newOwnerID(),
 	}, nil
 }
 
-// SubscribeAndStart is Subscribe followed by Start — convenient when a single
-// consumer should begin competing for work immediately.
+// SubscribeAndStart is Subscribe followed by Start.
 func (c *Client) SubscribeAndStart(ctx context.Context, topic, channel string, handler Handler) (*Consumer, error) {
 	co, err := c.Subscribe(topic, channel, handler)
 	if err != nil {
@@ -239,7 +239,7 @@ func (c *Client) SubscribeAndStart(ctx context.Context, topic, channel string, h
 	return co, nil
 }
 
-// Start launches MaxInFlight poll workers. Safe to call once; later calls are no-ops.
+// Start launches one batch poller and MaxInFlight handler workers.
 func (co *Consumer) Start(ctx context.Context) error {
 	co.mu.Lock()
 	defer co.mu.Unlock()
@@ -258,15 +258,16 @@ func (co *Consumer) Start(ctx context.Context) error {
 	if n <= 0 {
 		n = 1
 	}
-	co.wg.Add(n)
+	work := make(chan store.Delivery, n)
+	co.wg.Add(n + 1)
 	for i := 0; i < n; i++ {
-		workerID := i
-		go co.worker(runCtx, workerID)
+		go co.handleLoop(runCtx, work)
 	}
+	go co.pollLoop(runCtx, work, n)
 	return nil
 }
 
-// Shutdown stops all workers and waits for in-flight handlers to finish (or ctx).
+// Shutdown stops the poller and waits for in-flight handlers.
 func (co *Consumer) Shutdown(ctx context.Context) error {
 	co.mu.Lock()
 	if !co.started {
@@ -292,10 +293,12 @@ func (co *Consumer) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (co *Consumer) worker(ctx context.Context, workerID int) {
+func (co *Consumer) pollLoop(ctx context.Context, work chan<- store.Delivery, maxInFlight int) {
 	defer co.wg.Done()
-	owner := fmt.Sprintf("%s#%d", co.owner, workerID)
-	backoff := co.client.opts.PollInterval
+	defer close(work)
+
+	base := co.client.opts.PollInterval
+	owner := co.owner + "#poller"
 	for {
 		select {
 		case <-ctx.Done():
@@ -303,13 +306,22 @@ func (co *Consumer) worker(ctx context.Context, workerID int) {
 		default:
 		}
 
-		// One claim per worker keeps leases aligned with active handlers under concurrency.
-		claimed, err := co.client.store.Claim(ctx, co.topic, co.channel, owner, co.client.opts.DefaultLease, 1)
+		free := maxInFlight - len(work)
+		if free <= 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(jitter(base / 4)):
+			}
+			continue
+		}
+
+		claimed, err := co.client.store.Claim(ctx, co.channelID, owner, co.client.opts.DefaultLease, free)
 		if err != nil {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(backoff):
+			case <-time.After(jitter(base)):
 			}
 			continue
 		}
@@ -317,38 +329,56 @@ func (co *Consumer) worker(ctx context.Context, workerID int) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(backoff):
+			case <-time.After(jitter(base)):
 			}
 			continue
 		}
-
-		d := claimed[0]
-		msg := &Message{
-			client:     co.client,
-			deliveryID: d.ID,
-			leaseToken: d.LeaseToken,
-			MessageID:  d.MessageID,
-			Topic:      d.Topic,
-			Channel:    d.Channel,
-			Body:       d.Body,
-			Attempts:   d.Attempts,
+		for _, d := range claimed {
+			select {
+			case <-ctx.Done():
+				return
+			case work <- d:
+			}
 		}
-		hctx, cancel := context.WithTimeout(ctx, co.client.opts.DefaultLease)
-		err = co.handler(hctx, msg)
-		cancel()
-
-		ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err == nil {
-			_ = finishWithRetry(ackCtx, func(ctx context.Context) error {
-				return co.client.store.Ack(ctx, msg.deliveryID, msg.leaseToken)
-			})
-		} else {
-			_ = finishWithRetry(ackCtx, func(ctx context.Context) error {
-				return co.client.store.Requeue(ctx, msg.deliveryID, msg.leaseToken, time.Time{})
-			})
-		}
-		ackCancel()
 	}
+}
+
+func (co *Consumer) handleLoop(ctx context.Context, work <-chan store.Delivery) {
+	defer co.wg.Done()
+	for d := range work {
+		// Drain claimed work even after cancel so leases get ack/requeue.
+		_ = ctx
+		co.dispatch(d)
+	}
+}
+
+func (co *Consumer) dispatch(d store.Delivery) {
+	msg := &Message{
+		client:     co.client,
+		deliveryID: d.ID,
+		leaseToken: d.LeaseToken,
+		MessageID:  d.MessageID,
+		Topic:      d.Topic,
+		Channel:    d.Channel,
+		Body:       d.Body,
+		Attempts:   d.Attempts,
+	}
+	// Handler deadline is lease-bound; do not tie to poller cancel so Shutdown can drain cleanly.
+	hctx, cancel := context.WithTimeout(context.Background(), co.client.opts.DefaultLease)
+	err := co.handler(hctx, msg)
+	cancel()
+
+	ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ackCancel()
+	if err == nil {
+		_ = finishWithRetry(ackCtx, func(ctx context.Context) error {
+			return co.client.store.Ack(ctx, msg.deliveryID, msg.leaseToken)
+		})
+		return
+	}
+	_ = finishWithRetry(ackCtx, func(ctx context.Context) error {
+		return co.client.store.Requeue(ctx, msg.deliveryID, msg.leaseToken, time.Time{})
+	})
 }
 
 func finishWithRetry(ctx context.Context, fn func(context.Context) error) error {
@@ -371,4 +401,15 @@ func newOwnerID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("%x", b)
+}
+
+func jitter(base time.Duration) time.Duration {
+	if base <= 0 {
+		base = 200 * time.Millisecond
+	}
+	// ±50% jitter to desynchronize multi-process idle polls.
+	var b [1]byte
+	_, _ = rand.Read(b[:])
+	frac := 0.5 + float64(b[0])/255.0 // 0.5 .. 1.5
+	return time.Duration(float64(base) * frac)
 }

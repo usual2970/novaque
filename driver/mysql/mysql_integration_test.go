@@ -46,14 +46,16 @@ func TestPublishFanoutAndNoRetroactive(t *testing.T) {
 		t.Fatal(err)
 	}
 	topic := "fanout_" + time.Now().Format("150405.000")
-	if _, err := s.EnsureChannel(ctx, topic, "A"); err != nil {
+	aID, err := s.EnsureChannel(ctx, topic, "A")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.EnsureChannel(ctx, topic, "B"); err != nil {
+	bID, err := s.EnsureChannel(ctx, topic, "B")
+	if err != nil {
 		t.Fatal(err)
 	}
 	msgID, err := s.Publish(ctx, topic, []byte("hello"), store.PublishOpts{
-		ExpiresAt:   time.Now().UTC().Add(time.Hour),
+		TTL:         time.Hour,
 		MaxAttempts: 5,
 	})
 	if err != nil {
@@ -63,11 +65,11 @@ func TestPublishFanoutAndNoRetroactive(t *testing.T) {
 		t.Fatal("expected message id")
 	}
 
-	a, err := s.Claim(ctx, topic, "A", "w1", 10*time.Second, 10)
+	a, err := s.Claim(ctx, aID, "w1", 10*time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.Claim(ctx, topic, "B", "w1", 10*time.Second, 10)
+	b, err := s.Claim(ctx, bID, "w1", 10*time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,11 +80,11 @@ func TestPublishFanoutAndNoRetroactive(t *testing.T) {
 		t.Fatalf("body mismatch")
 	}
 
-	// Late channel should not see historical message.
-	if _, err := s.EnsureChannel(ctx, topic, "late"); err != nil {
+	lateID, err := s.EnsureChannel(ctx, topic, "late")
+	if err != nil {
 		t.Fatal(err)
 	}
-	late, err := s.Claim(ctx, topic, "late", "w1", 10*time.Second, 10)
+	late, err := s.Claim(ctx, lateID, "w1", 10*time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,14 +92,10 @@ func TestPublishFanoutAndNoRetroactive(t *testing.T) {
 		t.Fatalf("late channel should have 0 historical deliveries, got %d", len(late))
 	}
 
-	msgID2, err := s.Publish(ctx, topic, []byte("next"), store.PublishOpts{
-		ExpiresAt: time.Now().UTC().Add(time.Hour),
-	})
-	if err != nil {
+	if _, err := s.Publish(ctx, topic, []byte("next"), store.PublishOpts{TTL: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
-	_ = msgID2
-	late2, err := s.Claim(ctx, topic, "late", "w1", 10*time.Second, 10)
+	late2, err := s.Claim(ctx, lateID, "w1", 10*time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,21 +112,20 @@ func TestClaimCompeteAndLeaseRedelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	topic := "compete_" + time.Now().Format("150405.000")
-	if _, err := s.EnsureChannel(ctx, topic, "workers"); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 4; i++ {
-		if _, err := s.Publish(ctx, topic, []byte{byte(i)}, store.PublishOpts{
-			ExpiresAt: time.Now().UTC().Add(time.Hour),
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	c1, err := s.Claim(ctx, topic, "workers", "a", time.Second, 2)
+	chID, err := s.EnsureChannel(ctx, topic, "workers")
 	if err != nil {
 		t.Fatal(err)
 	}
-	c2, err := s.Claim(ctx, topic, "workers", "b", time.Second, 2)
+	for i := 0; i < 4; i++ {
+		if _, err := s.Publish(ctx, topic, []byte{byte(i)}, store.PublishOpts{TTL: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c1, err := s.Claim(ctx, chID, "a", time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := s.Claim(ctx, chID, "b", time.Second, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,13 +140,12 @@ func TestClaimCompeteAndLeaseRedelivery(t *testing.T) {
 		seen[d.ID] = true
 	}
 
-	// Short lease: do not ack first claim; reap then redeliver.
 	d := c1[0]
 	time.Sleep(1200 * time.Millisecond)
 	if _, err := s.ReapExpiredLeases(ctx, 100); err != nil {
 		t.Fatal(err)
 	}
-	again, err := s.Claim(ctx, topic, "workers", "c", 10*time.Second, 10)
+	again, err := s.Claim(ctx, chID, "c", 10*time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +158,6 @@ func TestClaimCompeteAndLeaseRedelivery(t *testing.T) {
 	if !found {
 		t.Fatal("expected redelivery after lease expiry")
 	}
-	// Late ack with old token must fail.
 	if err := s.Ack(ctx, d.ID, d.LeaseToken); err == nil {
 		t.Fatal("expected stale ack to fail")
 	}

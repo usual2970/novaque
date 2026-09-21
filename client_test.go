@@ -83,7 +83,7 @@ func (f *fakeStore) Publish(_ context.Context, topic string, body []byte, _ stor
 	return id, nil
 }
 
-func (f *fakeStore) Claim(context.Context, string, string, string, time.Duration, int) ([]store.Delivery, error) {
+func (f *fakeStore) Claim(context.Context, int64, string, time.Duration, int) ([]store.Delivery, error) {
 	return nil, nil
 }
 func (f *fakeStore) Ack(context.Context, int64, string) error { return nil }

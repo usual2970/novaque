@@ -30,7 +30,7 @@ func New(db *sql.DB) *Store {
 
 var _ store.Store = (*Store)(nil)
 
-// Migrate applies schema DDL idempotently.
+// Migrate applies schema DDL idempotently and upgrades older delivery tables.
 func (s *Store) Migrate(ctx context.Context) error {
 	raw, err := schemaFS.ReadFile("schema.sql")
 	if err != nil {
@@ -41,6 +41,33 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("mysql migrate: %w\nstmt: %s", err, stmt)
 		}
+	}
+	return s.ensureDeliveryExpiresAt(ctx)
+}
+
+func (s *Store) ensureDeliveryExpiresAt(ctx context.Context) error {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'novaque_deliveries'
+		  AND COLUMN_NAME = 'expires_at'`).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		ALTER TABLE novaque_deliveries
+		ADD COLUMN expires_at DATETIME(3) NOT NULL DEFAULT '2099-01-01 00:00:00.000' AFTER available_at`); err != nil {
+		return fmt.Errorf("add deliveries.expires_at: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE novaque_deliveries d
+		INNER JOIN novaque_messages m ON m.id = d.message_id
+		SET d.expires_at = m.expires_at`); err != nil {
+		return fmt.Errorf("backfill deliveries.expires_at: %w", err)
 	}
 	return nil
 }
@@ -178,14 +205,15 @@ func (s *Store) Publish(ctx context.Context, topic string, body []byte, opts sto
 		}
 	}
 
-	// Single-statement fan-out snapshot of channels visible at insert time.
+	// Single-statement fan-out; copy message expires_at onto each delivery (claim hot path).
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO novaque_deliveries
-		  (message_id, channel_id, status, available_at, attempts, max_attempts)
-		SELECT ?, c.id, ?, NOW(3), 0, ?
+		  (message_id, channel_id, status, available_at, attempts, max_attempts, expires_at)
+		SELECT ?, c.id, ?, NOW(3), 0, ?, m.expires_at
 		FROM novaque_channels c
+		INNER JOIN novaque_messages m ON m.id = ?
 		WHERE c.topic_id = ?`,
-		messageID, store.StatusPending, maxAttempts, topicID)
+		messageID, store.StatusPending, maxAttempts, messageID, topicID)
 	if err != nil {
 		return 0, err
 	}

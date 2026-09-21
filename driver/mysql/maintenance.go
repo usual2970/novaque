@@ -25,24 +25,24 @@ func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error)
 	return res.RowsAffected()
 }
 
-// PurgeExpired deletes expired messages and deliveries that are not under a valid lease.
+// PurgeExpired deletes expired deliveries (and orphan messages) to keep the claim index small.
 func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	// Prefer purging by delivery.expires_at (hot-path column); skip valid leases.
 	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM novaque_deliveries
 		WHERE id IN (
 		  SELECT id FROM (
 		    SELECT d.id
 		    FROM novaque_deliveries d
-		    INNER JOIN novaque_messages m ON m.id = d.message_id
-		    WHERE m.expires_at < NOW(3)
+		    WHERE d.expires_at < NOW(3)
 		      AND (
 		        d.status IN (?, ?)
 		        OR (d.status = ? AND (d.lease_until IS NULL OR d.lease_until < NOW(3)))
 		      )
-		    ORDER BY m.expires_at ASC
+		    ORDER BY d.expires_at ASC
 		    LIMIT ?
 		  ) doomed
 		)`,
