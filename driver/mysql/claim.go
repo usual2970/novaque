@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -102,7 +103,7 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 		args = append(args, id)
 	}
 	q := fmt.Sprintf(`
-		SELECT d.id, d.message_id, d.channel_id, t.name, c.name, m.body,
+		SELECT d.id, d.message_id, d.channel_id, c.topic_id, t.name, c.name, m.body,
 		       d.status, d.attempts, d.max_attempts, d.lease_token, d.available_at, d.lease_until
 		FROM novaque_deliveries d
 		INNER JOIN novaque_messages m ON m.id = d.message_id
@@ -118,13 +119,14 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 
 	var out []store.Delivery
 	var deadIDs []int64
+	var statTopicID int64 // every row in a Claim shares the channel, hence the topic
 	byID := make(map[int64]store.Delivery, len(claimedIDs))
 	for bodyRows.Next() {
 		var d store.Delivery
 		var availableSec int64
 		var leaseUntilSec sql.NullInt64
 		if err := bodyRows.Scan(
-			&d.ID, &d.MessageID, &d.ChannelID, &d.Topic, &d.Channel, &d.Body,
+			&d.ID, &d.MessageID, &d.ChannelID, &statTopicID, &d.Topic, &d.Channel, &d.Body,
 			&d.Status, &d.Attempts, &d.MaxAttempts, &d.LeaseToken, &availableSec, &leaseUntilSec,
 		); err != nil {
 			return nil, err
@@ -165,11 +167,38 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	// Counters bump only after the commit succeeded (R5). claim counts every
+	// row leased to in_flight here — poison rows included — and dead counts
+	// rows terminalized inside this call (KTD4).
+	s.recordStat(statTopicID, channelID, statClaim, int64(len(claimedIDs)))
+	if len(deadIDs) > 0 {
+		s.recordStat(statTopicID, channelID, statDead, int64(len(deadIDs)))
+	}
 	return out, nil
 }
 
-// Ack deletes the delivery when the lease token still matches.
+// ackAttribution resolves the stats coordinates of a still-leased delivery in
+// one indexed round trip. It returns sql.ErrNoRows on mismatch; the caller
+// falls through to its mutation, which then affects 0 rows and produces the
+// legacy error without recording anything (R5).
+func (s *Store) ackAttribution(ctx context.Context, deliveryID int64, leaseToken string) (topicID, channelID int64, err error) {
+	err = s.db.QueryRowContext(ctx, `
+		SELECT c.topic_id, d.channel_id
+		FROM novaque_deliveries d
+		INNER JOIN novaque_channels c ON c.id = d.channel_id
+		WHERE d.id = ? AND d.lease_token = ? AND d.status = ?`,
+		deliveryID, leaseToken, store.StatusInFlight).Scan(&topicID, &channelID)
+	return topicID, channelID, err
+}
+
+// Ack deletes the delivery when the lease token still matches. The read-only
+// attribution lookup must find the row before the delete (it disappears on
+// ack), but only a DELETE affecting exactly 1 row records the event.
 func (s *Store) Ack(ctx context.Context, deliveryID int64, leaseToken string) error {
+	topicID, channelID, scanErr := s.ackAttribution(ctx, deliveryID, leaseToken)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return scanErr
+	}
 	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM novaque_deliveries
 		WHERE id = ? AND lease_token = ? AND status = ?`,
@@ -184,11 +213,19 @@ func (s *Store) Ack(ctx context.Context, deliveryID int64, leaseToken string) er
 	if n == 0 {
 		return fmt.Errorf("ack rejected: delivery %d lease mismatch or not in_flight", deliveryID)
 	}
+	if scanErr == nil {
+		s.recordStat(topicID, channelID, statAck, 1)
+	}
 	return nil
 }
 
-// Requeue returns a delivery to pending when the lease token matches.
+// Requeue returns a delivery to pending when the lease token matches. Same
+// attribution shape as Ack; only an UPDATE affecting exactly 1 row counts.
 func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string, availableAt time.Time) error {
+	topicID, channelID, scanErr := s.ackAttribution(ctx, deliveryID, leaseToken)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return scanErr
+	}
 	var res sql.Result
 	var err error
 	if availableAt.IsZero() {
@@ -215,6 +252,9 @@ func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string
 	}
 	if n == 0 {
 		return fmt.Errorf("requeue rejected: delivery %d lease mismatch or not in_flight", deliveryID)
+	}
+	if scanErr == nil {
+		s.recordStat(topicID, channelID, statRequeue, 1)
 	}
 	return nil
 }

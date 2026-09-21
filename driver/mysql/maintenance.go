@@ -2,11 +2,15 @@ package mysql
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"github.com/usual2970/novaque/store"
 )
 
 // ReapExpiredLeases resets expired in_flight deliveries to pending (DB time).
+// It records no stats at all (KTD5): the requeue counter belongs to handler
+// Requeue only.
 func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 100
@@ -25,32 +29,82 @@ func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error)
 	return res.RowsAffected()
 }
 
-// PurgeExpired deletes expired deliveries (and orphan messages) to keep the claim index small.
+// PurgeExpired deletes expired deliveries (and orphan messages) to keep the
+// claim index small. Counters need no transaction anymore (they are buffered,
+// not written in-tx): a read-only SELECT captures the doomed batch with its
+// per-channel attribution, the DELETE rechecks eligibility so a mid-batch ack
+// cannot die, and purge deltas are recorded only after the delete succeeds.
+// Attribution comes from the SELECT, so a mid-batch race can over-count purge
+// by a hair — acceptable on a maintenance path.
 func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	// Prefer purging by delivery.expires_at (hot-path column); skip valid leases.
-	res, err := s.db.ExecContext(ctx, `
-		DELETE FROM novaque_deliveries
-		WHERE id IN (
-		  SELECT id FROM (
-		    SELECT d.id
-		    FROM novaque_deliveries d
-		    WHERE d.expires_at < `+sqlNow+`
-		      AND (
-		        d.status IN (?, ?)
-		        OR (d.status = ? AND (d.lease_until IS NULL OR d.lease_until < `+sqlNow+`))
-		      )
-		    ORDER BY d.expires_at ASC
-		    LIMIT ?
-		  ) doomed
-		)`,
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT d.id, d.channel_id, c.topic_id
+		FROM novaque_deliveries d
+		INNER JOIN novaque_channels c ON c.id = d.channel_id
+		WHERE d.expires_at < `+sqlNow+`
+		  AND (
+		    d.status IN (?, ?)
+		    OR (d.status = ? AND (d.lease_until IS NULL OR d.lease_until < `+sqlNow+`))
+		  )
+		ORDER BY d.expires_at ASC
+		LIMIT ?`,
 		store.StatusPending, store.StatusDead, store.StatusInFlight, limit)
 	if err != nil {
 		return 0, err
 	}
-	n1, _ := res.RowsAffected()
+	type purgeKey struct {
+		topicID   int64
+		channelID int64
+	}
+	counts := make(map[purgeKey]int64)
+	var ids []int64
+	for rows.Next() {
+		var id, channelID, topicID int64
+		if err := rows.Scan(&id, &channelID, &topicID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+		counts[purgeKey{topicID: topicID, channelID: channelID}]++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	var n1 int64
+	if len(ids) > 0 {
+		placeholders := make([]string, len(ids))
+		args := make([]any, 0, len(ids)+3)
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		// Keep the eligibility conditions in the DELETE so rows that changed
+		// state between SELECT and DELETE survive (mid-batch acks etc.).
+		q := fmt.Sprintf(`
+			DELETE FROM novaque_deliveries
+			WHERE id IN (%s)
+			  AND expires_at < `+sqlNow+`
+			  AND (
+			    status IN (?, ?)
+			    OR (status = ? AND (lease_until IS NULL OR lease_until < `+sqlNow+`))
+			  )`, strings.Join(placeholders, ","))
+		args = append(args, store.StatusPending, store.StatusDead, store.StatusInFlight)
+		res, err := s.db.ExecContext(ctx, q, args...)
+		if err != nil {
+			return 0, err
+		}
+		n1, _ = res.RowsAffected()
+		for k, n := range counts {
+			s.recordStat(k.topicID, k.channelID, statPurged, n)
+		}
+	}
+	// Orphan message pass: never records any stats event.
 
 	res2, err := s.db.ExecContext(ctx, `
 		DELETE FROM novaque_messages

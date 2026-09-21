@@ -7,6 +7,7 @@ import (
 	"embed"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/usual2970/novaque/store"
 )
@@ -20,6 +21,12 @@ const DefaultMaxAttempts = 5
 // Store is the MySQL implementation of store.Store.
 type Store struct {
 	db *sql.DB
+
+	// statMu guards statBuf, the in-process counter sink: mutators buffer
+	// deltas here only after a commit, and FlushStats drains them in batches,
+	// so no mutation transaction ever carries a stats write.
+	statMu  sync.Mutex
+	statBuf map[statKey]int64
 }
 
 // New wraps a caller-owned *sql.DB. Requires MySQL >= 8.0.1 (InnoDB, SKIP LOCKED).
@@ -231,8 +238,39 @@ func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts st
 		return 0, err
 	}
 
+	// Read-only attribution for stats (no extra writes in this tx): the
+	// delivery rows were just inserted above, so the fan-out is exact here.
+	attrRows, err := tx.QueryContext(ctx, `
+		SELECT channel_id FROM novaque_deliveries WHERE message_id = ?`, messageID)
+	if err != nil {
+		return 0, err
+	}
+	fanout := make(map[int64]int64) // channelID -> deliveries (one per channel)
+	for attrRows.Next() {
+		var chID int64
+		if err := attrRows.Scan(&chID); err != nil {
+			attrRows.Close()
+			return 0, err
+		}
+		fanout[chID]++
+	}
+	attrRows.Close()
+	if err := attrRows.Err(); err != nil {
+		return 0, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return 0, err
+	}
+	// Counters bump only after the commit succeeded (R5). Publish unit is one
+	// delivery per channel; zero-channel publishes land on the channel_id=0
+	// sentinel row (KTD3).
+	if len(fanout) == 0 {
+		s.recordStat(topicID, 0, statPublish, 1)
+	} else {
+		for chID, n := range fanout {
+			s.recordStat(topicID, chID, statPublish, n)
+		}
 	}
 	return messageID, nil
 }
