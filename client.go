@@ -2,6 +2,7 @@ package novaque
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -16,10 +17,12 @@ type Options struct {
 	DefaultLease       time.Duration
 	DefaultMaxAttempts int
 	PollInterval       time.Duration
-	MaxInFlight        int
-	ReapInterval       time.Duration
-	PurgeInterval      time.Duration
-	MaintenanceBatch   int
+	// MaxInFlight is concurrent claim+handle workers per Consumer (each claims 1).
+	// Raise this for in-process concurrency; add more OS processes for multi-node scale.
+	MaxInFlight      int
+	ReapInterval     time.Duration
+	PurgeInterval    time.Duration
+	MaintenanceBatch int
 }
 
 func (o Options) withDefaults() Options {
@@ -205,6 +208,8 @@ type Consumer struct {
 }
 
 // Subscribe ensures topic/channel and returns a Consumer (not yet started).
+// Call Start to launch MaxInFlight concurrent workers; this split lets you
+// wire many subscriptions before opening the floodgates under load.
 func (c *Client) Subscribe(topic, channel string, handler Handler) (*Consumer, error) {
 	if handler == nil {
 		return nil, errors.New("novaque: handler is nil")
@@ -217,11 +222,24 @@ func (c *Client) Subscribe(topic, channel string, handler Handler) (*Consumer, e
 		topic:   topic,
 		channel: channel,
 		handler: handler,
-		owner:   fmt.Sprintf("%p", c),
+		owner:   newOwnerID(),
 	}, nil
 }
 
-// Start begins polling.
+// SubscribeAndStart is Subscribe followed by Start — convenient when a single
+// consumer should begin competing for work immediately.
+func (c *Client) SubscribeAndStart(ctx context.Context, topic, channel string, handler Handler) (*Consumer, error) {
+	co, err := c.Subscribe(topic, channel, handler)
+	if err != nil {
+		return nil, err
+	}
+	if err := co.Start(ctx); err != nil {
+		return nil, err
+	}
+	return co, nil
+}
+
+// Start launches MaxInFlight poll workers. Safe to call once; later calls are no-ops.
 func (co *Consumer) Start(ctx context.Context) error {
 	co.mu.Lock()
 	defer co.mu.Unlock()
@@ -235,12 +253,20 @@ func (co *Consumer) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(base)
 	co.stop = cancel
 	co.started = true
-	co.wg.Add(1)
-	go co.loop(runCtx)
+
+	n := co.client.opts.MaxInFlight
+	if n <= 0 {
+		n = 1
+	}
+	co.wg.Add(n)
+	for i := 0; i < n; i++ {
+		workerID := i
+		go co.worker(runCtx, workerID)
+	}
 	return nil
 }
 
-// Shutdown stops polling and waits for in-flight handler return.
+// Shutdown stops all workers and waits for in-flight handlers to finish (or ctx).
 func (co *Consumer) Shutdown(ctx context.Context) error {
 	co.mu.Lock()
 	if !co.started {
@@ -266,8 +292,9 @@ func (co *Consumer) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (co *Consumer) loop(ctx context.Context) {
+func (co *Consumer) worker(ctx context.Context, workerID int) {
 	defer co.wg.Done()
+	owner := fmt.Sprintf("%s#%d", co.owner, workerID)
 	backoff := co.client.opts.PollInterval
 	for {
 		select {
@@ -276,8 +303,8 @@ func (co *Consumer) loop(ctx context.Context) {
 		default:
 		}
 
-		// Claim one at a time so MaxInFlight>1 does not hoard leases during serial handling.
-		claimed, err := co.client.store.Claim(ctx, co.topic, co.channel, co.owner, co.client.opts.DefaultLease, 1)
+		// One claim per worker keeps leases aligned with active handlers under concurrency.
+		claimed, err := co.client.store.Claim(ctx, co.topic, co.channel, owner, co.client.opts.DefaultLease, 1)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -338,4 +365,10 @@ func finishWithRetry(ctx context.Context, fn func(context.Context) error) error 
 		}
 	}
 	return err
+}
+
+func newOwnerID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x", b)
 }

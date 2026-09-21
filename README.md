@@ -55,7 +55,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	_ = cons.Start(ctx)
+	_ = cons.Start(ctx) // launches Options.MaxInFlight concurrent workers
 	defer cons.Shutdown(context.Background())
 
 	if _, err := client.Publish(ctx, "events", []byte(`{"ok":true}`), novaque.PublishOpts{}); err != nil {
@@ -74,6 +74,13 @@ func main() {
 | Delivery | At-least-once; lease expiry redelivers; ack requires matching lease token |
 | Poison | After `max_attempts` claims, delivery is marked `dead` |
 | Backend | Only MySQL driver ships; use `store.Store` for fakes/tests |
+
+## Concurrency
+
+- **In-process:** set `Options.MaxInFlight` (default 1). `Consumer.Start` runs that many workers; each claims **one** message at a time so leases match active handlers.
+- **Multi-node:** run more processes against the same DB/channel; they compete via `SKIP LOCKED`.
+- **API:** prefer `Subscribe` then `Start` when wiring many consumers under load; use `SubscribeAndStart` for the simple path.
+- Size `*sql.DB` pool ≥ `MaxInFlight` (plus publish/reaper headroom).
 
 ## Layout
 

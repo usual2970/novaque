@@ -79,3 +79,68 @@ func TestClientConsumerEndToEnd(t *testing.T) {
 		t.Fatalf("want 2 deliveries, got %v", got)
 	}
 }
+
+func TestHighConcurrencyCompete(t *testing.T) {
+	db := testmysql.Open(t)
+	store := mysqldriver.New(db)
+	client, err := novaque.Open(store, novaque.Options{
+		DefaultLease:  10 * time.Second,
+		PollInterval:  20 * time.Millisecond,
+		MaxInFlight:   8,
+		ReapInterval:  time.Hour,
+		PurgeInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := client.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "conc_" + time.Now().Format("150405.000")
+	const n = 40
+	seen := make(map[int64]int)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(n)
+
+	cons, err := client.SubscribeAndStart(ctx, topic, "workers", func(_ context.Context, msg *novaque.Message) error {
+		mu.Lock()
+		seen[msg.MessageID]++
+		mu.Unlock()
+		wg.Done()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cons.Shutdown(context.Background())
+
+	for i := 0; i < n; i++ {
+		if _, err := client.Publish(ctx, topic, []byte{byte(i)}, novaque.PublishOpts{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("timeout; got %d unique of %d", len(seen), n)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != n {
+		t.Fatalf("want %d unique messages, got %d", n, len(seen))
+	}
+	for id, c := range seen {
+		if c != 1 {
+			t.Fatalf("message %d delivered %d times", id, c)
+		}
+	}
+}
