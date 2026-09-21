@@ -45,6 +45,10 @@ func (nopStore) ChannelBacklog(context.Context, int64) (store.ChannelBacklog, er
 func (nopStore) PruneStats(context.Context, int) (int64, error) { return 0, nil }
 func (nopStore) FlushStats(context.Context) error               { return nil }
 
+// nopStore must keep satisfying the full Store contract, stats included
+// (U4 fake completeness check).
+var _ store.Store = nopStore{}
+
 // recEntry is one recorded call on a recordingLogger.
 type recEntry struct {
 	msg    string

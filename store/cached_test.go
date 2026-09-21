@@ -91,6 +91,10 @@ func (c *countingStore) FlushStats(context.Context) error {
 	return nil
 }
 
+// countingStore must keep satisfying the full Store contract, stats included
+// (U4 fake completeness check).
+var _ store.Store = (*countingStore)(nil)
+
 func TestCachingStoreMemoizesEnsure(t *testing.T) {
 	inner := newCounting()
 	s := store.WithCache(inner)
@@ -176,5 +180,65 @@ func TestWithCacheIdempotent(t *testing.T) {
 	s2 := store.WithCache(s1)
 	if s1 != s2 {
 		t.Fatal("WithCache should not double-wrap")
+	}
+}
+
+// TestCachingStoreStatsConcurrentSmoke covers U4: a short concurrent hammer
+// through store.WithCache on every stats method — with countingStore already
+// atomic, each of the attempts must reach inner exactly once (R7 passthrough
+// holds under concurrency) and nothing may panic.
+func TestCachingStoreStatsConcurrentSmoke(t *testing.T) {
+	inner := newCounting()
+	s := store.WithCache(inner)
+	ctx := context.Background()
+
+	const goroutines = 8
+	const rounds = 50
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				if _, err := s.ChannelCounters(ctx, 7); err != nil {
+					t.Errorf("channel counters: %v", err)
+					return
+				}
+				if _, err := s.TopicCounters(ctx, 5); err != nil {
+					t.Errorf("topic counters: %v", err)
+					return
+				}
+				if _, err := s.ChannelBacklog(ctx, 7); err != nil {
+					t.Errorf("backlog: %v", err)
+					return
+				}
+				if _, err := s.PruneStats(ctx, 30); err != nil {
+					t.Errorf("prune: %v", err)
+					return
+				}
+				if err := s.FlushStats(ctx); err != nil {
+					t.Errorf("flush: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	want := int64(goroutines * rounds)
+	if n := inner.channelCountersCalls.Load(); n != want {
+		t.Errorf("ChannelCounters inner calls = %d, want %d", n, want)
+	}
+	if n := inner.topicCountersCalls.Load(); n != want {
+		t.Errorf("TopicCounters inner calls = %d, want %d", n, want)
+	}
+	if n := inner.backlogCalls.Load(); n != want {
+		t.Errorf("ChannelBacklog inner calls = %d, want %d", n, want)
+	}
+	if n := inner.pruneCalls.Load(); n != want {
+		t.Errorf("PruneStats inner calls = %d, want %d", n, want)
+	}
+	if n := inner.flushCalls.Load(); n != want {
+		t.Errorf("FlushStats inner calls = %d, want %d", n, want)
 	}
 }
