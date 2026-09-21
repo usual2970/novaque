@@ -23,6 +23,10 @@ type Options struct {
 	ReapInterval     time.Duration
 	PurgeInterval    time.Duration
 	MaintenanceBatch int
+	// Logger receives structured operational logs (Debug on success, Error on
+	// swallowed failures; message bodies are never logged). nil = silent
+	// built-in zap Nop default; pass Zap(yourZapLogger) to inject.
+	Logger Logger
 }
 
 func (o Options) withDefaults() Options {
@@ -50,6 +54,9 @@ func (o Options) withDefaults() Options {
 	if o.MaintenanceBatch <= 0 {
 		o.MaintenanceBatch = 100
 	}
+	if o.Logger == nil {
+		o.Logger = defaultLogger()
+	}
 	return o
 }
 
@@ -57,11 +64,20 @@ func (o Options) withDefaults() Options {
 type Client struct {
 	store store.Store
 	opts  Options
+	log   Logger
 
 	mu      sync.Mutex
 	started bool
 	stop    context.CancelFunc
 	wg      sync.WaitGroup
+}
+
+// logger returns the Client's Logger; never nil (silent Nop fallback).
+func (c *Client) logger() Logger {
+	if c.log == nil {
+		return defaultLogger()
+	}
+	return c.log
 }
 
 // Open constructs a Client from any Store implementation (e.g. mysql.New(db)).
@@ -70,7 +86,8 @@ func Open(s store.Store, opts Options) (*Client, error) {
 	if s == nil {
 		return nil, errors.New("novaque: store is nil")
 	}
-	return &Client{store: store.WithCache(s), opts: opts.withDefaults()}, nil
+	o := opts.withDefaults()
+	return &Client{store: store.WithCache(s), opts: o, log: o.Logger}, nil
 }
 
 // Migrate applies the store's schema.
