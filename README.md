@@ -170,7 +170,7 @@ Semantics worth knowing:
 
 - **Async counters.** Mutations buffer counter deltas in-process; the maintenance loop flushes them every `StatsFlushInterval` (default 2s). Reads are eventually consistent within that window; a hard crash loses at most the unflushed window. A flush that landed server-side but *looked* failed is retried and can double-count — at-least-once, never loses counts. Graceful `Shutdown` performs one final flush.
 - **Reap is not requeue.** Only a handler-driven `Requeue` counts. A lease that expires and is re-claimed counts `claim` again — the same at-least-once rule as delivery.
-- **Ready vs Pending.** Delayed publishes (`PublishOpts.Delay`) count as `Pending` but not `Ready` until `available_at` passes; claim only takes `Ready`.
+- **Ready vs Pending.** Delayed publishes (`PublishOpts.Delay`) count as `Pending` but not `Ready` until `available_at` passes; claim only takes `Ready`. `Ready` mirrors claim eligibility exactly, so pending rows whose TTL has expired (not yet purged) stay in `Pending` but drop out of `Ready`.
 - **Zero-channel publishes** count on a topic-level row (visible in `TopicCounters`; no channel backlog changes).
 - **Retention.** Day buckets older than `StatsRetentionDays` (default 30) are pruned every `StatsPruneInterval` (default 1h). Prune needs `Start` — or call `PruneStats` / `FlushStats` explicitly when you host novaque without maintenance loops.
 - **Privacy.** Stats store ids and counts only — never message payloads.

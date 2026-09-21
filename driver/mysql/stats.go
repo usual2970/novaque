@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/usual2970/novaque/store"
@@ -98,7 +99,11 @@ func (s *Store) FlushStats(ctx context.Context) error {
 
 	// Coalesce kinds into one row per (topic, channel). order fixes this
 	// flush's row sequence, so the batch loop and a failure re-merge agree on
-	// which rows are remaining (map range order would not).
+	// which rows are remaining (map range order would not). Sorting it by
+	// (topicID, channelID) also gives every flush — the loop tick, an explicit
+	// Client.FlushStats, Shutdown's final drain, or another process in
+	// multi-process mode — one global row-lock order, so overlapping flushes
+	// cannot AB/BA deadlock on the multi-row upsert.
 	counts := make(map[statCoord][numStatKinds]int64, len(pending))
 	var order []statCoord
 	for k, n := range pending {
@@ -110,6 +115,12 @@ func (s *Store) FlushStats(ctx context.Context) error {
 		vals[k.kind] += n
 		counts[rk] = vals
 	}
+	sort.Slice(order, func(i, j int) bool {
+		if order[i].topicID != order[j].topicID {
+			return order[i].topicID < order[j].topicID
+		}
+		return order[i].channelID < order[j].channelID
+	})
 
 	for start := 0; start < len(order); start += statsFlushBatch {
 		end := min(start+statsFlushBatch, len(order))
@@ -219,8 +230,11 @@ func (s *Store) TopicCounters(ctx context.Context, topicID int64) (store.Channel
 
 // ChannelBacklog counts live delivery rows for one channel in a single pass
 // over the idx_novaque_deliveries_claim prefix (channel_id, status,
-// available_at). Ready is the claimable slice of Pending: available_at has
-// passed the DB clock, so delayed publishes are excluded until due.
+// available_at). Ready is the claimable slice of Pending and mirrors Claim's
+// eligibility exactly (claim.go): available_at has passed the DB clock AND the
+// delivery's TTL has not. Delayed publishes are excluded until due, and
+// expired-but-not-yet-purged pending rows stay out of Ready (they can never be
+// claimed; PurgeExpired reaps them on its tick) while Pending still counts them.
 func (s *Store) ChannelBacklog(ctx context.Context, channelID int64) (store.ChannelBacklog, error) {
 	if channelID <= 0 {
 		return store.ChannelBacklog{}, fmt.Errorf("mysql stats: invalid channel id %d", channelID)
@@ -229,7 +243,7 @@ func (s *Store) ChannelBacklog(ctx context.Context, channelID int64) (store.Chan
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 		  COUNT(CASE WHEN status = ? THEN 1 END),
-		  COUNT(CASE WHEN status = ? AND available_at <= `+sqlNow+` THEN 1 END),
+		  COUNT(CASE WHEN status = ? AND available_at <= `+sqlNow+` AND expires_at > `+sqlNow+` THEN 1 END),
 		  COUNT(CASE WHEN status = ? THEN 1 END),
 		  COUNT(CASE WHEN status = ? THEN 1 END)
 		FROM novaque_deliveries

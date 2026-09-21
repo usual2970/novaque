@@ -56,8 +56,10 @@ type ChannelCounters struct {
 }
 
 // ChannelBacklog is a live snapshot of delivery row counts for one channel.
-// Ready is the claimable slice of Pending (delayed publishes count as Pending
-// only until available_at passes the DB clock).
+// Ready is the claimable slice of Pending and mirrors Claim's eligibility:
+// available_at has passed the DB clock AND the TTL has not expired (delayed
+// publishes count as Pending only until due; expired-but-unpurged rows stay
+// Pending but are never Ready).
 type ChannelBacklog struct {
 	Pending  int64
 	Ready    int64

@@ -348,3 +348,69 @@ func TestStatsChannelIsolation(t *testing.T) {
 		t.Fatalf("topic counters = %+v err=%v, want %+v", tc, err, wantTopic)
 	}
 }
+
+// TestStatsConcurrentFlushLockOrder: both stores' sinks hold the same coords
+// and their FlushStats run concurrently round after round. FlushStats sorts
+// coords by (topicID, channelID) before batching, so every multi-row upsert —
+// whichever store, tick, or process issued it — locks rows in one global
+// order and two overlapping flushes cannot AB/BA deadlock (InnoDB ER 1213).
+// A deadlock surfaces here as a failed flush round (kept loud on purpose);
+// the totals assert no delta was lost or doubled either way.
+func TestStatsConcurrentFlushLockOrder(t *testing.T) {
+	db1 := testmysql.Open(t)
+	db2 := testmysql.Open(t)
+	s1 := mysql.New(db1)
+	s2 := mysql.New(db2)
+	ctx := context.Background()
+	if err := s1.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "statlock_" + time.Now().Format("150405.000")
+	var chIDs []int64
+	for _, name := range []string{"a", "b", "c"} {
+		id, err := s1.EnsureChannel(ctx, topic, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chIDs = append(chIDs, id)
+	}
+	topicID, err := s1.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const rounds = 20
+	for r := 0; r < rounds; r++ {
+		// Each side fans a fresh publish out to all three channels, so both
+		// sinks hold the same three coords before the flushes race.
+		for _, s := range []*mysql.Store{s1, s2} {
+			if _, err := s.Publish(ctx, topicID, []byte("m"), store.PublishOpts{TTL: time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		for _, s := range []*mysql.Store{s1, s2} {
+			go func(s *mysql.Store) {
+				defer wg.Done()
+				if err := s.FlushStats(ctx); err != nil {
+					t.Errorf("round %d concurrent flush: %v", r, err)
+				}
+			}(s)
+		}
+		wg.Wait()
+	}
+
+	// Both sinks drained: each channel saw 2 fan-out publishes per round.
+	for _, id := range chIDs {
+		if c, err := s1.ChannelCounters(ctx, id); err != nil || c.Publish != 2*rounds {
+			t.Fatalf("channel %d counters = %+v err=%v, want publish=%d", id, c, err, 2*rounds)
+		}
+	}
+	if tc, err := s1.TopicCounters(ctx, topicID); err != nil || tc.Publish != 2*rounds*int64(len(chIDs)) {
+		t.Fatalf("topic rollup = %+v err=%v, want publish=%d", tc, err, 2*rounds*int64(len(chIDs)))
+	}
+}
