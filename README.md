@@ -59,7 +59,7 @@ func main() {
 	if err := client.Migrate(ctx); err != nil {
 		log.Fatal(err)
 	}
-	if err := client.Start(ctx); err != nil { // lease reaper + TTL purge
+	if err := client.Start(ctx); err != nil { // lease reaper + TTL purge + stats flush/prune
 		log.Fatal(err)
 	}
 	defer client.Shutdown(context.Background())
@@ -108,6 +108,9 @@ Publisher ──Publish──▶ topic ──fan-out──▶ channel A ──co
 | `ReapInterval` | 1s | expired-lease reaper tick |
 | `PurgeInterval` | 5s | TTL cleanup tick |
 | `MaintenanceBatch` | 100 | rows per reaper/purge pass |
+| `StatsRetentionDays` | 30 | UTC days a counter day bucket is kept before prune |
+| `StatsFlushInterval` | 2s | stats counter flush tick (buffered deltas → DB) |
+| `StatsPruneInterval` | 1h | stats retention prune tick |
 | `Logger` | zap Nop (silent) | structured operational logs; inject e.g. `Zap(yourZapLogger)` |
 
 ### PublishOpts
@@ -136,10 +139,42 @@ client, err := novaque.Open(mysqldriver.New(db), novaque.Options{
 
 - **Lifecycle `Info`** — Client and Consumer Start/Shutdown, once per actual transition (duplicate Start / Shutdown-when-not-started stay silent).
 - **Hot path `Debug`** — successful publish (`topic`, `message_id`) and non-empty claim (`topic`, `channel`, `count`). Expect high volume if you enable Debug in production.
-- **`Error` only for swallowed failures** — claim backoff, reap, purge, and final ack/requeue after retries. Errors returned to your caller (e.g. Publish) are not duplicate-logged; shutdown cancels are silent.
+- **`Error` only for swallowed failures** — claim backoff, reap, purge, stats flush/prune, and final ack/requeue after retries. Errors returned to your caller (e.g. Publish) are not duplicate-logged; shutdown cancels are silent.
 - **Payload privacy** — message bodies are **never logged**; only ids, topic, channel, counts, and errors.
 
 The quick start's stdlib `log.Printf` is caller-side printing, separate from this library logging.
+
+## Stats
+
+novaque keeps two kinds of numbers, and the split matters:
+
+- **Counters** — `publish` / `claim` / `ack` / `requeue` / `dead` / `purge` event totals stored as **UTC day buckets** keyed by topic/channel. They survive ack deletes and message TTL purges; they only fall when the retention prune removes old day buckets.
+- **Backlog** — a **live count** of `novaque_deliveries` rows right now. It drops as work is acked, purged, or dead-lettered, and is never day-bucketed.
+
+| Method | Returns |
+|--------|---------|
+| `ChannelCounters(ctx, topic, channel)` | summed counters over retained days for one channel |
+| `TopicCounters(ctx, topic)` | counters rolled up over the topic (per-channel rows plus the topic-level row) |
+| `ChannelBacklog(ctx, topic, channel)` | live `Pending` / `Ready` / `InFlight` / `Dead` counts |
+| `FlushStats(ctx)` | drains buffered counter deltas into the DB now |
+| `PruneStats(ctx)` | deletes day buckets older than `StatsRetentionDays`; returns rows deleted |
+
+```go
+cc, err := client.ChannelCounters(ctx, "events", "indexer")
+bl, err := client.ChannelBacklog(ctx, "events", "indexer")
+log.Printf("publish=%d ack=%d pending=%d ready=%d",
+    cc.Publish, cc.Ack, bl.Pending, bl.Ready)
+```
+
+Semantics worth knowing:
+
+- **Async counters.** Mutations buffer counter deltas in-process; the maintenance loop flushes them every `StatsFlushInterval` (default 2s). Reads are eventually consistent within that window; a hard crash loses at most the unflushed window. A flush that landed server-side but *looked* failed is retried and can double-count — at-least-once, never loses counts. Graceful `Shutdown` performs one final flush.
+- **Reap is not requeue.** Only a handler-driven `Requeue` counts. A lease that expires and is re-claimed counts `claim` again — the same at-least-once rule as delivery.
+- **Ready vs Pending.** Delayed publishes (`PublishOpts.Delay`) count as `Pending` but not `Ready` until `available_at` passes; claim only takes `Ready`.
+- **Zero-channel publishes** count on a topic-level row (visible in `TopicCounters`; no channel backlog changes).
+- **Retention.** Day buckets older than `StatsRetentionDays` (default 30) are pruned every `StatsPruneInterval` (default 1h). Prune needs `Start` — or call `PruneStats` / `FlushStats` explicitly when you host novaque without maintenance loops.
+- **Privacy.** Stats store ids and counts only — never message payloads.
+- **Shutdown order.** Stop Consumers before the Client so their final acks land before the Client's last counter flush.
 
 ## Guarantees
 
@@ -152,6 +187,7 @@ The quick start's stdlib `log.Printf` is caller-side printing, separate from thi
 | Poison | After `max_attempts` claims → `dead`, not returned |
 | TTL | `Client.Start` purges expired messages/deliveries |
 | Delay | Relative publish defer via `available_at`; max 90d; requires TTL > Delay |
+| Stats | counters in UTC day buckets (flushed async, pruned after `StatsRetentionDays`); backlog is a live COUNT — see [Stats](#stats) |
 
 ## Architecture
 
@@ -195,6 +231,6 @@ Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
 ## Status / non-goals
 
-Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), loadtest.
+Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), loadtest.
 
 Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, admin UI, deferred requeue/backoff.

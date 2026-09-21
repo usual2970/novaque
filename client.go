@@ -25,6 +25,16 @@ type Options struct {
 	ReapInterval     time.Duration
 	PurgeInterval    time.Duration
 	MaintenanceBatch int
+	// StatsRetentionDays keeps day-bucket counter rows for this many UTC days
+	// before the prune tick (or an explicit PruneStats call) deletes them.
+	StatsRetentionDays int
+	// StatsFlushInterval is how often the maintenance loop drains the driver's
+	// buffered counter deltas into the stats table.
+	StatsFlushInterval time.Duration
+	// StatsPruneInterval is how often the maintenance loop prunes day-bucket
+	// counter rows older than StatsRetentionDays. Dedicated field (not a
+	// PurgeInterval co-tick) so prune stays gentle and unit-testable.
+	StatsPruneInterval time.Duration
 	// Logger receives structured operational logs (Debug on success, Error on
 	// swallowed failures; message bodies are never logged). nil = silent
 	// built-in zap Nop default; pass Zap(yourZapLogger) to inject.
@@ -55,6 +65,15 @@ func (o Options) withDefaults() Options {
 	}
 	if o.MaintenanceBatch <= 0 {
 		o.MaintenanceBatch = 100
+	}
+	if o.StatsRetentionDays <= 0 {
+		o.StatsRetentionDays = 30
+	}
+	if o.StatsFlushInterval <= 0 {
+		o.StatsFlushInterval = 2 * time.Second
+	}
+	if o.StatsPruneInterval <= 0 {
+		o.StatsPruneInterval = time.Hour
 	}
 	if o.Logger == nil {
 		o.Logger = defaultLogger()
@@ -95,7 +114,8 @@ func (c *Client) Migrate(ctx context.Context) error {
 	return c.store.Migrate(ctx)
 }
 
-// Start begins shared reaper and TTL maintenance loops (exactly once per Client).
+// Start begins shared reaper, TTL purge, and stats maintenance loops
+// (exactly once per Client).
 func (c *Client) Start(ctx context.Context) error {
 	c.mu.Lock()
 	if c.started {
@@ -110,9 +130,10 @@ func (c *Client) Start(ctx context.Context) error {
 	c.stop = cancel
 	c.started = true
 
-	c.wg.Add(2)
+	c.wg.Add(3)
 	go c.loopReap(runCtx)
 	go c.loopPurge(runCtx)
+	go c.loopStats(runCtx)
 	c.mu.Unlock()
 
 	// Log after the transition and outside the mutex: duplicate Start stays silent.
@@ -141,6 +162,13 @@ func (c *Client) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		// Loops have stopped: one final best-effort drain so graceful shutdown
+		// does not lose the last flush window. Failure is logged, not returned.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := c.store.FlushStats(flushCtx); err != nil {
+			c.logger().Error("stats flush failed", zap.String("op", "flush_stats"), zap.NamedError("err", err))
+		}
+		cancel()
 		c.logger().Info("client shutdown")
 		return nil
 	case <-ctx.Done():
@@ -180,6 +208,113 @@ func (c *Client) loopPurge(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// loopStats drains the driver's buffered counter deltas on StatsFlushInterval
+// and prunes day-bucket rows past retention on StatsPruneInterval.
+func (c *Client) loopStats(ctx context.Context) {
+	defer c.wg.Done()
+	flushT := time.NewTicker(c.opts.StatsFlushInterval)
+	defer flushT.Stop()
+	pruneT := time.NewTicker(c.opts.StatsPruneInterval)
+	defer pruneT.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-flushT.C:
+			if err := c.store.FlushStats(ctx); err != nil && ctx.Err() == nil {
+				// Swallowed failure: only surface when not caused by shutdown cancel.
+				c.logger().Error("stats flush failed", zap.String("op", "flush_stats"), zap.NamedError("err", err))
+			}
+		case <-pruneT.C:
+			if _, err := c.store.PruneStats(ctx, c.opts.StatsRetentionDays); err != nil && ctx.Err() == nil {
+				// Swallowed failure: only surface when not caused by shutdown cancel.
+				c.logger().Error("stats prune failed", zap.String("op", "prune_stats"), zap.NamedError("err", err))
+			}
+		}
+	}
+}
+
+// --- Stats API: day-bucket counters plus live backlog (ids and counts only,
+// never message payloads) ---
+
+// ChannelCounters are summed day-bucket event counters (UTC) for one channel
+// or topic (re-export of store.ChannelCounters).
+type ChannelCounters = store.ChannelCounters
+
+// ChannelBacklog is a live pending/ready/in_flight/dead snapshot for one
+// channel (re-export of store.ChannelBacklog).
+type ChannelBacklog = store.ChannelBacklog
+
+// ChannelCounters returns the summed day-bucket event counters retained for
+// one channel: publish, claim, ack, requeue, dead, purge. Counters are UTC
+// day buckets that survive ack deletes and TTL purges until the retention
+// prune removes old days. They are buffered in-process and flushed every
+// StatsFlushInterval, so reads are eventually consistent within that window;
+// call FlushStats first to force a drain.
+func (c *Client) ChannelCounters(ctx context.Context, topic, channel string) (ChannelCounters, error) {
+	channelID, err := c.store.EnsureChannel(ctx, topic, channel)
+	if err != nil {
+		return ChannelCounters{}, fmt.Errorf("novaque channel counters: %w", err)
+	}
+	counters, err := c.store.ChannelCounters(ctx, channelID)
+	if err != nil {
+		return ChannelCounters{}, fmt.Errorf("novaque channel counters: %w", err)
+	}
+	return counters, nil
+}
+
+// TopicCounters rolls the day-bucket counters up over a whole topic: every
+// per-channel row plus the topic-level row that zero-channel publishes count
+// on. Eventual-consistency window as per ChannelCounters.
+func (c *Client) TopicCounters(ctx context.Context, topic string) (ChannelCounters, error) {
+	topicID, err := c.store.EnsureTopic(ctx, topic)
+	if err != nil {
+		return ChannelCounters{}, fmt.Errorf("novaque topic counters: %w", err)
+	}
+	counters, err := c.store.TopicCounters(ctx, topicID)
+	if err != nil {
+		return ChannelCounters{}, fmt.Errorf("novaque topic counters: %w", err)
+	}
+	return counters, nil
+}
+
+// ChannelBacklog returns the live delivery counts for one channel right now:
+// pending, ready (the claimable slice of pending — delayed publishes are
+// excluded until available_at passes), in_flight, and dead. Backlog is a live
+// row count, not a day bucket, so it needs no flush.
+func (c *Client) ChannelBacklog(ctx context.Context, topic, channel string) (ChannelBacklog, error) {
+	channelID, err := c.store.EnsureChannel(ctx, topic, channel)
+	if err != nil {
+		return ChannelBacklog{}, fmt.Errorf("novaque channel backlog: %w", err)
+	}
+	b, err := c.store.ChannelBacklog(ctx, channelID)
+	if err != nil {
+		return ChannelBacklog{}, fmt.Errorf("novaque channel backlog: %w", err)
+	}
+	return b, nil
+}
+
+// PruneStats deletes day-bucket counter rows older than StatsRetentionDays
+// (UTC days) and returns the number of rows deleted. Start runs this on
+// StatsPruneInterval; hosts that never Start can call it explicitly.
+func (c *Client) PruneStats(ctx context.Context) (int64, error) {
+	deleted, err := c.store.PruneStats(ctx, c.opts.StatsRetentionDays)
+	if err != nil {
+		return 0, fmt.Errorf("novaque prune stats: %w", err)
+	}
+	return deleted, nil
+}
+
+// FlushStats drains the driver's buffered counter deltas into the stats
+// table. Start runs this on StatsFlushInterval and Shutdown performs one
+// final best-effort flush; hosts that never Start can call it explicitly.
+func (c *Client) FlushStats(ctx context.Context) error {
+	if err := c.store.FlushStats(ctx); err != nil {
+		return fmt.Errorf("novaque flush stats: %w", err)
+	}
+	return nil
 }
 
 // MaxDelay is the maximum publish Delay (re-export of store.MaxDelay).

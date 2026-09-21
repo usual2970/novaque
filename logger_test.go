@@ -106,6 +106,26 @@ func TestOptionsWithDefaultsBindsLogger(t *testing.T) {
 	}
 }
 
+// TestOptionsStatsDefaults: stats options fall back to 30 days / 2s flush /
+// 1h prune for zero and negative values; explicit values are kept.
+func TestOptionsStatsDefaults(t *testing.T) {
+	for name, o := range map[string]Options{
+		"zero":     {},
+		"negative": {StatsRetentionDays: -3, StatsFlushInterval: -time.Second, StatsPruneInterval: -time.Hour},
+	} {
+		d := o.withDefaults()
+		if d.StatsRetentionDays != 30 || d.StatsFlushInterval != 2*time.Second || d.StatsPruneInterval != time.Hour {
+			t.Fatalf("%s Options stats defaults = %d/%v/%v, want 30/2s/1h",
+				name, d.StatsRetentionDays, d.StatsFlushInterval, d.StatsPruneInterval)
+		}
+	}
+	d := Options{StatsRetentionDays: 7, StatsFlushInterval: time.Second, StatsPruneInterval: time.Minute}.withDefaults()
+	if d.StatsRetentionDays != 7 || d.StatsFlushInterval != time.Second || d.StatsPruneInterval != time.Minute {
+		t.Fatalf("explicit stats options must be kept, got %d/%v/%v",
+			d.StatsRetentionDays, d.StatsFlushInterval, d.StatsPruneInterval)
+	}
+}
+
 func TestOpenKeepsInjectedLogger(t *testing.T) {
 	rec := newRecordingLogger()
 	c, err := Open(nopStore{}, Options{Logger: rec})
