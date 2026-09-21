@@ -1,0 +1,15 @@
+# Binaries
+/bin/
+*.exe
+*.test
+
+# Go
+/vendor/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Testcontainers / docker leftovers
+.tmp/
