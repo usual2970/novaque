@@ -42,18 +42,27 @@ func (k statKind) column() string {
 	}
 }
 
-// statKey identifies one counter cell for one (topic, channel) pair — the day
-// is deliberately absent: bucketing happens at flush time from the DB clock.
+// statCoord is the stats coordinates of one (topic, channel) pair — the day is
+// deliberately absent: bucketing happens at flush time from the DB clock.
 // channelID 0 is the zero-channel publish sentinel (KTD3).
-type statKey struct {
+type statCoord struct {
 	topicID   int64
 	channelID int64
-	kind      statKind
+}
+
+// statKey identifies one counter cell: a statCoord plus the counter kind.
+type statKey struct {
+	statCoord
+	kind statKind
 }
 
 // statsFlushBatch caps rows per flush statement; 500 rows keeps the multi-row
 // upsert comfortably under packet and placeholder limits.
 const statsFlushBatch = 500
+
+// statsFlushFullSQL is the full-batch statement rendered once: every full
+// batch in a drain sends byte-identical SQL, so only a tail batch re-renders.
+var statsFlushFullSQL = statsFlushSQL(statsFlushBatch)
 
 // recordStat buffers a counter delta in the in-process sink. Mutators call it
 // only AFTER a mutation committed (or RowsAffected confirmed success), so
@@ -68,7 +77,7 @@ func (s *Store) recordStat(topicID, channelID int64, kind statKind, n int64) {
 	if s.statBuf == nil {
 		s.statBuf = make(map[statKey]int64)
 	}
-	s.statBuf[statKey{topicID: topicID, channelID: channelID, kind: kind}] += n
+	s.statBuf[statKey{statCoord: statCoord{topicID: topicID, channelID: channelID}, kind: kind}] += n
 	s.statMu.Unlock()
 }
 
@@ -87,16 +96,13 @@ func (s *Store) FlushStats(ctx context.Context) error {
 	s.statBuf = nil
 	s.statMu.Unlock()
 
-	// Coalesce kinds into one row per (topic, channel); order keeps batching
-	// deterministic across flushes.
-	type rowKey struct {
-		topicID   int64
-		channelID int64
-	}
-	counts := make(map[rowKey][numStatKinds]int64, len(pending))
-	var order []rowKey
+	// Coalesce kinds into one row per (topic, channel). order fixes this
+	// flush's row sequence, so the batch loop and a failure re-merge agree on
+	// which rows are remaining (map range order would not).
+	counts := make(map[statCoord][numStatKinds]int64, len(pending))
+	var order []statCoord
 	for k, n := range pending {
-		rk := rowKey{topicID: k.topicID, channelID: k.channelID}
+		rk := k.statCoord
 		if _, ok := counts[rk]; !ok {
 			order = append(order, rk)
 		}
@@ -115,23 +121,22 @@ func (s *Store) FlushStats(ctx context.Context) error {
 				args = append(args, vals[k])
 			}
 		}
-		if _, err := s.db.ExecContext(ctx, statsFlushSQL(end-start), args...); err != nil {
+		stmt := statsFlushFullSQL
+		if end-start < statsFlushBatch {
+			stmt = statsFlushSQL(end - start)
+		}
+		if _, err := s.db.ExecContext(ctx, stmt, args...); err != nil {
 			// The failed batch (and every later one) never landed: merge those
 			// deltas back so the next FlushStats retries them.
-			remaining := make(map[rowKey]struct{}, len(order)-start)
+			remaining := make(map[statCoord]struct{}, len(order)-start)
 			for _, rk := range order[start:] {
 				remaining[rk] = struct{}{}
 			}
-			s.statMu.Lock()
-			if s.statBuf == nil {
-				s.statBuf = make(map[statKey]int64)
-			}
 			for k, n := range pending {
-				if _, ok := remaining[rowKey{topicID: k.topicID, channelID: k.channelID}]; ok {
-					s.statBuf[k] += n
+				if _, ok := remaining[k.statCoord]; ok {
+					s.recordStat(k.topicID, k.channelID, k.kind, n)
 				}
 			}
-			s.statMu.Unlock()
 			return fmt.Errorf("mysql stats flush: %w", err)
 		}
 	}
@@ -177,23 +182,29 @@ func statsFlushSQL(n int) string {
 	return b.String()
 }
 
+// sumDailyCounters runs the shared SUM-over-retained-days read. whereCol is
+// one of the two package literals below, never caller input.
+func (s *Store) sumDailyCounters(ctx context.Context, whereCol string, id int64) (store.ChannelCounters, error) {
+	var c store.ChannelCounters
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(publish), 0), COALESCE(SUM(claim), 0), COALESCE(SUM(ack), 0),
+		       COALESCE(SUM(requeue), 0), COALESCE(SUM(dead), 0), COALESCE(SUM(purged), 0)
+		FROM novaque_stats_daily
+		WHERE `+whereCol+` = ?`, id).
+		Scan(&c.Publish, &c.Claim, &c.Ack, &c.Requeue, &c.Dead, &c.Purge)
+	if err != nil {
+		return store.ChannelCounters{}, err
+	}
+	return c, nil
+}
+
 // ChannelCounters sums the retained day buckets for one channel. channel_id
 // is globally unique, so no topic filter is needed.
 func (s *Store) ChannelCounters(ctx context.Context, channelID int64) (store.ChannelCounters, error) {
 	if channelID <= 0 {
 		return store.ChannelCounters{}, fmt.Errorf("mysql stats: invalid channel id %d", channelID)
 	}
-	var c store.ChannelCounters
-	err := s.db.QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(publish), 0), COALESCE(SUM(claim), 0), COALESCE(SUM(ack), 0),
-		       COALESCE(SUM(requeue), 0), COALESCE(SUM(dead), 0), COALESCE(SUM(purged), 0)
-		FROM novaque_stats_daily
-		WHERE channel_id = ?`, channelID).
-		Scan(&c.Publish, &c.Claim, &c.Ack, &c.Requeue, &c.Dead, &c.Purge)
-	if err != nil {
-		return store.ChannelCounters{}, err
-	}
-	return c, nil
+	return s.sumDailyCounters(ctx, "channel_id", channelID)
 }
 
 // TopicCounters rolls up every retained day-bucket row for a topic. Fan-out
@@ -203,17 +214,7 @@ func (s *Store) TopicCounters(ctx context.Context, topicID int64) (store.Channel
 	if topicID <= 0 {
 		return store.ChannelCounters{}, fmt.Errorf("mysql stats: invalid topic id %d", topicID)
 	}
-	var c store.ChannelCounters
-	err := s.db.QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(publish), 0), COALESCE(SUM(claim), 0), COALESCE(SUM(ack), 0),
-		       COALESCE(SUM(requeue), 0), COALESCE(SUM(dead), 0), COALESCE(SUM(purged), 0)
-		FROM novaque_stats_daily
-		WHERE topic_id = ?`, topicID).
-		Scan(&c.Publish, &c.Claim, &c.Ack, &c.Requeue, &c.Dead, &c.Purge)
-	if err != nil {
-		return store.ChannelCounters{}, err
-	}
-	return c, nil
+	return s.sumDailyCounters(ctx, "topic_id", topicID)
 }
 
 // ChannelBacklog counts live delivery rows for one channel in a single pass
@@ -241,17 +242,35 @@ func (s *Store) ChannelBacklog(ctx context.Context, channelID int64) (store.Chan
 	return b, nil
 }
 
+// statsPruneBatch caps rows per prune statement, keeping row locks bounded on
+// the first prune after a retention lowering (same rationale as the other
+// maintenance batches).
+const statsPruneBatch = 500
+
 // PruneStats deletes day-bucket rows older than retentionDays UTC days. The
 // day boundary comes from the DB clock (UTC_DATE()), never host local time.
+// Deletes run in bounded batches; the return value is the same total a single
+// unbounded delete would report.
 func (s *Store) PruneStats(ctx context.Context, retentionDays int) (int64, error) {
 	if retentionDays <= 0 {
 		return 0, fmt.Errorf("mysql stats: invalid retention days %d", retentionDays)
 	}
-	res, err := s.db.ExecContext(ctx, `
-		DELETE FROM novaque_stats_daily
-		WHERE day_utc < UTC_DATE() - INTERVAL ? DAY`, retentionDays)
-	if err != nil {
-		return 0, err
+	var total int64
+	for {
+		res, err := s.db.ExecContext(ctx, `
+			DELETE FROM novaque_stats_daily
+			WHERE day_utc < UTC_DATE() - INTERVAL ? DAY
+			LIMIT ?`, retentionDays, statsPruneBatch)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < statsPruneBatch {
+			return total, nil
+		}
 	}
-	return res.RowsAffected()
 }

@@ -58,5 +58,9 @@ CREATE TABLE IF NOT EXISTS novaque_stats_daily (
   requeue BIGINT NOT NULL DEFAULT 0,
   dead BIGINT NOT NULL DEFAULT 0,
   purged BIGINT NOT NULL DEFAULT 0,
-  PRIMARY KEY (day_utc, topic_id, channel_id)
+  PRIMARY KEY (day_utc, topic_id, channel_id),
+  -- Counter reads filter by channel or topic alone; without these the SUM
+  -- full-scans a table that grows to retention x topics x channels.
+  KEY idx_novaque_stats_daily_channel (channel_id),
+  KEY idx_novaque_stats_daily_topic (topic_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

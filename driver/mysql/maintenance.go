@@ -3,7 +3,6 @@ package mysql
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/usual2970/novaque/store"
 )
@@ -56,11 +55,7 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	type purgeKey struct {
-		topicID   int64
-		channelID int64
-	}
-	counts := make(map[purgeKey]int64)
+	counts := make(map[statCoord]int64)
 	var ids []int64
 	for rows.Next() {
 		var id, channelID, topicID int64
@@ -69,7 +64,7 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 			return 0, err
 		}
 		ids = append(ids, id)
-		counts[purgeKey{topicID: topicID, channelID: channelID}]++
+		counts[statCoord{topicID: topicID, channelID: channelID}]++
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -78,12 +73,7 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 
 	var n1 int64
 	if len(ids) > 0 {
-		placeholders := make([]string, len(ids))
-		args := make([]any, 0, len(ids)+3)
-		for i, id := range ids {
-			placeholders[i] = "?"
-			args = append(args, id)
-		}
+		marks, args := idPlaceholders(ids)
 		// Keep the eligibility conditions in the DELETE so rows that changed
 		// state between SELECT and DELETE survive (mid-batch acks etc.).
 		q := fmt.Sprintf(`
@@ -93,7 +83,7 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 			  AND (
 			    status IN (?, ?)
 			    OR (status = ? AND (lease_until IS NULL OR lease_until < `+sqlNow+`))
-			  )`, strings.Join(placeholders, ","))
+			  )`, marks)
 		args = append(args, store.StatusPending, store.StatusDead, store.StatusInFlight)
 		res, err := s.db.ExecContext(ctx, q, args...)
 		if err != nil {

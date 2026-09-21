@@ -116,6 +116,17 @@ func validateName(kind, name string) error {
 	return nil
 }
 
+// idPlaceholders renders an IN (...) placeholder list plus its bound id args.
+func idPlaceholders(ids []int64) (marks string, args []any) {
+	placeholders := make([]string, len(ids))
+	args = make([]any, 0, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	return strings.Join(placeholders, ","), args
+}
+
 // EnsureTopic creates the topic if missing.
 func (s *Store) EnsureTopic(ctx context.Context, name string) (int64, error) {
 	if err := validateName("topic", name); err != nil {

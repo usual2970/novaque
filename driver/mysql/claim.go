@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/usual2970/novaque/store"
@@ -96,12 +95,7 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 		return nil, nil
 	}
 
-	placeholders := make([]string, len(claimedIDs))
-	args := make([]any, 0, len(claimedIDs))
-	for i, id := range claimedIDs {
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
+	marks, args := idPlaceholders(claimedIDs)
 	q := fmt.Sprintf(`
 		SELECT d.id, d.message_id, d.channel_id, c.topic_id, t.name, c.name, m.body,
 		       d.status, d.attempts, d.max_attempts, d.lease_token, d.available_at, d.lease_until
@@ -109,7 +103,7 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 		INNER JOIN novaque_messages m ON m.id = d.message_id
 		INNER JOIN novaque_channels c ON c.id = d.channel_id
 		INNER JOIN novaque_topics t ON t.id = c.topic_id
-		WHERE d.id IN (%s)`, strings.Join(placeholders, ","))
+		WHERE d.id IN (%s)`, marks)
 
 	bodyRows, err := tx.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -177,11 +171,11 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 	return out, nil
 }
 
-// ackAttribution resolves the stats coordinates of a still-leased delivery in
-// one indexed round trip. It returns sql.ErrNoRows on mismatch; the caller
+// leaseAttribution resolves the stats coordinates of a still-leased delivery
+// in one indexed round trip. It returns sql.ErrNoRows on mismatch; the caller
 // falls through to its mutation, which then affects 0 rows and produces the
 // legacy error without recording anything (R5).
-func (s *Store) ackAttribution(ctx context.Context, deliveryID int64, leaseToken string) (topicID, channelID int64, err error) {
+func (s *Store) leaseAttribution(ctx context.Context, deliveryID int64, leaseToken string) (topicID, channelID int64, err error) {
 	err = s.db.QueryRowContext(ctx, `
 		SELECT c.topic_id, d.channel_id
 		FROM novaque_deliveries d
@@ -195,7 +189,7 @@ func (s *Store) ackAttribution(ctx context.Context, deliveryID int64, leaseToken
 // attribution lookup must find the row before the delete (it disappears on
 // ack), but only a DELETE affecting exactly 1 row records the event.
 func (s *Store) Ack(ctx context.Context, deliveryID int64, leaseToken string) error {
-	topicID, channelID, scanErr := s.ackAttribution(ctx, deliveryID, leaseToken)
+	topicID, channelID, scanErr := s.leaseAttribution(ctx, deliveryID, leaseToken)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return scanErr
 	}
@@ -219,10 +213,10 @@ func (s *Store) Ack(ctx context.Context, deliveryID int64, leaseToken string) er
 	return nil
 }
 
-// Requeue returns a delivery to pending when the lease token matches. Same
-// attribution shape as Ack; only an UPDATE affecting exactly 1 row counts.
+// Requeue returns a delivery to pending when the lease token matches. Only an
+// UPDATE affecting exactly 1 row counts.
 func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string, availableAt time.Time) error {
-	topicID, channelID, scanErr := s.ackAttribution(ctx, deliveryID, leaseToken)
+	topicID, channelID, scanErr := s.leaseAttribution(ctx, deliveryID, leaseToken)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return scanErr
 	}
