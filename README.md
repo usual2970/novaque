@@ -13,17 +13,11 @@ You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. To
 
 ## Install
 
-Module path is currently `novaque` (GitHub: [usual2970/novaque](https://github.com/usual2970/novaque)).
-
 ```bash
-# clone / submodule, then in your app:
-go get novaque@v0.0.1
-
-# or local replace
-# replace novaque => ../novaque
+go get github.com/usual2970/novaque
 ```
 
-Requires **Go 1.22+** and, for the shipped driver, **MySQL ≥ 8.0.1** (InnoDB).
+Requires **Go 1.26.5+** and, for the shipped driver, **MySQL ≥ 8.0.1** (InnoDB).
 
 ## Quick start
 
@@ -37,8 +31,9 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"novaque"
-	mysqldriver "github.com/usual2970/novaque/driver/mysql"
+
+	"github.com/usual2970/novaque"
+	"github.com/usual2970/novaque/driver/mysql"
 )
 
 func main() {
@@ -49,7 +44,7 @@ func main() {
 	}
 	db.SetMaxOpenConns(32)
 
-	client, err := novaque.Open(mysqldriver.New(db), novaque.Options{
+	client, err := novaque.Open(mysql.New(db), novaque.Options{
 		MaxInFlight: 8, // concurrent handlers per consumer
 	})
 	if err != nil {
@@ -57,7 +52,7 @@ func main() {
 	}
 	ctx := context.Background()
 	if err := client.Migrate(ctx); err != nil {
-		log.Fatal(err)
+		log.Fatal(err) // schema setup; idempotent, safe every startup
 	}
 	if err := client.Start(ctx); err != nil { // lease reaper + TTL purge + stats flush/prune
 		log.Fatal(err)
@@ -72,7 +67,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer cons.Shutdown(context.Background())
+	defer cons.Shutdown(context.Background()) // stop the consumer before the client
 
 	if _, err := client.Publish(ctx, "events", []byte(`{"ok":true}`),
 		novaque.PublishOpts{}); err != nil {
@@ -83,6 +78,15 @@ func main() {
 ```
 
 `Subscribe` + `Start` is available when you need to wire several consumers before polling.
+
+## Documentation
+
+Every exported symbol in `novaque`, `novaque/store`, and `novaque/driver/mysql` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
+
+```bash
+go doc github.com/usual2970/novaque.Client
+go doc github.com/usual2970/novaque.PublishOpts
+```
 
 ## Concepts
 
@@ -103,7 +107,7 @@ Publisher ──Publish──▶ topic ──fan-out──▶ channel A ──co
 | `DefaultTTL` | 7d | message retention when publish omits TTL |
 | `DefaultLease` | 30s | claim lease duration |
 | `DefaultMaxAttempts` | 5 | poison threshold (then `dead`) |
-| `PollInterval` | 200ms | consumer idle poll base (+ jitter) |
+| `PollInterval` | 200ms | consumer idle poll base (±50% jitter) |
 | `MaxInFlight` | 1 | handler workers + batch claim size per consumer |
 | `ReapInterval` | 1s | expired-lease reaper tick |
 | `PurgeInterval` | 5s | TTL cleanup tick |
@@ -132,7 +136,7 @@ Size `*sql.DB` `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroo
 `Options.Logger` takes the public `Logger` interface — `Debug`/`Info`/`Warn`/`Error(msg, ...zap.Field)` plus `With` for child loggers. When unset, novaque binds a **silent `zap.NewNop()` default**: the library produces no console noise until you inject one.
 
 ```go
-client, err := novaque.Open(mysqldriver.New(db), novaque.Options{
+client, err := novaque.Open(mysql.New(db), novaque.Options{
 	Logger: novaque.Zap(zapLogger), // adapt your configured *zap.Logger
 })
 ```
@@ -195,6 +199,7 @@ Semantics worth knowing:
 ```
 novaque/
   client.go           # Client, Consumer, Publish / Subscribe
+  example_test.go     # godoc Example functions (compile-verified)
   logger.go           # Logger interface, zap adapter, silent Nop default
   store/
     store.go          # Store interface (dialect-agnostic)
@@ -232,6 +237,8 @@ Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
 ## Status / non-goals
 
-Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), loadtest.
+Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), loadtest, complete identifier-first godoc with compile-verified examples.
 
-Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, admin UI, deferred requeue/backoff.
+In progress: admin surface — `store.Store`-level listings, backlog reads, and dead-letter operations are committed with their MySQL implementation; Client-level admin methods and a mountable admin UI are under active development.
+
+Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, deferred requeue/backoff.
