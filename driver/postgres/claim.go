@@ -176,10 +176,13 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	// stats (U5): claim counter (every leased row, poison included) and dead
-	// counter (poison rows) buffered after commit, mirroring driver/mysql:
-	// s.recordStat(statTopicID, channelID, statClaim, int64(len(claimedIDs)))
-	// and for deadIDs s.recordStat(statTopicID, channelID, statDead, ...).
+	// Counters bump only after the commit succeeded. claim counts every row
+	// leased to in_flight here — poison rows included — and a poison claim
+	// also counts dead: the lease attempt and the terminal outcome both.
+	s.recordStat(statTopicID, channelID, statClaim, int64(len(claimedIDs)))
+	if len(deadIDs) > 0 {
+		s.recordStat(statTopicID, channelID, statDead, int64(len(deadIDs)))
+	}
 	return out, nil
 }
 
@@ -201,7 +204,7 @@ func (s *Store) leaseAttribution(ctx context.Context, deliveryID int64, leaseTok
 // attribution lookup must find the row before the delete (it disappears on
 // ack), but only a DELETE affecting exactly 1 row records the event.
 func (s *Store) Ack(ctx context.Context, deliveryID int64, leaseToken string) error {
-	_, _, scanErr := s.leaseAttribution(ctx, deliveryID, leaseToken)
+	topicID, channelID, scanErr := s.leaseAttribution(ctx, deliveryID, leaseToken)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return scanErr
 	}
@@ -219,16 +222,16 @@ func (s *Store) Ack(ctx context.Context, deliveryID int64, leaseToken string) er
 	if n == 0 {
 		return fmt.Errorf("postgres: ack rejected: delivery %d lease mismatch or not in_flight", deliveryID)
 	}
-	// stats (U5): ack counter buffered after the guarded delete, mirroring
-	// driver/mysql (only when the attribution lookup hit):
-	// s.recordStat(topicID, channelID, statAck, 1).
+	if scanErr == nil {
+		s.recordStat(topicID, channelID, statAck, 1)
+	}
 	return nil
 }
 
 // Requeue returns a delivery to pending when the lease token matches. Only an
 // UPDATE affecting exactly 1 row counts.
 func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string, availableAt time.Time) error {
-	_, _, scanErr := s.leaseAttribution(ctx, deliveryID, leaseToken)
+	topicID, channelID, scanErr := s.leaseAttribution(ctx, deliveryID, leaseToken)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return scanErr
 	}
@@ -259,8 +262,8 @@ func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string
 	if n == 0 {
 		return fmt.Errorf("postgres: requeue rejected: delivery %d lease mismatch or not in_flight", deliveryID)
 	}
-	// stats (U5): requeue counter buffered after the guarded update,
-	// mirroring driver/mysql (only when the attribution lookup hit):
-	// s.recordStat(topicID, channelID, statRequeue, 1).
+	if scanErr == nil {
+		s.recordStat(topicID, channelID, statRequeue, 1)
+	}
 	return nil
 }

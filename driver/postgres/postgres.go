@@ -31,18 +31,15 @@ type Store struct {
 
 	// statMu guards statBuf, the in-process counter sink: mutators buffer
 	// deltas here only after a commit, and FlushStats drains them in batches,
-	// so no mutation transaction ever carries a stats write. The sink is
-	// wired in a later unit; the fields live here from the start.
+	// so no mutation transaction ever carries a stats write.
 	statMu  sync.Mutex
 	statBuf map[statKey]int64
 }
 
-// statKey identifies one counter cell: a topic/channel pair plus the counter
-// kind. The buffering and flush are added by the stats unit.
+// statKey identifies one counter cell: a statCoord plus the counter kind.
 type statKey struct {
-	topicID   int64
-	channelID int64
-	kind      string
+	statCoord
+	kind statKind
 }
 
 // New wraps a caller-owned *sql.DB. Requires PostgreSQL >= 14 (SKIP LOCKED).
@@ -318,35 +315,18 @@ func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts st
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	// stats (U5): publish counters buffered after commit, mirroring driver/mysql.
-	// The fanout attribution above feeds those buffered counters; zero-channel
-	// publishes land on the channel_id=0 sentinel row.
+	// Counters bump only after the commit succeeded, so a rolled-back
+	// mutation records nothing. The publish unit is one delivery per channel;
+	// zero-channel publishes land on the channel_id=0 sentinel row (a
+	// topic-only counter with no channel backlog change).
+	if len(fanout) == 0 {
+		s.recordStat(topicID, 0, statPublish, 1)
+	} else {
+		for chID, n := range fanout {
+			s.recordStat(topicID, chID, statPublish, n)
+		}
+	}
 	return messageID, nil
-}
-
-// ChannelCounters sums the retained day-bucket event counters for one channel.
-func (s *Store) ChannelCounters(ctx context.Context, channelID int64) (store.ChannelCounters, error) {
-	return store.ChannelCounters{}, errNotImplemented("ChannelCounters")
-}
-
-// TopicCounters rolls up the retained day-bucket event counters for a topic.
-func (s *Store) TopicCounters(ctx context.Context, topicID int64) (store.ChannelCounters, error) {
-	return store.ChannelCounters{}, errNotImplemented("TopicCounters")
-}
-
-// ChannelBacklog returns live pending / ready / in_flight / dead counts for one channel.
-func (s *Store) ChannelBacklog(ctx context.Context, channelID int64) (store.ChannelBacklog, error) {
-	return store.ChannelBacklog{}, errNotImplemented("ChannelBacklog")
-}
-
-// PruneStats deletes day-bucket counter rows older than retentionDays.
-func (s *Store) PruneStats(ctx context.Context, retentionDays int) (int64, error) {
-	return 0, errNotImplemented("PruneStats")
-}
-
-// FlushStats drains any buffered counter deltas into the stats table.
-func (s *Store) FlushStats(ctx context.Context) error {
-	return errNotImplemented("FlushStats")
 }
 
 // ListTopics returns every topic, ascending by name.

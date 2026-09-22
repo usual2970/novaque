@@ -9,7 +9,7 @@ import (
 
 // statCoord is the stats coordinates of one (topic, channel) pair — the
 // per-channel attribution of a doomed batch. The day is deliberately absent:
-// bucketing happens at flush time from the DB clock (U5 ports the sink).
+// bucketing happens at flush time from the DB clock.
 type statCoord struct {
 	topicID   int64
 	channelID int64
@@ -49,8 +49,8 @@ func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error)
 }
 
 // PurgeExpired deletes expired deliveries (and orphan messages) to keep the
-// claim index small. Counters need no transaction (they are buffered in U5,
-// not written in-tx): a read-only SELECT captures the doomed batch with its
+// claim index small. Counters need no transaction (they are buffered, not
+// written in-tx): a read-only SELECT captures the doomed batch with its
 // per-channel attribution, the DELETE rechecks eligibility so a mid-batch ack
 // cannot die, and purge deltas are recorded only after the delete succeeds.
 // Attribution comes from the SELECT, so a mid-batch race can over-count purge
@@ -112,11 +112,9 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 			return 0, fmt.Errorf("postgres: delete expired deliveries: %w", err)
 		}
 		n1, _ = res.RowsAffected()
-		// stats (U5): purged counters per channel buffered after the delete,
-		// mirroring driver/mysql. U5 swaps this comment for:
-		// for k, n := range counts {
-		// 	s.recordStat(k.topicID, k.channelID, statPurged, n)
-		// }
+		for k, n := range counts {
+			s.recordStat(k.topicID, k.channelID, statPurged, n)
+		}
 	}
 	// Orphan message pass: never records any stats event. Postgres permits a
 	// DELETE whose subquery reads the same table directly, so the MySQL double
