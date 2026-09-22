@@ -555,6 +555,43 @@ func TestPrefixRedirectsPreservePrefix(t *testing.T) {
 	}
 }
 
+// TestPrefixNormalizationInNew pins normalizePrefix's input handling
+// (review #6): a prefix given without its leading slash, or with trailing
+// slashes, mounts identically to "/admin", and the bare-prefix redirect
+// preserves the request's query string.
+func TestPrefixNormalizationInNew(t *testing.T) {
+	for _, prefix := range []string{"admin", "/admin/", "/admin///"} {
+		ts, _ := newTestServer(t, prefix)
+		c := noRedirect()
+
+		// The normalized mount serves the dashboard and generated links
+		// use /admin.
+		res, body := doGet(t, ts.Client(), ts.URL+"/admin/")
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("prefix %q: GET /admin/ = %d, want 200", prefix, res.StatusCode)
+		}
+		if !strings.Contains(body, `href="/admin/topics/1"`) {
+			t.Fatalf("prefix %q: links not prefixed with /admin", prefix)
+		}
+
+		// Bare prefix: 301 to the slashed root.
+		res, _ = doGet(t, c, ts.URL+"/admin")
+		if res.StatusCode != http.StatusMovedPermanently || res.Header.Get("Location") != "/admin/" {
+			t.Fatalf("prefix %q: bare redirect = %d %q, want 301 /admin/", prefix, res.StatusCode, res.Header.Get("Location"))
+		}
+	}
+
+	// The bare-prefix redirect carries the original query string through.
+	ts, _ := newTestServer(t, "/admin")
+	res, _ := doGet(t, noRedirect(), ts.URL+"/admin?keep=me&z=1")
+	if res.StatusCode != http.StatusMovedPermanently {
+		t.Fatalf("bare with query: status = %d, want 301", res.StatusCode)
+	}
+	if loc := res.Header.Get("Location"); loc != "/admin/?keep=me&z=1" {
+		t.Fatalf("bare with query: Location = %q, want /admin/?keep=me&z=1", loc)
+	}
+}
+
 func TestRootMountServesEveryPage(t *testing.T) {
 	ts, _ := newTestServer(t, "/")
 	for _, path := range []string{"/", "/topics/1", "/channels/2", "/channels/2/dead", "/api/summary", "/static/admin.css"} {
@@ -879,6 +916,50 @@ func TestCreateChannelFromTopicForm(t *testing.T) {
 	}
 }
 
+// TestCreateChannelFromTopicFormErrorBranches pins the branches the happy
+// path test skips (review #6): malformed topic ids 404, a whitespace-only
+// name re-renders the topic page with the form error and never Ensures, and
+// a failing EnsureChannel (failEnsureChan — the fake hook no test
+// previously set) re-renders the driver error instead of redirecting.
+func TestCreateChannelFromTopicFormErrorBranches(t *testing.T) {
+	ts, f := newTestServer(t, "/admin")
+	c := noRedirect()
+
+	// topic_id parse failures (non-numeric or non-positive) are 404s.
+	for _, bad := range []string{"abc", "-1", "0"} {
+		res, _ := doPost(t, c, ts.URL+"/admin/channels", url.Values{"topic_id": {bad}, "name": {"x"}})
+		if res.StatusCode != http.StatusNotFound {
+			t.Fatalf("topic_id=%q: status = %d, want 404", bad, res.StatusCode)
+		}
+	}
+
+	// Empty name: the topic page re-renders (200) with the form error and
+	// no Ensure happens.
+	res, body := doPost(t, c, ts.URL+"/admin/channels", url.Values{"topic_id": {"1"}, "name": {"   "}})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("empty name: status = %d, want 200", res.StatusCode)
+	}
+	if !strings.Contains(body, "Name is required.") || !strings.Contains(body, "orders") {
+		t.Fatal("empty name: form error or topic page missing")
+	}
+	if _, chans := f.ensureCalls(); len(chans) != 0 {
+		t.Fatalf("empty name must not reach EnsureChannel, saw %v", chans)
+	}
+
+	// Driver failure: failEnsureChan (honored in the fake's EnsureChannel)
+	// surfaces on the re-rendered form rather than a redirect.
+	f.mu.Lock()
+	f.failEnsureChan = errors.New("boom-ensure-channel")
+	f.mu.Unlock()
+	res, body = doPost(t, c, ts.URL+"/admin/channels", url.Values{"topic_id": {"1"}, "name": {"retries"}})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("failing EnsureChannel: status = %d, want 200", res.StatusCode)
+	}
+	if !strings.Contains(body, "boom-ensure-channel") {
+		t.Fatal("failing EnsureChannel: driver error missing from re-rendered form")
+	}
+}
+
 // --- delete confirmations + deletes (R6, R11 wording fix) ---
 
 func TestDeleteTopicConfirmShowsBlastRadius(t *testing.T) {
@@ -1106,6 +1187,33 @@ func TestStoreErrorRendersPlain500(t *testing.T) {
 	}
 	if strings.Contains(body, "emails") {
 		t.Fatal("error page leaked partial dashboard content")
+	}
+}
+
+// TestStoreErrorRendersJSON500 pins the JSON error branches the plain-500
+// test skips (review #6): with the store failing, /api/summary and the two
+// detail endpoints answer 500 with a JSON error object — content-type
+// included — never a partial feed.
+func TestStoreErrorRendersJSON500(t *testing.T) {
+	ts, f := newTestServer(t, "/admin")
+	f.mu.Lock()
+	f.failBacklogs = true
+	f.mu.Unlock()
+	for _, path := range []string{"/admin/api/summary", "/admin/api/topics/1", "/admin/api/channels/2"} {
+		res, raw := doGet(t, ts.Client(), ts.URL+path)
+		if res.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("GET %s: status = %d, want 500", path, res.StatusCode)
+		}
+		if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Fatalf("GET %s: Content-Type = %q, want application/json", path, ct)
+		}
+		var out map[string]string
+		if err := json.Unmarshal([]byte(raw), &out); err != nil {
+			t.Fatalf("GET %s: decode error body: %v (%s)", path, err, raw)
+		}
+		if !strings.Contains(out["error"], "boom-backlogs") {
+			t.Fatalf("GET %s: error = %q, want the driver error text", path, out["error"])
+		}
 	}
 }
 
