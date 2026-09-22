@@ -50,6 +50,22 @@ func TestBuildMultiMetricStrip(t *testing.T) {
 	}
 }
 
+func TestDeadCounterLevel(t *testing.T) {
+	// Dead row: no scale floor; single dead day in a quiet window stays visible.
+	if got := deadCounterLevel(1, 1); got < 2 {
+		t.Fatalf("deadCounterLevel(1,1) = %d, want >= 2", got)
+	}
+	if got := deadCounterLevel(2, 2); got != 4 {
+		t.Fatalf("deadCounterLevel(2,2) = %d, want 4 (row peak)", got)
+	}
+	if got := deadCounterLevel(1, 100); got != 2 {
+		t.Fatalf("deadCounterLevel(1,100) = %d, want 2 (minimum visibility)", got)
+	}
+	if got := counterLevel(1, 100); got != 1 {
+		t.Fatalf("counterLevel(1,100) = %d, want 1 (publish uses floor)", got)
+	}
+}
+
 func TestMonthLabelsInStrip(t *testing.T) {
 	aug31 := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	sep1 := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)

@@ -68,6 +68,25 @@ func counterLevel(value, max int64) int {
 	return lvl
 }
 
+// deadCounterLevel scales dead deliveries within the row only (no volume
+// floor). Any dead count is at least l2 so a rare dead day stays visible.
+func deadCounterLevel(value, max int64) int {
+	if value <= 0 || max <= 0 {
+		return 0
+	}
+	lvl := int((value*4 + max - 1) / max)
+	if lvl < 1 {
+		lvl = 1
+	}
+	if lvl > 4 {
+		lvl = 4
+	}
+	if lvl < 2 {
+		lvl = 2
+	}
+	return lvl
+}
+
 func buildContributionGraph(days []dayView) contributionGraph {
 	if len(days) == 0 {
 		return contributionGraph{}
@@ -93,13 +112,17 @@ func buildContributionGraph(days []dayView) contributionGraph {
 				max = v
 			}
 		}
+		levelFn := counterLevel
+		if def.id == "dead" {
+			levelFn = deadCounterLevel
+		}
 		cells := make([]metricCell, len(days))
 		for i, d := range days {
 			day := d.Day.UTC().Truncate(24 * time.Hour)
 			cells[i] = metricCell{
 				Day:   day,
 				Value: vals[i],
-				Level: counterLevel(vals[i], max),
+				Level: levelFn(vals[i], max),
 			}
 		}
 		metrics = append(metrics, metricRow{
