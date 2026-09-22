@@ -12,26 +12,6 @@ import (
 // replace them one file at a time (publish/claim, maintenance, stats, admin).
 // Every stub returns an error rather than panicking or faking success.
 
-func (s *Store) ChannelCounters(ctx context.Context, channelID int64) (store.ChannelCounters, error) {
-	return store.ChannelCounters{}, fmt.Errorf("sqlite: ChannelCounters not implemented yet")
-}
-
-func (s *Store) TopicCounters(ctx context.Context, topicID int64) (store.ChannelCounters, error) {
-	return store.ChannelCounters{}, fmt.Errorf("sqlite: TopicCounters not implemented yet")
-}
-
-func (s *Store) ChannelBacklog(ctx context.Context, channelID int64) (store.ChannelBacklog, error) {
-	return store.ChannelBacklog{}, fmt.Errorf("sqlite: ChannelBacklog not implemented yet")
-}
-
-func (s *Store) PruneStats(ctx context.Context, retentionDays int) (int64, error) {
-	return 0, fmt.Errorf("sqlite: PruneStats not implemented yet")
-}
-
-func (s *Store) FlushStats(ctx context.Context) error {
-	return fmt.Errorf("sqlite: FlushStats not implemented yet")
-}
-
 func (s *Store) ListTopics(ctx context.Context) ([]store.TopicInfo, error) {
 	return nil, fmt.Errorf("sqlite: ListTopics not implemented yet")
 }
