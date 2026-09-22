@@ -577,7 +577,6 @@ button:hover { background: color-mix(in oklab, var(--primary) 88%, black); }
 	aspect-ratio: 1;
 	max-height: 1.15rem;
 	border-radius: 2px;
-	background: var(--contrib-0);
 	box-sizing: border-box;
 }
 
@@ -588,6 +587,7 @@ button:hover { background: color-mix(in oklab, var(--primary) 88%, black); }
 	aspect-ratio: auto;
 }
 
+.contrib-cell--l0 { background: var(--contrib-0); }
 .contrib-cell--l1 { background: var(--contrib-1); }
 .contrib-cell--l2 { background: var(--contrib-2); }
 .contrib-cell--l3 { background: var(--contrib-3); }
@@ -597,10 +597,7 @@ button:hover { background: color-mix(in oklab, var(--primary) 88%, black); }
 	color: var(--status-danger-foreground);
 }
 
-.contrib-strip__row--danger .contrib-cell {
-	background: var(--dead-0);
-}
-
+.contrib-strip__row--danger .contrib-cell--l0 { background: var(--dead-0); }
 .contrib-strip__row--danger .contrib-cell--l1 { background: var(--dead-1); }
 .contrib-strip__row--danger .contrib-cell--l2 { background: var(--dead-2); }
 .contrib-strip__row--danger .contrib-cell--l3 { background: var(--dead-3); }
