@@ -1,0 +1,69 @@
+{{define "content"}}
+{{if .Delivery}}
+<h1>Dead delivery #{{.Delivery.ID}}</h1>
+<p class="muted">Channel <a href="{{url "/channels/" .ChannelID}}">{{.TopicName}}/{{.ChannelName}}</a> · message #{{.Delivery.MessageID}} · destination {{.Delivery.Topic}}/{{.Delivery.Channel}}</p>
+
+<section class="card">
+	<h2>Metadata</h2>
+	<dl class="backlog">
+		<div><dt>Delivery</dt><dd>#{{.Delivery.ID}}</dd></div>
+		<div><dt>Message</dt><dd>#{{.Delivery.MessageID}}</dd></div>
+		<div><dt>Attempts</dt><dd>{{.Delivery.Attempts}}/{{.Delivery.MaxAttempts}}</dd></div>
+		<div><dt>Remaining TTL</dt><dd>{{if .Delivery.Expired}}<span class="muted">expired — awaiting purge</span>{{else}}{{.Delivery.Remaining}}{{end}}</dd></div>
+		<div><dt>Died at</dt><dd>{{.Delivery.AvailableAt.Format "2006-01-02 15:04:05 MST"}}</dd></div>
+		<div><dt>Expires at</dt><dd>{{.Delivery.ExpiresAt.Format "2006-01-02 15:04:05 MST"}}</dd></div>
+	</dl>
+</section>
+
+<section class="card">
+	<h2>Message body <span class="muted">({{.Delivery.BodyBytes}} bytes, full)</span></h2>
+	<pre class="dead-body">{{.Delivery.Body}}</pre>
+	<p class="hint">This page and the JSON endpoint for this delivery are the only places the admin shows a full payload.</p>
+</section>
+
+<section class="card">
+	<h2>Actions</h2>
+	<p class="warning" role="alert">Requeue resets attempts and starts a fresh TTL; delete removes the dead delivery permanently.</p>
+	<form class="confirm-form" method="post" action="{{url "/channels/" .ChannelID "/dead/" .Delivery.ID "/requeue"}}">
+		<button type="submit">Requeue (reset attempts, fresh TTL)</button>
+		<a class="cancel-link" href="{{url "/channels/" .ChannelID "/dead"}}">Back to the list</a>
+	</form>
+	<form class="confirm-form" method="post" action="{{url "/channels/" .ChannelID "/dead/" .Delivery.ID "/delete"}}">
+		<button class="danger-button" type="submit">Delete permanently</button>
+		<a class="cancel-link" href="{{url "/channels/" .ChannelID "/dead"}}">Back to the list</a>
+	</form>
+</section>
+{{else}}
+<h1>Dead letters — <span class="entity">{{.TopicName}}/{{.ChannelName}}</span></h1>
+<p class="muted">Newest first · <a href="{{url "/channels/" .ChannelID}}">back to channel {{.ChannelName}}</a></p>
+{{if .Notice}}<p class="note" role="status">{{.Notice}}</p>{{end}}
+
+{{if .Rows}}
+<table class="counters">
+	<thead>
+		<tr>
+			<th scope="col">Delivery</th>
+			<th scope="col">Body</th>
+			<th scope="col">Attempts</th>
+			<th scope="col">Remaining TTL</th>
+		</tr>
+	</thead>
+	<tbody>
+		{{range .Rows}}<tr class="dead-row">
+			<td><a href="{{url "/channels/" $.ChannelID "/dead/" .ID}}">#{{.ID}}</a></td>
+			<td><pre class="dead-body">{{.Body}}</pre>{{if .Truncated}}<p class="hint">truncated — {{.BodyBytes}} bytes total; open the delivery for the full body</p>{{end}}</td>
+			<td class="num">{{.Attempts}}/{{.MaxAttempts}}</td>
+			<td>{{if .Expired}}<span class="muted">expired</span>{{else}}{{.Remaining}}{{end}}</td>
+		</tr>{{end}}
+	</tbody>
+</table>
+{{else}}
+<p>No dead deliveries{{if .Before}} this far back{{end}}.</p>
+{{end}}
+
+<nav class="pagination">
+	{{if .HasOlder}}<a href="{{url "/channels/" .ChannelID "/dead?before=" .OlderBefore}}">Older…</a>{{end}}
+	{{if .Before}}<a href="{{url "/channels/" .ChannelID "/dead"}}">Back to first page</a>{{end}}
+</nav>
+{{end}}
+{{end}}

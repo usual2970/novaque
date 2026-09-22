@@ -99,7 +99,7 @@ func New(client *novaque.Client, opts Options) (http.Handler, error) {
 	// Every URL in markup flows through the single "url" helper (KTD3).
 	fm := template.FuncMap{"url": h.path}
 	h.pages = make(map[string]*template.Template, 4)
-	for _, page := range []string{"dashboard.html", "topic.html", "channel.html", "confirm.html"} {
+	for _, page := range []string{"dashboard.html", "topic.html", "channel.html", "confirm.html", "dead.html"} {
 		t, err := template.New("layout.html").Funcs(fm).ParseFS(templateFS, "templates/layout.html", "templates/"+page)
 		if err != nil {
 			return nil, fmt.Errorf("novaque/admin: parse %s: %w", page, err)
@@ -138,13 +138,15 @@ func (h *handler) routes() {
 	m.HandleFunc("GET /channels/{id}", h.pageChannel)
 	m.HandleFunc("GET /topics/{id}/delete", h.pageConfirmDeleteTopic)
 	m.HandleFunc("GET /channels/{id}/delete", h.pageConfirmDeleteChannel)
-	// Dead-letter surface (U5): routes registered now so URL shapes are
-	// stable; the handlers are minimal 404s until U5 lands.
-	m.HandleFunc("GET /channels/{id}/dead", deadStub)
-	m.HandleFunc("GET /api/channels/{id}/dead", deadStub)
-	m.HandleFunc("GET /api/channels/{id}/dead/{deliveryID}", deadStub)
-	m.HandleFunc("POST /channels/{id}/dead/{deliveryID}/requeue", deadStub)
-	m.HandleFunc("POST /channels/{id}/dead/{deliveryID}/delete", deadStub)
+	// Dead-letter surface (U5): paginated browse with truncated bodies, the
+	// full-body view, and the requeue/delete actions — the only surfaces
+	// carrying message payloads (R12).
+	m.HandleFunc("GET /channels/{id}/dead", h.pageDead)
+	m.HandleFunc("GET /channels/{id}/dead/{deliveryID}", h.pageDeadDelivery)
+	m.HandleFunc("GET /api/channels/{id}/dead", h.apiDeadList)
+	m.HandleFunc("GET /api/channels/{id}/dead/{deliveryID}", h.apiDeadDelivery)
+	m.HandleFunc("POST /channels/{id}/dead/{deliveryID}/requeue", h.formRequeueDead)
+	m.HandleFunc("POST /channels/{id}/dead/{deliveryID}/delete", h.formDeleteDead)
 	// Forms — every mutation is a POST (KTD4).
 	m.HandleFunc("POST /topics", h.formCreateTopic)
 	m.HandleFunc("POST /channels", h.formCreateChannel)
@@ -156,11 +158,6 @@ func (h *handler) routes() {
 	m.HandleFunc("GET /api/channels/{id}", h.apiChannel)
 	// Static assets (templates are a separate embed and never served).
 	m.Handle("GET /static/", h.static)
-}
-
-// deadStub holds the dead-letter route shapes until U5 implements them.
-func deadStub(w http.ResponseWriter, r *http.Request) {
-	http.NotFound(w, r)
 }
 
 // normalizePrefix canonicalizes a mount path: leading slash, no trailing
