@@ -1,3 +1,6 @@
+// Package mysql implements store.Store on MySQL 8.0.1+ (InnoDB). Claiming
+// uses FOR UPDATE SKIP LOCKED so multiple processes compete safely within a
+// channel. The schema is embedded and applied idempotently by Migrate.
 package mysql
 
 import (
@@ -15,7 +18,7 @@ import (
 //go:embed schema.sql
 var schemaFS embed.FS
 
-// DefaultMaxAttempts used when publish opts leave MaxAttempts unset.
+// DefaultMaxAttempts is the default used when publish opts leave MaxAttempts unset.
 const DefaultMaxAttempts = 5
 
 // Store is the MySQL implementation of store.Store.
@@ -161,7 +164,8 @@ func (s *Store) EnsureChannel(ctx context.Context, topic, channel string) (int64
 	return id, err
 }
 
-// Publish inserts message + per-channel deliveries atomically for a known topic id.
+// Publish inserts message + per-channel deliveries atomically for a known
+// topic id. A nil body is stored as empty.
 func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts store.PublishOpts) (int64, error) {
 	if body == nil {
 		body = []byte{}
@@ -273,9 +277,10 @@ func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts st
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	// Counters bump only after the commit succeeded (R5). Publish unit is one
-	// delivery per channel; zero-channel publishes land on the channel_id=0
-	// sentinel row (KTD3).
+	// Counters bump only after the commit succeeded, so a rolled-back
+	// mutation records nothing. The publish unit is one delivery per channel;
+	// zero-channel publishes land on the channel_id=0 sentinel row (a
+	// topic-only counter with no channel backlog change).
 	if len(fanout) == 0 {
 		s.recordStat(topicID, 0, statPublish, 1)
 	} else {

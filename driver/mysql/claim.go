@@ -161,9 +161,9 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	// Counters bump only after the commit succeeded (R5). claim counts every
-	// row leased to in_flight here — poison rows included — and dead counts
-	// rows terminalized inside this call (KTD4).
+	// Counters bump only after the commit succeeded. claim counts every row
+	// leased to in_flight here — poison rows included — and a poison claim
+	// also counts dead: the lease attempt and the terminal outcome both.
 	s.recordStat(statTopicID, channelID, statClaim, int64(len(claimedIDs)))
 	if len(deadIDs) > 0 {
 		s.recordStat(statTopicID, channelID, statDead, int64(len(deadIDs)))
@@ -174,7 +174,7 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 // leaseAttribution resolves the stats coordinates of a still-leased delivery
 // in one indexed round trip. It returns sql.ErrNoRows on mismatch; the caller
 // falls through to its mutation, which then affects 0 rows and produces the
-// legacy error without recording anything (R5).
+// legacy error without recording anything.
 func (s *Store) leaseAttribution(ctx context.Context, deliveryID int64, leaseToken string) (topicID, channelID int64, err error) {
 	err = s.db.QueryRowContext(ctx, `
 		SELECT c.topic_id, d.channel_id

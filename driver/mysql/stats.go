@@ -45,7 +45,8 @@ func (k statKind) column() string {
 
 // statCoord is the stats coordinates of one (topic, channel) pair — the day is
 // deliberately absent: bucketing happens at flush time from the DB clock.
-// channelID 0 is the zero-channel publish sentinel (KTD3).
+// channelID 0 is the zero-channel publish sentinel (topic-only counter, no
+// channel backlog change).
 type statCoord struct {
 	topicID   int64
 	channelID int64
@@ -67,7 +68,7 @@ var statsFlushFullSQL = statsFlushSQL(statsFlushBatch)
 
 // recordStat buffers a counter delta in the in-process sink. Mutators call it
 // only AFTER a mutation committed (or RowsAffected confirmed success), so
-// rollbacks and lease mismatches never count (R5); the map coalesces repeated
+// rollbacks and lease mismatches never count; the map coalesces repeated
 // deltas for free. Buffering keeps every mutation transaction free of stats
 // writes — FlushStats drains the sink in batches.
 func (s *Store) recordStat(topicID, channelID int64, kind statKind, n int64) {
@@ -83,10 +84,10 @@ func (s *Store) recordStat(topicID, channelID int64, kind statKind, n int64) {
 }
 
 // FlushStats drains the buffered counter sink into novaque_stats_daily in
-// batched upserts. The day bucket comes from the DB clock (UTC_DATE(), KTD8 —
-// never host time), so a flush spanning UTC midnight attributes its whole
-// delta to the flush-time day. On error the not-yet-flushed deltas are merged
-// back into the sink so a transient DB failure loses no counts (at-least-once).
+// batched upserts. The day bucket comes from the DB clock (UTC_DATE(), never
+// host time), so a flush spanning UTC midnight attributes its whole delta to
+// the flush-time day. On error the not-yet-flushed deltas are merged back
+// into the sink so a transient DB failure loses no counts (at-least-once).
 func (s *Store) FlushStats(ctx context.Context) error {
 	s.statMu.Lock()
 	if len(s.statBuf) == 0 {

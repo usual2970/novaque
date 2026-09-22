@@ -8,8 +8,9 @@ import (
 )
 
 // ReapExpiredLeases resets expired in_flight deliveries to pending (DB time).
-// It records no stats at all (KTD5): the requeue counter belongs to handler
-// Requeue only.
+// It records no stats at all: a lease reap is not a requeue — the requeue
+// counter belongs to handler-driven Requeue only, and reclaiming reaped work
+// counts claim again.
 func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 100
