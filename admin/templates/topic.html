@@ -1,0 +1,70 @@
+{{define "content"}}
+<h1>Topic <span class="entity">{{.Name}}</span></h1>
+<p class="muted">Topic #{{.ID}} · totals: {{.Totals.Pending}} pending · {{.Totals.Ready}} ready · {{.Totals.InFlight}} in flight · {{.Totals.Dead}} dead</p>
+
+<section class="card">
+	<h2>Channels</h2>
+	{{if .Channels}}
+	<table>
+		<thead>
+			<tr>
+				<th scope="col">Channel</th>
+				<th scope="col" class="num">Pending</th>
+				<th scope="col" class="num">Ready</th>
+				<th scope="col" class="num">In flight</th>
+				<th scope="col" class="num">Dead</th>
+				<th scope="col"><span class="visually-hidden">Actions</span></th>
+			</tr>
+		</thead>
+		<tbody>
+			{{range .Channels}}
+			<tr>
+				<th scope="row"><a href="{{url "/channels/" .ID}}">{{.Name}}</a> <span class="muted">#{{.ID}}</span></th>
+				<td class="num" data-b="{{.ID}}-pending">{{.Backlog.Pending}}</td>
+				<td class="num" data-b="{{.ID}}-ready">{{.Backlog.Ready}}</td>
+				<td class="num" data-b="{{.ID}}-in_flight">{{.Backlog.InFlight}}</td>
+				<td class="num" data-b="{{.ID}}-dead">{{.Backlog.Dead}}</td>
+				<td><a class="danger-link" href="{{url "/channels/" .ID "/delete"}}">Delete…</a></td>
+			</tr>
+			{{end}}
+		</tbody>
+	</table>
+	{{else}}
+	<p class="note">No channels. Publishes to a zero-channel topic keep the message and count on the topic's sentinel stats row only.</p>
+	{{end}}
+	{{if .ChannelError}}<p class="form-error" role="alert">{{.ChannelError}}</p>{{end}}
+	<form class="inline-form" method="post" action="{{url "/channels"}}">
+		<input type="hidden" name="topic_id" value="{{.ID}}">
+		<label for="channel-name">Add channel</label>
+		<input id="channel-name" type="text" name="name" value="{{.ChannelName}}" maxlength="64" required>
+		<button type="submit">Create channel</button>
+	</form>
+	<p class="note">A channel created after a publish receives only future publishes — messages already published are not retroactively delivered.</p>
+</section>
+
+<section class="card">
+	<h2>Publishes per day <span class="muted">({{len .Days}} days, UTC)</span></h2>
+	<div class="trend" role="img" aria-label="Publishes per day over the trailing window">
+		{{range .Days}}<div class="trend-col" title="{{.Day.Format "2006-01-02"}} · {{.Publish}} publishes"><div class="trend-bar" style="height: {{.Pct}}%"></div></div>{{end}}
+	</div>
+	<table class="counters">
+		<thead>
+			<tr>
+				<th scope="col">Day (UTC)</th>
+				<th scope="col" class="num">Publish</th>
+				<th scope="col" class="num">Claim</th>
+				<th scope="col" class="num">Ack</th>
+				<th scope="col" class="num">Requeue</th>
+				<th scope="col" class="num">Dead</th>
+				<th scope="col" class="num">Purge</th>
+			</tr>
+		</thead>
+		<tbody>
+			{{range .Days}}<tr class="day-row"><td>{{.Day.Format "2006-01-02"}}</td><td class="num">{{.Publish}}</td><td class="num">{{.Claim}}</td><td class="num">{{.Ack}}</td><td class="num">{{.Requeue}}</td><td class="num">{{.Dead}}</td><td class="num">{{.Purge}}</td></tr>{{end}}
+		</tbody>
+	</table>
+	<p class="hint">Counters are day buckets flushed from an in-process buffer; with multiple publisher processes they may lag by seconds.</p>
+</section>
+
+<p><a class="danger-link" href="{{url "/topics/" .ID "/delete"}}">Delete this topic…</a></p>
+{{end}}

@@ -1,0 +1,56 @@
+{{define "content"}}
+<h1>Dashboard</h1>
+
+<section class="card">
+	<h2>Create topic</h2>
+	{{if .CreateError}}<p class="form-error" role="alert">{{.CreateError}}</p>{{end}}
+	<form class="inline-form" method="post" action="{{url "/topics"}}">
+		<label for="topic-name">Name</label>
+		<input id="topic-name" type="text" name="name" value="{{.CreateName}}" maxlength="64" required>
+		<button type="submit">Create topic</button>
+	</form>
+	<p class="hint">Names are 1–64 characters of letters, digits, dot, underscore, and dash (driver rule). Creating an existing topic resolves to it — idempotent.</p>
+</section>
+
+<section class="card">
+	<h2>Topics &amp; channels</h2>
+	{{if .Groups}}
+	<table>
+		<thead>
+			<tr>
+				<th scope="col">Topic / channel</th>
+				<th scope="col" class="num">Pending</th>
+				<th scope="col" class="num">Ready</th>
+				<th scope="col" class="num">In flight</th>
+				<th scope="col" class="num">Dead</th>
+				<th scope="col"><span class="visually-hidden">Actions</span></th>
+			</tr>
+		</thead>
+		<tbody>
+			{{range .Groups}}
+			<tr class="topic-row">
+				<th scope="row"><a href="{{url "/topics/" .ID}}">{{.Name}}</a> <span class="muted">#{{.ID}}</span></th>
+				<td class="num" data-t="{{.ID}}-pending">{{.Totals.Pending}}</td>
+				<td class="num" data-t="{{.ID}}-ready">{{.Totals.Ready}}</td>
+				<td class="num" data-t="{{.ID}}-in_flight">{{.Totals.InFlight}}</td>
+				<td class="num" data-t="{{.ID}}-dead">{{.Totals.Dead}}</td>
+				<td><a class="danger-link" href="{{url "/topics/" .ID "/delete"}}">Delete…</a></td>
+			</tr>
+			{{range .Channels}}
+			<tr>
+				<td class="indent"><a href="{{url "/channels/" .ID}}">{{.Name}}</a> <span class="muted">#{{.ID}}</span></td>
+				<td class="num" data-b="{{.ID}}-pending">{{.Backlog.Pending}}</td>
+				<td class="num" data-b="{{.ID}}-ready">{{.Backlog.Ready}}</td>
+				<td class="num" data-b="{{.ID}}-in_flight">{{.Backlog.InFlight}}</td>
+				<td class="num" data-b="{{.ID}}-dead">{{.Backlog.Dead}}</td>
+				<td><a class="danger-link" href="{{url "/channels/" .ID "/delete"}}">Delete…</a></td>
+			</tr>
+			{{end}}
+			{{end}}
+		</tbody>
+	</table>
+	{{else}}
+	<p>No topics yet — create one above.</p>
+	{{end}}
+</section>
+{{end}}

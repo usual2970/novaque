@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} — novaque admin</title>
+<link rel="stylesheet" href="{{url "/static/admin.css"}}">
+</head>
+<body>
+<header class="top">
+	<a class="brand" href="{{url "/"}}">novaque<span>admin</span></a>
+</header>
+<main{{if .Poll}} data-poll="{{.Poll}}"{{end}}>
+{{template "content" .}}
+</main>
+<footer class="foot">
+	<p>Day-bucket counters are UTC and may lag by a few seconds when multiple processes publish (each flushes its own buffer). The admin assumes <code>Client.Migrate</code> has run.</p>
+</footer>
+<script>const BASE = "{{.Prefix}}";</script>
+<script src="{{url "/static/admin.js"}}" defer></script>
+</body>
+</html>

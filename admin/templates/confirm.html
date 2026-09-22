@@ -1,0 +1,12 @@
+{{define "content"}}
+<h1>{{.Heading}}</h1>
+<p>This action cannot be undone. Review what it removes:</p>
+<ul class="facts">
+	{{range .Lines}}<li>{{.}}</li>{{end}}
+</ul>
+{{range .Warnings}}<p class="warning" role="alert">{{.}}</p>{{end}}
+<form class="confirm-form" method="post" action="{{.ActionURL}}">
+	<button class="danger-button" type="submit">{{.ActionLabel}}</button>
+	<a class="cancel-link" href="{{.CancelURL}}">Cancel</a>
+</form>
+{{end}}
