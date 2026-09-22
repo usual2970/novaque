@@ -97,7 +97,10 @@ func New(client *novaque.Client, opts Options) (http.Handler, error) {
 	// Templates: Funcs before Parse, one set per page so each page file can
 	// define its own "content" block against the shared layout (KTD10).
 	// Every URL in markup flows through the single "url" helper (KTD3).
-	fm := template.FuncMap{"url": h.path}
+	fm := template.FuncMap{
+		"url":     h.path,
+		"heatmap": buildContributionGraph,
+	}
 	h.pages = make(map[string]*template.Template, 5)
 	for _, page := range []string{"dashboard.html", "topic.html", "channel.html", "confirm.html", "dead.html"} {
 		t, err := template.New("layout.html").Funcs(fm).ParseFS(templateFS, "templates/layout.html", "templates/"+page)
@@ -303,11 +306,9 @@ type topicGroupView struct {
 	Channels []channelView
 }
 
-// dayView is one zero-filled UTC day bucket plus the trend bar height (a
-// percent of the window's max publish count).
+// dayView is one zero-filled UTC day bucket for detail pages and heatmaps.
 type dayView struct {
 	novaque.DailyCounters
-	Pct int
 }
 
 type dashboardView struct {
@@ -498,20 +499,11 @@ func zeroFillDaily(rows []novaque.DailyCounters, days int, now time.Time) []dayV
 	}
 	today := now.UTC().Truncate(24 * time.Hour)
 	out := make([]dayView, 0, days)
-	var max int64
 	for i := days - 1; i >= 0; i-- {
 		day := today.AddDate(0, 0, -i)
 		row := byDay[day.Format(dateFormat)] // zero value zero-fills
 		row.Day = day
-		if row.Publish > max {
-			max = row.Publish
-		}
 		out = append(out, dayView{DailyCounters: row})
-	}
-	for i := range out {
-		if max > 0 {
-			out[i].Pct = int(out[i].Publish * 100 / max)
-		}
 	}
 	return out
 }

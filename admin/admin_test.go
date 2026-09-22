@@ -771,19 +771,40 @@ func TestTrendZeroFillsEveryDay(t *testing.T) {
 	ts, _ := newTestServer(t, "/admin")
 	_, body := doGet(t, ts.Client(), ts.URL+"/admin/topics/1")
 	// 30-day window (min(retention, 30)); the fake recorded only 3 days, so
-	// 27 bars must be zero-filled — every day in the window renders a bar.
-	if got := strings.Count(body, `class="trend-bar"`); got != 30 {
-		t.Fatalf("trend bars = %d, want 30 (zero-filled window)", got)
+	// 27 heatmap cells must be zero-filled — every day in the window renders.
+	if got := strings.Count(body, ` Publish"`); got != 30 {
+		t.Fatalf("publish heatmap tooltips = %d, want 30 (zero-filled window)", got)
 	}
-	if !strings.Contains(body, `height: 0%`) {
-		t.Fatal("trend lacks zero-height bars for days without counters")
+	if got := strings.Count(body, `class="contrib-cell contrib-cell--l`); got < 180 {
+		t.Fatalf("heatmap cells = %d, want at least 180 (30 days × 6 metrics)", got)
+	}
+	if !strings.Contains(body, `class="contrib-legend"`) {
+		t.Fatal("heatmap missing legend")
+	}
+	if !strings.Contains(body, `class="contrib-strip"`) {
+		t.Fatal("heatmap missing day strip")
+	}
+	if got := strings.Count(body, `contrib-strip__row`); got < 7 {
+		t.Fatalf("heatmap rows = %d, want 1 month + 6 metric rows", got)
+	}
+	if !strings.Contains(body, `>Publish</span>`) || !strings.Contains(body, `>Dead</span>`) {
+		t.Fatal("heatmap missing metric row labels")
+	}
+	if !strings.Contains(body, `class="contrib-scroll"`) {
+		t.Fatal("heatmap missing scroll wrapper")
+	}
+	if !strings.Contains(body, `class="contrib-cell contrib-cell--l0"`) {
+		t.Fatal("heatmap lacks level-0 cells for days without counters")
 	}
 	if got := strings.Count(body, `class="day-row"`); got != 30 {
 		t.Fatalf("counter table rows = %d, want 30 (zero-filled window)", got)
 	}
-	// Seeded values render.
+	// Seeded values render in table and summary total (5+3+8).
 	if !strings.Contains(body, ">5<") {
 		t.Fatal("trend missing seeded publish count 5")
+	}
+	if !strings.Contains(body, `(16 publishes total)`) {
+		t.Fatal("heatmap summary missing total publish count 16")
 	}
 }
 
@@ -1153,8 +1174,8 @@ func TestStaticAssetsServed(t *testing.T) {
 	if !strings.HasPrefix(res.Header.Get("Content-Type"), "text/css") {
 		t.Fatalf("css Content-Type = %q", res.Header.Get("Content-Type"))
 	}
-	if !strings.Contains(body, "trend-bar") {
-		t.Fatal("css missing trend-bar rules")
+	if !strings.Contains(body, "contrib-cell") {
+		t.Fatal("css missing contrib-cell rules")
 	}
 	res, _ = doGet(t, ts.Client(), ts.URL+"/admin/static/admin.js")
 	if res.StatusCode != http.StatusOK {

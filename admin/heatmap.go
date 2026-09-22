@@ -1,0 +1,110 @@
+package admin
+
+import "time"
+
+// contributionGraph is a multi-row heatmap: one strip per counter kind over the
+// trailing UTC day window (typically 30 days × 6 metrics).
+type contributionGraph struct {
+	Total        int64
+	WindowDays   int
+	MonthColumns []monthColumn
+	Metrics      []metricRow
+}
+
+type monthColumn struct {
+	MonthLabel string
+}
+
+type metricRow struct {
+	ID    string
+	Label string
+	Cells []metricCell
+}
+
+type metricCell struct {
+	Day   time.Time
+	Value int64
+	Level int
+}
+
+type metricDef struct {
+	id    string
+	label string
+	value func(dayView) int64
+}
+
+var heatmapMetrics = []metricDef{
+	{"publish", "Publish", func(d dayView) int64 { return d.Publish }},
+	{"claim", "Claim", func(d dayView) int64 { return d.Claim }},
+	{"ack", "Ack", func(d dayView) int64 { return d.Ack }},
+	{"requeue", "Requeue", func(d dayView) int64 { return d.Requeue }},
+	{"purge", "Purge", func(d dayView) int64 { return d.Purge }},
+	{"dead", "Dead", func(d dayView) int64 { return d.Dead }},
+}
+
+// counterLevel maps a count to heat intensity 0–4 (quartiles vs window max).
+func counterLevel(value, max int64) int {
+	if value <= 0 || max <= 0 {
+		return 0
+	}
+	lvl := int((value*4 + max - 1) / max)
+	if lvl < 1 {
+		return 1
+	}
+	if lvl > 4 {
+		return 4
+	}
+	return lvl
+}
+
+func buildContributionGraph(days []dayView) contributionGraph {
+	if len(days) == 0 {
+		return contributionGraph{}
+	}
+	months := make([]monthColumn, len(days))
+	var total int64
+	for i, d := range days {
+		day := d.Day.UTC().Truncate(24 * time.Hour)
+		if i == 0 || day.Month() != days[i-1].Day.UTC().Truncate(24*time.Hour).Month() {
+			months[i].MonthLabel = day.Format("Jan")
+		}
+		total += d.Publish
+	}
+
+	metrics := make([]metricRow, 0, len(heatmapMetrics))
+	for _, def := range heatmapMetrics {
+		var max int64
+		vals := make([]int64, len(days))
+		for i, d := range days {
+			v := def.value(d)
+			vals[i] = v
+			if v > max {
+				max = v
+			}
+		}
+		cells := make([]metricCell, len(days))
+		for i, d := range days {
+			day := d.Day.UTC().Truncate(24 * time.Hour)
+			cells[i] = metricCell{
+				Day:   day,
+				Value: vals[i],
+				Level: counterLevel(vals[i], max),
+			}
+		}
+		metrics = append(metrics, metricRow{
+			ID:    def.id,
+			Label: def.label,
+			Cells: cells,
+		})
+	}
+
+	return contributionGraph{
+		Total:        total,
+		WindowDays:   len(days),
+		MonthColumns: months,
+		Metrics:      metrics,
+	}
+}
+
+// publishLevel is kept for tests naming compatibility.
+func publishLevel(publish, max int64) int { return counterLevel(publish, max) }

@@ -35,10 +35,38 @@ try {
 </html>
 
 {{define "days"}}
+{{$graph := heatmap .}}
 <section class="card">
-	<h2>Publishes per day <span class="muted">({{len .}} days, UTC)</span></h2>
-	<div class="trend" role="img" aria-label="Publishes per day over the trailing window">
-		{{range .}}<div class="trend-col" title="{{.Day.Format "2006-01-02"}} · {{.Publish}} publishes"><div class="trend-bar" style="height: {{.Pct}}%"></div></div>{{end}}
+	<header class="contrib-summary">
+		<h2>Day-bucket counters · trailing {{$graph.WindowDays}} UTC days <span class="muted">({{$graph.Total}} publishes total)</span></h2>
+	</header>
+	<div class="contrib-scroll">
+		<div class="contrib-strip" style="--contrib-days: {{$graph.WindowDays}};" role="group" aria-label="Counter heatmaps by UTC day">
+			<div class="contrib-strip__row contrib-strip__row--months" aria-hidden="true">
+				<span class="contrib-strip__metric"></span>
+				<div class="contrib-strip__track">
+					{{range $graph.MonthColumns}}<span class="contrib-strip__month">{{.MonthLabel}}</span>{{end}}
+				</div>
+			</div>
+			{{range $graph.Metrics}}{{ $metric := . }}<div class="contrib-strip__row{{if eq $metric.ID "dead"}} contrib-strip__row--danger{{end}}">
+				<span class="contrib-strip__metric">{{$metric.Label}}</span>
+				<div class="contrib-strip__track" role="img" aria-label="{{$metric.Label}} per day">
+					{{range $metric.Cells}}<div class="contrib-cell contrib-cell--l{{.Level}}" title="{{.Day.Format "2006-01-02"}} · {{.Value}} {{$metric.Label}}"></div>{{end}}
+				</div>
+			</div>{{end}}
+		</div>
+	</div>
+	<div class="contrib-footer">
+		<p class="contrib-footer__hint muted">Each row is one counter; hover a square for that day&apos;s value.</p>
+		<div class="contrib-legend" aria-hidden="true">
+			<span>Less</span>
+			<span class="contrib-cell contrib-cell--l0"></span>
+			<span class="contrib-cell contrib-cell--l1"></span>
+			<span class="contrib-cell contrib-cell--l2"></span>
+			<span class="contrib-cell contrib-cell--l3"></span>
+			<span class="contrib-cell contrib-cell--l4"></span>
+			<span>More</span>
+		</div>
 	</div>
 	<table class="counters">
 		<thead>
