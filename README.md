@@ -7,8 +7,8 @@ You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. To
 | | |
 |---|---|
 | Topology | topic → channels (multicast); compete within a channel |
-| Durability | rows in MySQL (MVP); claim with `SKIP LOCKED` |
-| Extensibility | `store.Store` seam — Postgres/SQLite drivers can plug in later |
+| Durability | rows in MySQL (`SKIP LOCKED`) or SQLite (serializable transactions) |
+| Extensibility | `store.Store` seam — Postgres drivers can plug in later |
 | Form | library module, not a long-running service |
 
 ## Install
@@ -17,7 +17,7 @@ You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. To
 go get github.com/usual2970/novaque
 ```
 
-Requires **Go 1.26.5+** and, for the shipped driver, **MySQL ≥ 8.0.1** (InnoDB).
+Requires **Go 1.26.5+** and one of the shipped drivers: **MySQL ≥ 8.0.1** (InnoDB) or **SQLite ≥ 3.39.0** (the embedded pure-Go modernc driver bundles a recent SQLite, so no system library is needed).
 
 ## Upgrading to v0.0.7
 
@@ -89,9 +89,42 @@ func main() {
 
 `Subscribe` + `Start` is available when you need to wire several consumers before polling.
 
+## SQLite driver
+
+`driver/sqlite` runs the full queue on a single database file via the pure-Go **modernc.org/sqlite** driver — no cgo, no native library. It implements the same `store.Store` surface as the MySQL driver: fan-out publish, lease-based competing claim, ack/requeue fencing, lease reap, TTL purge, buffered daily stats, admin/dead-letter surface, and cascade deletes.
+
+```go
+import (
+	"database/sql"
+
+	_ "modernc.org/sqlite"
+
+	"github.com/usual2970/novaque"
+	"github.com/usual2970/novaque/driver/sqlite"
+)
+
+db, err := sql.Open("sqlite",
+	"file:data/novaque.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)")
+if err != nil {
+	log.Fatal(err)
+}
+db.SetMaxOpenConns(10)
+
+client, err := novaque.Open(sqlite.New(db), novaque.Options{MaxInFlight: 4})
+// ...Migrate / Start / Subscribe as in the quick start
+```
+
+**Required pragmas.** Open file databases with `foreign_keys(1)` (cascade deletes depend on it — SQLite ships with FK enforcement off by default), `journal_mode(WAL)` (allows readers while a maintenance write runs), and `busy_timeout(10000)` (writers wait on the single writer lock instead of failing immediately).
+
+**Version floor: SQLite ≥ 3.39.0.** `Migrate` checks `sqlite_version()` and fails fast on older runtimes. The bundled modernc driver always satisfies this; the floor only matters if you register a different SQLite build.
+
+**Concurrency — different from MySQL.** SQLite has no row locks and never supports `FOR UPDATE SKIP LOCKED` in any version. Competing claim is still multi-process safe: transactions are serializable, the pending→in_flight lease update is status-guarded (`WHERE id=? AND status='pending'`), and stale-snapshot conflicts (`SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`) retry the whole claim transaction. A busy timeout covers ordinary lock waits.
+
+**When not to use SQLite.** It allows **one writer at a time** database-wide, so high-throughput or many-process deployments should stay on MySQL. SQLite is the right fit for embedded/edge/single-node deployments, local tools and demos, and test suites (the SQLite integration tests need no Docker) — not for a fleet of publisher processes.
+
 ## Documentation
 
-Every exported symbol in `novaque`, `novaque/store`, `novaque/admin`, and `novaque/driver/mysql` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
+Every exported symbol in `novaque`, `novaque/store`, `novaque/admin`, `novaque/driver/mysql`, and `novaque/driver/sqlite` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
 
 ```bash
 go doc github.com/usual2970/novaque.Client
@@ -245,7 +278,7 @@ Dead deliveries are browsable per channel — body preview truncated in the list
 | Fan-out | One pending delivery per **existing** channel, same transaction as the message |
 | Late channel | No retroactive history |
 | Delivery | At-least-once; ack requires matching `lease_token` |
-| Compete | Multi-process safe via `FOR UPDATE SKIP LOCKED` |
+| Compete | Multi-process safe: MySQL via `FOR UPDATE SKIP LOCKED`; SQLite via serializable txns, status-guarded leases and busy retries |
 | Poison | After `max_attempts` claims → `dead`, not returned |
 | TTL | `Client.Start` purges expired messages/deliveries |
 | Delay | Relative publish defer via `available_at`; max 90d; requires TTL > Delay |
@@ -262,10 +295,12 @@ novaque/
     store.go          # Store interface (dialect-agnostic)
     cached.go         # WithCache — memoize EnsureTopic / EnsureChannel
   driver/mysql/       # MySQL Store + schema.sql
+  driver/sqlite/      # SQLite Store + schema.sql (pure-Go modernc driver)
   admin/              # mountable admin UI + JSON API (stdlib http.Handler)
   cmd/example/        # local HTTP demo: admin UI + publish/subscribe hooks
   cmd/loadtest/       # local publish/consume stress tool
-  internal/testmysql/ # testcontainers helper (integration tests)
+  internal/testmysql/ # testcontainers helper (MySQL integration tests)
+  internal/testsqlite/ # temp-file helper (SQLite integration tests; no Docker)
 ```
 
 - Domain code talks only to `store.Store`; MySQL SQL/locking stays in `driver/mysql`.
@@ -278,8 +313,9 @@ novaque/
 ```bash
 go test ./...
 
-# needs Docker
+# MySQL integration needs Docker; SQLite integration needs none
 go test -tags=integration ./...
+go test -tags=integration ./driver/sqlite/...
 ```
 
 ### Example server (admin + publish/subscribe)
@@ -309,6 +345,6 @@ Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
 ## Status / non-goals
 
-Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), mountable admin UI (`novaque/admin`), loadtest, complete identifier-first godoc with compile-verified examples.
+Shipped: MySQL and SQLite drivers, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), mountable admin UI (`novaque/admin`), loadtest, complete identifier-first godoc with compile-verified examples.
 
-Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, deferred requeue/backoff.
+Not in MVP: Postgres driver, NSQ wire protocol, standalone broker, deferred requeue/backoff.
