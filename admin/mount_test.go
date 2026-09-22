@@ -239,13 +239,15 @@ func TestAssetAndSecurityHeaders(t *testing.T) {
 		t.Errorf("admin.css Cache-Control = %q, want public, max-age=3600", cc)
 	}
 
-	// HTML pages: always revalidate, never frameable, no referrer leak.
+	// HTML pages: never stored (review #11 — every page renders live state,
+	// the dead pages carry payload bodies), never frameable, no referrer
+	// leak.
 	res, _ = doGet(t, ts.Client(), ts.URL+"/admin/")
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("dashboard: status = %d, want 200", res.StatusCode)
 	}
-	if cc := res.Header.Get("Cache-Control"); cc != "no-cache" {
-		t.Errorf("page Cache-Control = %q, want no-cache", cc)
+	if cc := res.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("page Cache-Control = %q, want no-store", cc)
 	}
 	if xo := res.Header.Get("X-Frame-Options"); xo != "DENY" {
 		t.Errorf("page X-Frame-Options = %q, want DENY", xo)
@@ -255,6 +257,21 @@ func TestAssetAndSecurityHeaders(t *testing.T) {
 	}
 	if xo := res.Header.Get("X-Content-Type-Options"); xo != "nosniff" {
 		t.Errorf("page X-Content-Type-Options = %q, want nosniff", xo)
+	}
+
+	// The dead-letter HTML pages carry payload bodies, so they get the same
+	// no-store as the JSON endpoints (R12).
+	for _, path := range []string{
+		"/admin/channels/2/dead",
+		"/admin/channels/2/dead/" + strconv.FormatInt(id, 10),
+	} {
+		res, _ = doGet(t, ts.Client(), ts.URL+path)
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status = %d, want 200", path, res.StatusCode)
+		}
+		if cc := res.Header.Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("GET %s Cache-Control = %q, want no-store (payload page)", path, cc)
+		}
 	}
 
 	// JSON is never stored — including the dead-letter body endpoints, the

@@ -18,10 +18,12 @@ import (
 //   - /api/*: Cache-Control: no-store — JSON is live data, and the
 //     dead-letter endpoints are the only APIs carrying message bodies, which
 //     must never sit in a shared cache (R12).
-//   - every other response (the HTML pages): Cache-Control: no-cache so
-//     pages always revalidate, X-Frame-Options: DENY so admin pages cannot
-//     be framed, and Referrer-Policy: same-origin so dead-body URLs never
-//     leak out via a referrer.
+//   - every other response (the HTML pages): Cache-Control: no-store as
+//     well (review #11) — every page renders live backlog/dead state, and
+//     the dead-letter HTML pages carry message payloads, so no page is safe
+//     to store even with revalidation; X-Frame-Options: DENY so admin pages
+//     cannot be framed, and Referrer-Policy: same-origin so dead-body URLs
+//     never leak out via a referrer.
 //   - every response: X-Content-Type-Options: nosniff.
 //
 // The middleware also suppresses the plain directory listing the embedded
@@ -59,7 +61,7 @@ func (h *handler) securityHeaders(next http.Handler) http.Handler {
 		case strings.HasPrefix(p, "/api/"):
 			w.Header().Set("Cache-Control", "no-store")
 		default:
-			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("Referrer-Policy", "same-origin")
 		}
