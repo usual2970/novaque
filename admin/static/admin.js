@@ -117,3 +117,21 @@
 
 	poll();
 })();
+
+// Theme toggle: flip the <html> class the head script resolved and persist
+// the choice. Independent of the poller — every page carries the button.
+(function () {
+	"use strict";
+	var toggle = document.getElementById("theme-toggle");
+	if (!toggle) {
+		return;
+	}
+	toggle.addEventListener("click", function () {
+		var root = document.documentElement;
+		var dark = root.classList.toggle("dark");
+		root.classList.toggle("light", !dark);
+		try {
+			localStorage.setItem("novaque-theme", dark ? "dark" : "light");
+		} catch (e) {}
+	});
+})();
