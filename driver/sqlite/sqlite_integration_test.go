@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -351,8 +352,11 @@ func TestPublishDelayClaimAndReject(t *testing.T) {
 // shared pool (AE5 best-effort). SQLite has no row locks: concurrent claim
 // transactions take snapshots, and a transaction whose snapshot went stale
 // before its first write fails SQLITE_BUSY_SNAPSHOT (517), which busy_timeout
-// does not cover — Claim itself retries the whole transaction. Any busy error
-// that escapes Claim is retried here too; a double lease must never happen.
+// does not cover — Claim itself retries the whole transaction up to
+// claimMaxAttempts, and that driver-internal retry is the ONLY retry path:
+// this test no longer retries busy errors at the caller side (doing so masked
+// a driver retry-budget regression). Any "busy after" error escaping Claim is
+// counted and asserted to be zero; a double lease must never happen.
 func TestClaimConcurrentNoDuplicateLease(t *testing.T) {
 	db := testsqlite.Open(t)
 	s := sqlite.New(db)
@@ -389,24 +393,18 @@ func TestClaimConcurrentNoDuplicateLease(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 			owner := fmt.Sprintf("worker-%d", g)
-			backoff := time.Millisecond
 			for {
 				got, err := s.Claim(ctx, chID, owner, 30*time.Second, 10)
 				if err != nil {
-					if isClaimBusy(err) {
-						time.Sleep(backoff)
-						if backoff < 50*time.Millisecond {
-							backoff *= 2
-						}
-						continue
-					}
+					// No caller-side busy retry: Claim's own retry budget
+					// (claimMaxAttempts) is the only retry path. Report any
+					// escaped error and stop; the harness below counts busy.
 					errCh <- err
 					return
 				}
 				if len(got) == 0 {
 					return
 				}
-				backoff = time.Millisecond
 				mu.Lock()
 				for _, d := range got {
 					leased[d.ID]++
@@ -417,8 +415,15 @@ func TestClaimConcurrentNoDuplicateLease(t *testing.T) {
 	}
 	wg.Wait()
 	close(errCh)
+	var busyAfter int
 	for err := range errCh {
 		t.Error(err)
+		if strings.Contains(err.Error(), "busy after") || isClaimBusy(err) {
+			busyAfter++
+		}
+	}
+	if busyAfter != 0 {
+		t.Fatalf("Claim escaped %d busy errors; driver retry budget regressed", busyAfter)
 	}
 	if t.Failed() {
 		return
@@ -434,8 +439,9 @@ func TestClaimConcurrentNoDuplicateLease(t *testing.T) {
 }
 
 // isClaimBusy reports whether err is a SQLite lock/busy code: SQLITE_BUSY (5)
-// or the extended SQLITE_BUSY_SNAPSHOT (517). The test retries those, since
-// they are expected under snapshot contention rather than correctness errors.
+// or the extended SQLITE_BUSY_SNAPSHOT (517). The concurrent-lease test uses
+// it only to count escaped busy errors (which must be zero); it never retries
+// them — Claim's internal retry budget is the sole retry path.
 func isClaimBusy(err error) bool {
 	var e *sqlite3.Error
 	if errors.As(err, &e) {
