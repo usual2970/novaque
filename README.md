@@ -7,8 +7,8 @@ You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. To
 | | |
 |---|---|
 | Topology | topic → channels (multicast); compete within a channel |
-| Durability | rows in MySQL (MVP); claim with `SKIP LOCKED` |
-| Extensibility | `store.Store` seam — Postgres/SQLite drivers can plug in later |
+| Durability | rows in MySQL or PostgreSQL; claim with `SKIP LOCKED` |
+| Extensibility | `store.Store` seam — other drivers (e.g. SQLite) can plug in |
 | Form | library module, not a long-running service |
 
 ## Install
@@ -17,7 +17,7 @@ You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. To
 go get github.com/usual2970/novaque
 ```
 
-Requires **Go 1.26.5+** and, for the shipped driver, **MySQL ≥ 8.0.1** (InnoDB).
+Requires **Go 1.26.5+** and one of the shipped drivers: **MySQL ≥ 8.0.1** (InnoDB) or **PostgreSQL ≥ 14**.
 
 ## Upgrading to v0.0.7
 
@@ -89,9 +89,44 @@ func main() {
 
 `Subscribe` + `Start` is available when you need to wire several consumers before polling.
 
+## PostgreSQL driver
+
+`driver/postgres` implements the same `store.Store` semantics on **PostgreSQL 14+**: topic→channel fan-out, `FOR UPDATE SKIP LOCKED` claiming, lease/ack, TTL purge, day-bucket stats, and the admin/dead-letter surface behave identically to the MySQL driver. `Migrate` checks `server_version_num` and refuses any server below 14, then applies the embedded schema.
+
+```bash
+go get github.com/jackc/pgx/v5
+```
+
+```go
+import (
+	"database/sql"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/usual2970/novaque"
+	"github.com/usual2970/novaque/driver/postgres"
+)
+
+db, err := sql.Open("pgx",
+	"postgres://user:pass@127.0.0.1:5432/app?sslmode=disable&TimeZone=UTC")
+if err != nil {
+	log.Fatal(err)
+}
+db.SetMaxOpenConns(32)
+
+client, err := novaque.Open(postgres.New(db), novaque.Options{
+	MaxInFlight: 8, // concurrent handlers per consumer
+})
+```
+
+- **DSN.** pgx v5 connection string over `database/sql`. `sslmode=disable` is for local dev only — require TLS (`sslmode=require` or stricter) for any off-host database.
+- **UTC.** Every clock on the hot path is derived server-side (`clock_timestamp()` and `NOW() AT TIME ZONE 'UTC'`), so correctness does not depend on the session time zone; setting `TimeZone=UTC` in the DSN keeps manual inspection and logs aligned.
+- **Case sensitivity.** Unlike MySQL's default utf8mb4 collation, PostgreSQL names are case-sensitive: `Orders` and `orders` are distinct topics.
+- **Connection pool.** Same sizing rule as MySQL: `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroom, and a primary-writable connection (no read replicas) for claim/ack/publish.
+
 ## Documentation
 
-Every exported symbol in `novaque`, `novaque/store`, `novaque/admin`, and `novaque/driver/mysql` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
+Every exported symbol in `novaque`, `novaque/store`, `novaque/admin`, `novaque/driver/mysql`, and `novaque/driver/postgres` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
 
 ```bash
 go doc github.com/usual2970/novaque.Client
@@ -262,13 +297,15 @@ novaque/
     store.go          # Store interface (dialect-agnostic)
     cached.go         # WithCache — memoize EnsureTopic / EnsureChannel
   driver/mysql/       # MySQL Store + schema.sql
+  driver/postgres/    # PostgreSQL 14+ Store + schema.sql
   admin/              # mountable admin UI + JSON API (stdlib http.Handler)
   cmd/example/        # local HTTP demo: admin UI + publish/subscribe hooks
   cmd/loadtest/       # local publish/consume stress tool
-  internal/testmysql/ # testcontainers helper (integration tests)
+  internal/testmysql/    # testcontainers helper (MySQL integration tests)
+  internal/testpostgres/ # testcontainers helper (PostgreSQL integration tests)
 ```
 
-- Domain code talks only to `store.Store`; MySQL SQL/locking stays in `driver/mysql`.
+- Domain code talks only to `store.Store`; dialect SQL/locking stays inside each `driver/` package.
 - `Open` wraps the driver with `store.WithCache` so steady-state publish/subscribe skips name→id round-trips.
 - Claim path uses **channel id** and denormalized `expires_at` on `novaque_deliveries` (no hot-path JOIN).
 - Each consumer runs **one batch poller** + `MaxInFlight` workers (Solid Queue–style), not N independent empty polls.
@@ -280,6 +317,10 @@ go test ./...
 
 # needs Docker
 go test -tags=integration ./...
+
+# one dialect at a time
+go test -tags=integration ./driver/postgres/...
+go test -tags=integration ./driver/mysql/...
 ```
 
 ### Example server (admin + publish/subscribe)
@@ -309,6 +350,6 @@ Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
 ## Status / non-goals
 
-Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), mountable admin UI (`novaque/admin`), loadtest, complete identifier-first godoc with compile-verified examples.
+Shipped: MySQL and PostgreSQL 14+ drivers, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), mountable admin UI (`novaque/admin`), loadtest, complete identifier-first godoc with compile-verified examples.
 
-Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, deferred requeue/backoff.
+Not in MVP: SQLite driver, NSQ wire protocol, standalone broker, deferred requeue/backoff.
