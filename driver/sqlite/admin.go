@@ -256,21 +256,6 @@ func (s *Store) ListDead(ctx context.Context, channelID int64, before int64, lim
 	return out, rows.Err()
 }
 
-// deadAttribution resolves the stats coordinates of a still-dead delivery in
-// one indexed round trip (same shape as leaseAttribution in claim.go). It
-// returns sql.ErrNoRows when the row is not dead; the caller's guarded
-// mutation then affects 0 rows and yields ErrDeadGone without recording
-// anything.
-func (s *Store) deadAttribution(ctx context.Context, deliveryID int64) (topicID, channelID int64, err error) {
-	err = s.db.QueryRowContext(ctx, `
-		SELECT c.topic_id, d.channel_id
-		FROM novaque_deliveries d
-		INNER JOIN novaque_channels c ON c.id = d.channel_id
-		WHERE d.id = ? AND d.status = ?`,
-		deliveryID, store.StatusDead).Scan(&topicID, &channelID)
-	return topicID, channelID, err
-}
-
 // RequeueDead returns one dead delivery of channelID to pending per KTD8:
 // attempts reset to zero, lease cleared, available now, and a fresh TTL
 // written to BOTH expires_at columns — the delivery column keeps the
@@ -287,15 +272,7 @@ func (s *Store) RequeueDead(ctx context.Context, deliveryID, channelID int64, fr
 	if freshTTL <= 0 {
 		return fmt.Errorf("sqlite admin: invalid fresh TTL %s", freshTTL)
 	}
-	// Read-only stats attribution before the mutation (Ack/Requeue pattern):
-	// only a RowsAffected-confirmed transition with known coordinates counts.
-	// The channel comes from the parameter, not attribution — the scoped
-	// guard below confirms the two agree before the stat is recorded.
-	topicID, _, scanErr := s.deadAttribution(ctx, deliveryID)
-	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-		return scanErr
-	}
-	ttlSec := durationSec(freshTTL)
+	ttlSec := store.DurationSec(freshTTL)
 
 	// SQLite transactions are always serializable; BeginTx with nil options —
 	// modernc rejects explicit isolation levels (e.g. ReadCommitted).
@@ -305,28 +282,28 @@ func (s *Store) RequeueDead(ctx context.Context, deliveryID, channelID int64, fr
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := tx.ExecContext(ctx, `
+	// The guarded delivery UPDATE returns its stats coordinates itself
+	// (RETURNING): the channel-scoped, status-dead guard is the same fencing
+	// as before, and a non-matching row returns no rows -> ErrDeadGone.
+	var topic sql.NullInt64
+	var gotChannel int64
+	if err := tx.QueryRowContext(ctx, `
 		UPDATE novaque_deliveries
 		SET status = ?, attempts = 0, available_at = `+sqlNow+`,
 		    lease_owner = NULL, lease_token = NULL, lease_until = NULL,
 		    expires_at = `+sqlNow+` + ?
-		WHERE id = ? AND channel_id = ? AND status = ?`,
-		store.StatusPending, ttlSec, deliveryID, channelID, store.StatusDead)
-	if err != nil {
+		WHERE id = ? AND channel_id = ? AND status = ?`+statAttribution,
+		store.StatusPending, ttlSec, deliveryID, channelID, store.StatusDead).
+		Scan(&topic, &gotChannel); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.ErrDeadGone
+		}
 		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return store.ErrDeadGone
 	}
 	// The message row's expiry moves with the delivery's (subquery reads a
-	// different table than it writes, which SQLite permits — verified to
-	// update the row inside this tx after the delivery's status changed; no
-	// separate message_id lookup is needed). Both writes commit or roll back
-	// together.
+	// different table than it writes, which SQLite permits — it updates the
+	// row inside this tx after the delivery's status changed; no separate
+	// message_id lookup is needed). Both writes commit or roll back together.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE novaque_messages
 		SET expires_at = `+sqlNow+` + ?
@@ -337,8 +314,8 @@ func (s *Store) RequeueDead(ctx context.Context, deliveryID, channelID int64, fr
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	if scanErr == nil {
-		s.recordStat(topicID, channelID, statRequeue, 1)
+	if topic.Valid {
+		s.recordStat(topic.Int64, gotChannel, statRequeue, 1)
 	}
 	return nil
 }
@@ -351,27 +328,23 @@ func (s *Store) RequeueDead(ctx context.Context, deliveryID, channelID int64, fr
 // Manual dead-letter deletions count as purge (KTD8: purge = TTL purges +
 // manual deletions).
 func (s *Store) DeleteDead(ctx context.Context, deliveryID, channelID int64) error {
-	// The channel comes from the parameter, not attribution — the scoped
-	// guard confirms the two agree before the stat is recorded.
-	topicID, _, scanErr := s.deadAttribution(ctx, deliveryID)
-	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-		return scanErr
-	}
-	res, err := s.db.ExecContext(ctx, `
-		DELETE FROM novaque_deliveries WHERE id = ? AND channel_id = ? AND status = ?`,
-		deliveryID, channelID, store.StatusDead)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
+	// The guarded DELETE returns its coordinates itself (RETURNING): the same
+	// channel-scoped, status-dead guard as before, and a non-matching row
+	// returns no rows -> ErrDeadGone.
+	var topic sql.NullInt64
+	var gotChannel int64
+	err := s.db.QueryRowContext(ctx, `
+		DELETE FROM novaque_deliveries
+		WHERE id = ? AND channel_id = ? AND status = ?`+statAttribution,
+		deliveryID, channelID, store.StatusDead).Scan(&topic, &gotChannel)
+	if errors.Is(err, sql.ErrNoRows) {
 		return store.ErrDeadGone
 	}
-	if scanErr == nil {
-		s.recordStat(topicID, channelID, statPurged, 1)
+	if err != nil {
+		return err
+	}
+	if topic.Valid {
+		s.recordStat(topic.Int64, gotChannel, statPurged, 1)
 	}
 	return nil
 }

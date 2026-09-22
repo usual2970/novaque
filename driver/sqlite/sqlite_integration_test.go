@@ -243,9 +243,9 @@ func TestClaimCompeteAndLeaseRedelivery(t *testing.T) {
 
 	d := c1[0]
 	time.Sleep(2500 * time.Millisecond)
-	// U4 ships ReapExpiredLeases; until then drive the identical reap with
-	// raw SQL so the lease-redelivery path is still exercised end to end.
-	reapExpiredLeasesRaw(t, ctx, db, 100)
+	if _, err := s.ReapExpiredLeases(ctx, 100); err != nil {
+		t.Fatal(err)
+	}
 	again, err := s.Claim(ctx, chID, "c", 10*time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -706,26 +706,4 @@ func countRows(ctx context.Context, t *testing.T, db *sql.DB, q string, args ...
 		t.Fatalf("count query %q: %v", q, err)
 	}
 	return n
-}
-
-// reapExpiredLeasesRaw applies the ReapExpiredLeases update (U4) with raw SQL
-// so pre-U4 tests can stage lease expiry without depending on the driver
-// method. The eligibility clause mirrors driver/mysql/maintenance.go; unlike
-// MySQL, SQLite has no UPDATE ... ORDER BY ... LIMIT here, so the bounded batch
-// is selected via an id subquery (U4's reap must adapt identically).
-func reapExpiredLeasesRaw(t *testing.T, ctx context.Context, db *sql.DB, limit int) {
-	t.Helper()
-	if _, err := db.ExecContext(ctx, `
-		UPDATE novaque_deliveries
-		SET status = ?, available_at = unixepoch(),
-		    lease_owner = NULL, lease_token = NULL, lease_until = NULL
-		WHERE id IN (
-			SELECT id FROM novaque_deliveries
-			WHERE status = ? AND lease_until IS NOT NULL AND lease_until < unixepoch()
-			ORDER BY lease_until ASC
-			LIMIT ?
-		)`,
-		store.StatusPending, store.StatusInFlight, limit); err != nil {
-		t.Fatalf("raw reap: %v", err)
-	}
 }

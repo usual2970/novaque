@@ -2,16 +2,10 @@ package sqlite
 
 import (
 	"time"
-
-	"github.com/usual2970/novaque/store"
 )
 
 // sqlNow is the database clock as Unix seconds.
 const sqlNow = "unixepoch()"
-
-func durationSec(d time.Duration) int64 {
-	return store.DurationSec(d)
-}
 
 func timeToSec(t time.Time) int64 {
 	return t.UTC().Unix()

@@ -13,8 +13,7 @@ import (
 // counts claim again.
 //
 // Unlike MySQL, SQLite has no UPDATE ... ORDER BY ... LIMIT: the bounded batch
-// is selected through an id subquery (the same proven shape as
-// reapExpiredLeasesRaw in the tests).
+// is selected through an id subquery.
 func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 100

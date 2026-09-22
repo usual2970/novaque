@@ -73,7 +73,7 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 	if leaseFor <= 0 {
 		leaseFor = 30 * time.Second
 	}
-	leaseSec := durationSec(leaseFor)
+	leaseSec := store.DurationSec(leaseFor)
 
 	var (
 		out          []store.Delivery
@@ -163,35 +163,39 @@ func (s *Store) runClaimTx(ctx context.Context, channelID int64, owner string, l
 		return nil, 0, 0, 0, nil
 	}
 
-	claimedIDs := make([]int64, 0, len(ids))
-	tokens := make(map[int64]string, len(ids))
-	for _, id := range ids {
-		token := newLeaseToken()
-		res, err := tx.ExecContext(ctx, `
-			UPDATE novaque_deliveries
-			SET status = ?,
-			    attempts = attempts + 1,
-			    lease_owner = ?,
-			    lease_token = ?,
-			    lease_until = `+sqlNow+` + ?
-			WHERE id = ? AND status = ?`,
-			store.StatusInFlight, owner, token, leaseSec, id, store.StatusPending)
-		if err != nil {
-			return nil, 0, 0, 0, err
-		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			continue
-		}
-		claimedIDs = append(claimedIDs, id)
-		tokens[id] = token
+	// One set-based lease for the whole poll slice instead of one UPDATE per
+	// row. Each token is generated in the statement itself:
+	// lower(hex(randomblob(16))) is the same 32-hex-char, 128-bit-per-row
+	// format newLeaseToken produced in Go (randomblob uses SQLite's RNG;
+	// tokens are distinct per row). The status='pending' guard in the WHERE
+	// is the same fencing as before: any commit that changed one of these
+	// rows after this transaction's snapshot invalidates it, so the first
+	// write fails SQLITE_BUSY_SNAPSHOT (517) and the caller retries — a
+	// silent zero-row lease cannot happen on a fresh snapshot.
+	leaseMarks, leaseMarkArgs := idPlaceholders(ids)
+	leaseArgs := make([]any, 0, len(ids)+4)
+	leaseArgs = append(leaseArgs, store.StatusInFlight, owner, leaseSec)
+	leaseArgs = append(leaseArgs, leaseMarkArgs...)
+	leaseArgs = append(leaseArgs, store.StatusPending)
+	res, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE novaque_deliveries
+		SET status = ?,
+		    attempts = attempts + 1,
+		    lease_owner = ?,
+		    lease_token = lower(hex(randomblob(16))),
+		    lease_until = `+sqlNow+` + ?
+		WHERE id IN (%s) AND status = ?`, leaseMarks), leaseArgs...)
+	if err != nil {
+		return nil, 0, 0, 0, err
 	}
-	if len(claimedIDs) == 0 {
+	n, _ := res.RowsAffected()
+	if n == 0 {
 		if err := tx.Commit(); err != nil {
 			return nil, 0, 0, 0, err
 		}
 		return nil, 0, 0, 0, nil
 	}
+	claimedIDs := ids
 
 	marks, args := idPlaceholders(claimedIDs)
 	q := fmt.Sprintf(`
@@ -225,9 +229,6 @@ func (s *Store) runClaimTx(ctx context.Context, channelID int64, owner string, l
 		if leaseUntilSec.Valid {
 			d.LeaseUntil = secToTime(leaseUntilSec.Int64)
 		}
-		if tok, ok := tokens[d.ID]; ok {
-			d.LeaseToken = tok
-		}
 		if d.Attempts > d.MaxAttempts {
 			deadIDs = append(deadIDs, d.ID)
 			continue
@@ -238,11 +239,13 @@ func (s *Store) runClaimTx(ctx context.Context, channelID int64, owner string, l
 		return nil, 0, 0, 0, err
 	}
 
-	for _, id := range deadIDs {
-		if _, err := tx.ExecContext(ctx, `
+	if len(deadIDs) > 0 {
+		deadMarks, deadMarkArgs := idPlaceholders(deadIDs)
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE novaque_deliveries
 			SET status = ?, lease_owner = NULL, lease_token = NULL, lease_until = NULL
-			WHERE id = ?`, store.StatusDead, id); err != nil {
+			WHERE id IN (%s)`, deadMarks),
+			append([]any{store.StatusDead}, deadMarkArgs...)...); err != nil {
 			return nil, 0, 0, 0, err
 		}
 	}
@@ -260,22 +263,14 @@ func (s *Store) runClaimTx(ctx context.Context, channelID int64, owner string, l
 	return out, statTopicID, len(claimedIDs), len(deadIDs), nil
 }
 
-// ensureSQLiteVersion gates Migrate on SQLite 3.39.0+ (KTD2, OQ2). The
-// threshold and failure wording were set when SKIP LOCKED was believed to
-// exist on recent SQLite; empirically no SQLite release parses that clause,
-// and on this driver the no-double-lease guarantee rests on snapshot
-// isolation plus the status-guarded lease UPDATE. The check is kept as the
-// mandated runtime floor; it is cached per Store (sync.Once) so a repeated
-// Migrate costs nothing.
-func (s *Store) ensureSQLiteVersion(ctx context.Context) error {
-	s.versionOnce.Do(func() {
-		s.versionErr = s.checkSQLiteVersion(ctx)
-	})
-	return s.versionErr
-}
-
-// checkSQLiteVersion reads sqlite_version() and requires 3.39.0 or newer,
-// failing fast with a versioned error instead of running on an old build.
+// checkSQLiteVersion gates Migrate on the supported SQLite floor, 3.39.0+,
+// by reading sqlite_version(). The threshold and failure wording were set
+// when SKIP LOCKED was believed to exist on recent SQLite; empirically no
+// SQLite release parses that clause, and on this driver the no-double-lease
+// guarantee rests on snapshot isolation plus the status-guarded lease
+// UPDATE. The check is kept as the mandated runtime floor; it runs on every
+// Migrate (it is one cheap SELECT), so a context-canceled first attempt
+// does not freeze an error for the Store's lifetime.
 func (s *Store) checkSQLiteVersion(ctx context.Context) error {
 	var version string
 	if err := s.db.QueryRowContext(ctx, `SELECT sqlite_version()`).Scan(&version); err != nil {
@@ -300,84 +295,70 @@ func (s *Store) checkSQLiteVersion(ctx context.Context) error {
 	return nil
 }
 
-// leaseAttribution resolves the stats coordinates of a still-leased delivery
-// in one indexed round trip. It returns sql.ErrNoRows on mismatch; the caller
-// falls through to its mutation, which then affects 0 rows and produces the
-// legacy error without recording anything.
-func (s *Store) leaseAttribution(ctx context.Context, deliveryID int64, leaseToken string) (topicID, channelID int64, err error) {
-	err = s.db.QueryRowContext(ctx, `
-		SELECT c.topic_id, d.channel_id
-		FROM novaque_deliveries d
-		INNER JOIN novaque_channels c ON c.id = d.channel_id
-		WHERE d.id = ? AND d.lease_token = ? AND d.status = ?`,
-		deliveryID, leaseToken, store.StatusInFlight).Scan(&topicID, &channelID)
-	return topicID, channelID, err
-}
+// statAttribution is the RETURNING fragment that resolves the affected row's
+// stats coordinates straight from the mutation: the channel id from the
+// mutated row and the topic id via a subquery on novaque_channels (NULL if
+// the channel row is somehow missing — the caller treats a missing topic as
+// "record no stat", matching the old INNER JOIN attribution).
+const statAttribution = `
+		RETURNING
+			(SELECT c.topic_id FROM novaque_channels c
+			 WHERE c.id = novaque_deliveries.channel_id),
+			channel_id`
 
-// Ack deletes the delivery when the lease token still matches. The read-only
-// attribution lookup must find the row before the delete (it disappears on
-// ack), but only a DELETE affecting exactly 1 row records the event.
+// Ack deletes the delivery when the lease token still matches. The guarded
+// DELETE returns its stats coordinates itself (RETURNING), so ack costs one
+// round trip; only a DELETE matching exactly one in_flight row records the
+// event.
 func (s *Store) Ack(ctx context.Context, deliveryID int64, leaseToken string) error {
-	topicID, channelID, scanErr := s.leaseAttribution(ctx, deliveryID, leaseToken)
-	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-		return scanErr
-	}
-	res, err := s.db.ExecContext(ctx, `
+	var topic sql.NullInt64
+	var channelID int64
+	err := s.db.QueryRowContext(ctx, `
 		DELETE FROM novaque_deliveries
-		WHERE id = ? AND lease_token = ? AND status = ?`,
-		deliveryID, leaseToken, store.StatusInFlight)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
+		WHERE id = ? AND lease_token = ? AND status = ?`+statAttribution,
+		deliveryID, leaseToken, store.StatusInFlight).Scan(&topic, &channelID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("sqlite: ack rejected: delivery %d lease mismatch or not in_flight", deliveryID)
 	}
-	if scanErr == nil {
-		s.recordStat(topicID, channelID, statAck, 1)
+	if err != nil {
+		return err
+	}
+	if topic.Valid {
+		s.recordStat(topic.Int64, channelID, statAck, 1)
 	}
 	return nil
 }
 
-// Requeue returns a delivery to pending when the lease token matches. Only an
-// UPDATE affecting exactly 1 row counts.
+// Requeue returns a delivery to pending when the lease token matches. The
+// guarded UPDATE returns its coordinates itself (RETURNING); only an UPDATE
+// matching exactly one in_flight row records the event.
 func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string, availableAt time.Time) error {
-	topicID, channelID, scanErr := s.leaseAttribution(ctx, deliveryID, leaseToken)
-	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-		return scanErr
-	}
-	var res sql.Result
+	var topic sql.NullInt64
+	var channelID int64
 	var err error
 	if availableAt.IsZero() {
-		res, err = s.db.ExecContext(ctx, `
+		err = s.db.QueryRowContext(ctx, `
 			UPDATE novaque_deliveries
 			SET status = ?, available_at = `+sqlNow+`,
 			    lease_owner = NULL, lease_token = NULL, lease_until = NULL
-			WHERE id = ? AND lease_token = ? AND status = ?`,
-			store.StatusPending, deliveryID, leaseToken, store.StatusInFlight)
+			WHERE id = ? AND lease_token = ? AND status = ?`+statAttribution,
+			store.StatusPending, deliveryID, leaseToken, store.StatusInFlight).Scan(&topic, &channelID)
 	} else {
-		res, err = s.db.ExecContext(ctx, `
+		err = s.db.QueryRowContext(ctx, `
 			UPDATE novaque_deliveries
 			SET status = ?, available_at = ?,
 			    lease_owner = NULL, lease_token = NULL, lease_until = NULL
-			WHERE id = ? AND lease_token = ? AND status = ?`,
-			store.StatusPending, timeToSec(availableAt), deliveryID, leaseToken, store.StatusInFlight)
+			WHERE id = ? AND lease_token = ? AND status = ?`+statAttribution,
+			store.StatusPending, timeToSec(availableAt), deliveryID, leaseToken, store.StatusInFlight).Scan(&topic, &channelID)
 	}
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("sqlite: requeue rejected: delivery %d lease mismatch or not in_flight", deliveryID)
 	}
-	if scanErr == nil {
-		s.recordStat(topicID, channelID, statRequeue, 1)
+	if err != nil {
+		return err
+	}
+	if topic.Valid {
+		s.recordStat(topic.Int64, channelID, statRequeue, 1)
 	}
 	return nil
 }

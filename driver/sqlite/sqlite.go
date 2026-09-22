@@ -6,7 +6,6 @@ package sqlite
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
 	"embed"
 	"fmt"
@@ -31,11 +30,6 @@ type Store struct {
 	// so no mutation transaction ever carries a stats write.
 	statMu  sync.Mutex
 	statBuf map[statKey]int64
-
-	// versionOnce caches the runtime SQLite version gate (3.39.0+): the check
-	// is a single SELECT, but Migrate may run more than once; run it once.
-	versionOnce sync.Once
-	versionErr  error
 }
 
 // New wraps a caller-owned *sql.DB.
@@ -59,7 +53,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	// Fail fast if the runtime SQLite is older than the supported floor,
 	// 3.39.0 (KTD2, OQ2).
-	return s.ensureSQLiteVersion(ctx)
+	return s.checkSQLiteVersion(ctx)
 }
 
 func splitSQL(s string) []string {
@@ -143,16 +137,4 @@ func (s *Store) EnsureChannel(ctx context.Context, topic, channel string) (int64
 	err = s.db.QueryRowContext(ctx, `
 		SELECT id FROM novaque_channels WHERE topic_id = ? AND name = ?`, topicID, channel).Scan(&id)
 	return id, err
-}
-
-func newLeaseToken() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	const hexdigits = "0123456789abcdef"
-	out := make([]byte, 32)
-	for i, v := range b {
-		out[i*2] = hexdigits[v>>4]
-		out[i*2+1] = hexdigits[v&0x0f]
-	}
-	return string(out)
 }

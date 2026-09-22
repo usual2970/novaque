@@ -121,37 +121,33 @@ func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts st
 	delaySec := store.DelaySec(opts.Delay)
 	availableAt := nowUnix + delaySec
 
-	// Single-statement fan-out; copy message expires_at onto each delivery (claim hot path).
-	_, err = tx.ExecContext(ctx, `
+	// Single-statement fan-out; copy message expires_at onto each delivery
+	// (claim hot path). RETURNING gives the inserted channels straight from
+	// the INSERT ... SELECT, so stats attribution needs no separate read-back
+	// round trip: one returned row per channel.
+	fanRows, err := tx.QueryContext(ctx, `
 		INSERT INTO novaque_deliveries
 		  (message_id, channel_id, status, available_at, attempts, max_attempts, expires_at)
 		SELECT ?, c.id, ?, ?, 0, ?, m.expires_at
 		FROM novaque_channels c
 		INNER JOIN novaque_messages m ON m.id = ?
-		WHERE c.topic_id = ?`,
+		WHERE c.topic_id = ?
+		RETURNING channel_id`,
 		messageID, store.StatusPending, availableAt, maxAttempts, messageID, topicID)
 	if err != nil {
 		return 0, err
 	}
-
-	// Read-only attribution for stats (no extra writes in this tx): the
-	// delivery rows were just inserted above, so the fan-out is exact here.
-	attrRows, err := tx.QueryContext(ctx, `
-		SELECT channel_id FROM novaque_deliveries WHERE message_id = ?`, messageID)
-	if err != nil {
-		return 0, err
-	}
-	fanout := make(map[int64]int64) // channelID -> deliveries (one per channel)
-	for attrRows.Next() {
+	var fanout []int64
+	for fanRows.Next() {
 		var chID int64
-		if err := attrRows.Scan(&chID); err != nil {
-			attrRows.Close()
+		if err := fanRows.Scan(&chID); err != nil {
+			fanRows.Close()
 			return 0, err
 		}
-		fanout[chID]++
+		fanout = append(fanout, chID)
 	}
-	attrRows.Close()
-	if err := attrRows.Err(); err != nil {
+	fanRows.Close()
+	if err := fanRows.Err(); err != nil {
 		return 0, err
 	}
 
@@ -165,8 +161,8 @@ func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts st
 	if len(fanout) == 0 {
 		s.recordStat(topicID, 0, statPublish, 1)
 	} else {
-		for chID, n := range fanout {
-			s.recordStat(topicID, chID, statPublish, n)
+		for _, chID := range fanout {
+			s.recordStat(topicID, chID, statPublish, 1)
 		}
 	}
 	return messageID, nil
