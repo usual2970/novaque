@@ -79,7 +79,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// checkVersion enforces the PostgreSQL 14 floor (KTD2). num is a
+// checkVersion enforces the PostgreSQL 14 floor. num is a
 // server_version_num value (major*10000 + minor*100 + patch).
 func checkVersion(num int) error {
 	const minVersion = 140000

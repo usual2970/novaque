@@ -15,7 +15,7 @@ import (
 	"github.com/usual2970/novaque/store"
 )
 
-// Admin-surface integration tests (U6): listings, batched backlogs, daily
+// Admin-surface integration tests: listings, batched backlogs, daily
 // counters, dead-letter pagination and guarded dead ops, cascade deletes
 // (KTD7), and the requeue-dead TTL semantics (KTD8). The suite shares one
 // database, so every test scopes raw-SQL assertions to its own unique

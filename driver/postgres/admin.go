@@ -1,6 +1,6 @@
 package postgres
 
-// Admin surface of store.Store (mountable admin UI plan U6): listings,
+// Admin surface of store.Store: listings,
 // batched backlogs, day-bucket counter windows, keyset-paginated dead-letter
 // browse with bodies (R12: the only admin surface carrying payloads), guarded
 // dead ops (KTD8), and single-transaction cascade deletes (KTD7). Reads are
@@ -291,7 +291,7 @@ func (s *Store) RequeueDead(ctx context.Context, deliveryID, channelID int64, fr
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return scanErr
 	}
-	ttlSec := durationSec(freshTTL)
+	ttlSec := store.DurationSec(freshTTL)
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {

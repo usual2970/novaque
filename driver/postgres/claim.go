@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/usual2970/novaque/store"
@@ -16,13 +18,7 @@ import (
 func newLeaseToken() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
-	const hexdigits = "0123456789abcdef"
-	out := make([]byte, 32)
-	for i, v := range b {
-		out[i*2] = hexdigits[v>>4]
-		out[i*2+1] = hexdigits[v&0x0f]
-	}
-	return string(out)
+	return hex.EncodeToString(b)
 }
 
 // Claim leases eligible deliveries by channel id (no name lookup on the hot path).
@@ -37,7 +33,7 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 	if leaseFor <= 0 {
 		leaseFor = 30 * time.Second
 	}
-	leaseSec := durationSec(leaseFor)
+	leaseSec := store.DurationSec(leaseFor)
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -80,28 +76,65 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 		return nil, nil
 	}
 
+	// One statement leases every polled row. The poll's FOR UPDATE already
+	// holds each row's lock in this transaction, so UPDATE ... FROM over a
+	// per-id VALUES table — each entry carrying its pre-generated lease
+	// token — is exactly equivalent to one guarded UPDATE per id, in a
+	// single round trip. RETURNING identifies the rows that moved (the
+	// pending-status predicate stays in WHERE); claim order is reconstructed
+	// from ids below.
+	tokensByID := make(map[int64]string, len(ids))
+	var b strings.Builder
+	b.WriteString(`
+		UPDATE novaque_deliveries d
+		SET status = $1,
+		    attempts = d.attempts + 1,
+		    lease_owner = $2,
+		    lease_token = v.token,
+		    lease_until = ` + sqlNow + ` + $3::bigint
+		FROM (VALUES `)
+	args := []any{store.StatusInFlight, owner, leaseSec}
+	for i, id := range ids {
+		token := newLeaseToken()
+		tokensByID[id] = token
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		base := len(args) + 1
+		fmt.Fprintf(&b, "($%d::bigint, $%d::varchar)", base, base+1)
+		args = append(args, id, token)
+	}
+	statusParam := len(args) + 1
+	fmt.Fprintf(&b, `) AS v(claim_id, token)
+		WHERE d.id = v.claim_id AND d.status = $%d
+		RETURNING d.id`, statusParam)
+	args = append(args, store.StatusPending)
+
+	leaseRows, err := tx.QueryContext(ctx, b.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	claimed := make(map[int64]bool, len(ids))
+	for leaseRows.Next() {
+		var id int64
+		if err := leaseRows.Scan(&id); err != nil {
+			leaseRows.Close()
+			return nil, err
+		}
+		claimed[id] = true
+	}
+	leaseRows.Close()
+	if err := leaseRows.Err(); err != nil {
+		return nil, err
+	}
+
 	claimedIDs := make([]int64, 0, len(ids))
 	tokens := make(map[int64]string, len(ids))
 	for _, id := range ids {
-		token := newLeaseToken()
-		res, err := tx.ExecContext(ctx, `
-			UPDATE novaque_deliveries
-			SET status = $1,
-			    attempts = attempts + 1,
-			    lease_owner = $2,
-			    lease_token = $3,
-			    lease_until = `+sqlNow+` + $4::bigint
-			WHERE id = $5 AND status = $6`,
-			store.StatusInFlight, owner, token, leaseSec, id, store.StatusPending)
-		if err != nil {
-			return nil, err
+		if claimed[id] {
+			claimedIDs = append(claimedIDs, id)
+			tokens[id] = tokensByID[id]
 		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			continue
-		}
-		claimedIDs = append(claimedIDs, id)
-		tokens[id] = token
 	}
 	if len(claimedIDs) == 0 {
 		if err := tx.Commit(); err != nil {

@@ -20,7 +20,7 @@ func TestNewSmoke(t *testing.T) {
 	_ = context.Background()
 }
 
-// TestCheckVersion covers the PostgreSQL 14 floor (KTD2) at and around the
+// TestCheckVersion covers the PostgreSQL 14 floor at and around the
 // boundary; numbers are server_version_num values (major*10000 + minor).
 func TestCheckVersion(t *testing.T) {
 	cases := []struct {

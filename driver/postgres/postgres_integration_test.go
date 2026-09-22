@@ -189,8 +189,7 @@ func TestEnsureTopicChannelIdempotent(t *testing.T) {
 
 // TestPublishFanout (AE1): one publish on a topic with two channels creates
 // exactly one pending delivery per channel, bodies identical to the message.
-// Claim/Ack arrive in a later unit, so the fan-out is asserted directly
-// against the deliveries table.
+// The fan-out is asserted directly against the deliveries table.
 func TestPublishFanout(t *testing.T) {
 	db := testpostgres.Open(t)
 	s := postgres.New(db)
@@ -325,8 +324,8 @@ func TestPublishZeroChannels(t *testing.T) {
 }
 
 // TestPublishLateChannelNoHistory (AE4): a channel created after a publish
-// must not see the old message; subsequent publishes fan out to it. Claim
-// arrives in a later unit, so delivery membership is asserted with raw SQL.
+// must not see the old message; subsequent publishes fan out to it.
+// Delivery membership is asserted with raw SQL.
 func TestPublishLateChannelNoHistory(t *testing.T) {
 	db := testpostgres.Open(t)
 	s := postgres.New(db)
@@ -732,12 +731,13 @@ func TestRequeueFlows(t *testing.T) {
 	}
 }
 
-// TestClaimLeaseExpiryNoReaper (AE3, U3 slice): Claim with a tiny lease, wait
-// for lease_until to pass. Without the U4 reaper the row stays in_flight, so a
-// fresh Claim must NOT redeliver it (the poll filters on status=pending).
-// Because Ack fences only on token + in_flight status (never lease_until —
-// matching driver/mysql), the OLD token still acks. The full AE3 redelivery
-// flow (ReapExpiredLeases -> reclaim -> stale token rejected) is ported in U4.
+// TestClaimLeaseExpiryNoReaper (AE3): Claim with a tiny lease, wait for
+// lease_until to pass. While nothing reaps the expired lease the row stays
+// in_flight, so a fresh Claim must NOT redeliver it (the poll filters on
+// status=pending). Because Ack fences only on token + in_flight status
+// (never lease_until — matching driver/mysql), the OLD token still acks.
+// The full AE3 redelivery flow (ReapExpiredLeases -> reclaim -> stale
+// token rejected) is covered by the reaper tests.
 func TestClaimLeaseExpiryNoReaper(t *testing.T) {
 	db := testpostgres.Open(t)
 	s := postgres.New(db)
@@ -768,14 +768,14 @@ func TestClaimLeaseExpiryNoReaper(t *testing.T) {
 
 	time.Sleep(2500 * time.Millisecond)
 
-	// Reaper absent (U4): row still in_flight and Claim will not touch it.
+	// Reaper absent: row still in_flight and Claim will not touch it.
 	var status string
 	if err := db.QueryRowContext(ctx, `
 		SELECT status FROM novaque_deliveries WHERE id = $1`, d.ID).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
 	if status != store.StatusInFlight {
-		t.Fatalf("status = %s, want in_flight (reaper is U4)", status)
+		t.Fatalf("status = %s, want in_flight without reaping", status)
 	}
 	again, err := s.Claim(ctx, chID, "w2", 30*time.Second, 10)
 	if err != nil {
@@ -789,7 +789,7 @@ func TestClaimLeaseExpiryNoReaper(t *testing.T) {
 
 	// Ack ignores lease_until: the old token still fences while status is
 	// in_flight (identical to driver/mysql Ack). The stale-ack-rejected
-	// assertion in the MySQL AE3 test happens post-reaper and lands in U4.
+	// assertion happens after reaping, in the reaper tests.
 	if err := s.Ack(ctx, d.ID, d.LeaseToken); err != nil {
 		t.Fatalf("old-token ack after lease expiry: %v", err)
 	}
