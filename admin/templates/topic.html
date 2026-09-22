@@ -1,6 +1,6 @@
 {{define "content"}}
 <h1>Topic <span class="entity">{{.Name}}</span></h1>
-<p class="muted">Topic #{{.ID}} · totals: {{.Totals.Pending}} pending · {{.Totals.Ready}} ready · {{.Totals.InFlight}} in flight · {{.Totals.Dead}} dead</p>
+<p class="muted">Topic #{{.ID}} · totals: <span data-t="{{.ID}}-pending">{{.Totals.Pending}}</span> pending · <span data-t="{{.ID}}-ready">{{.Totals.Ready}}</span> ready · <span data-t="{{.ID}}-in_flight">{{.Totals.InFlight}}</span> in flight · <span data-t="{{.ID}}-dead">{{.Totals.Dead}}</span> dead</p>
 
 <section class="card">
 	<h2>Channels</h2>
@@ -42,29 +42,7 @@
 	<p class="note">A channel created after a publish receives only future publishes — messages already published are not retroactively delivered.</p>
 </section>
 
-<section class="card">
-	<h2>Publishes per day <span class="muted">({{len .Days}} days, UTC)</span></h2>
-	<div class="trend" role="img" aria-label="Publishes per day over the trailing window">
-		{{range .Days}}<div class="trend-col" title="{{.Day.Format "2006-01-02"}} · {{.Publish}} publishes"><div class="trend-bar" style="height: {{.Pct}}%"></div></div>{{end}}
-	</div>
-	<table class="counters">
-		<thead>
-			<tr>
-				<th scope="col">Day (UTC)</th>
-				<th scope="col" class="num">Publish</th>
-				<th scope="col" class="num">Claim</th>
-				<th scope="col" class="num">Ack</th>
-				<th scope="col" class="num">Requeue</th>
-				<th scope="col" class="num">Dead</th>
-				<th scope="col" class="num">Purge</th>
-			</tr>
-		</thead>
-		<tbody>
-			{{range .Days}}<tr class="day-row"><td>{{.Day.Format "2006-01-02"}}</td><td class="num">{{.Publish}}</td><td class="num">{{.Claim}}</td><td class="num">{{.Ack}}</td><td class="num">{{.Requeue}}</td><td class="num">{{.Dead}}</td><td class="num">{{.Purge}}</td></tr>{{end}}
-		</tbody>
-	</table>
-	<p class="hint">Counters are day buckets flushed from an in-process buffer; with multiple publisher processes they may lag by seconds.</p>
-</section>
+{{template "days" .Days}}
 
 <p><a class="danger-link" href="{{url "/topics/" .ID "/delete"}}">Delete this topic…</a></p>
 {{end}}

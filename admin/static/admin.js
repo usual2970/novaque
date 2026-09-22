@@ -12,7 +12,13 @@
 	}
 
 	var endpoint = main.getAttribute("data-poll");
+	// Single-chain invariant: at most one fetch is in flight and at most one
+	// timer is armed, and only the completion of a fetch arms the next tick.
+	// `generation` tokens the chain so a stale response (any future source of
+	// overlap) can never overwrite newer counts.
 	var timer = null;
+	var inFlight = false;
+	var generation = 0;
 	var FIELDS = ["pending", "ready", "in_flight", "dead"];
 
 	function setText(el, value) {
@@ -58,34 +64,54 @@
 	}
 
 	function poll() {
+		// Re-entrant calls are no-ops while a chain runs: the running chain's
+		// completion owns scheduling the next poll, so a second concurrent
+		// loop can never fork (rapid tab show/hide inside a fetch window).
+		if (inFlight) {
+			return;
+		}
+		inFlight = true;
+		var gen = ++generation;
 		fetch(BASE + endpoint, { headers: { Accept: "application/json" } })
 			.then(function (res) {
 				return res.ok ? res.json() : null;
 			})
 			.then(function (data) {
-				apply(data);
+				if (gen === generation) {
+					apply(data);
+				}
 			})
 			.catch(function () {
 				// Swallowed: the next tick retries; a failed poll must not
 				// take the page down.
 			})
-			.then(schedule);
+			.then(function () {
+				inFlight = false;
+				schedule();
+			});
 	}
 
 	function schedule() {
-		timer = setTimeout(poll, 5000);
+		// Armed only while visible: hidden tabs stop polling entirely. The
+		// visibilitychange handler resumes with an immediate refresh on show.
+		if (document.hidden) {
+			timer = null;
+			return;
+		}
+		timer = setTimeout(function () {
+			timer = null;
+			poll();
+		}, 5000);
 	}
 
-	// Gated on document.hidden: hidden tabs stop polling and resume with an
-	// immediate refresh on visibilitychange.
 	document.addEventListener("visibilitychange", function () {
 		if (document.hidden) {
 			if (timer) {
 				clearTimeout(timer);
 				timer = null;
 			}
-		} else if (!timer) {
-			poll();
+		} else {
+			poll(); // immediate refresh; a no-op while a chain is in flight
 		}
 	});
 
