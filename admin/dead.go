@@ -266,13 +266,14 @@ func (h *handler) pageDead(w http.ResponseWriter, r *http.Request) {
 		h.renderError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// No Poll: the list previously armed a poller whose feed's shape
+	// (deadListJSON) matched no branch in admin.js, so every response was
+	// discarded (review #9). The dead surface is a static browse — actions
+	// already redirect with their own notices — and the JSON list remains
+	// available for direct callers.
 	v.baseView = baseView{
 		Prefix: h.prefix,
 		Title:  "Dead letters — " + v.TopicName + "/" + v.ChannelName,
-		Poll:   fmt.Sprintf("/api/channels/%d/dead", channelID),
-	}
-	if before > 0 {
-		v.Poll = fmt.Sprintf("%s?before=%d", v.Poll, before)
 	}
 	v.Notice = deadNotice(r.URL.Query().Get("done"))
 	h.render(w, r, "dead.html", http.StatusOK, v)
@@ -437,9 +438,9 @@ type deadDeliveryJSON struct {
 	Expired      bool   `json:"expired"`
 }
 
-// apiDeadList answers GET /api/channels/{id}/dead — the dead page's poller
-// feed, honoring the ?before= cursor. Metadata only: bodies are omitted
-// (R12).
+// apiDeadList answers GET /api/channels/{id}/dead — the JSON dead list for
+// direct callers (the HTML page itself no longer polls it, review #9),
+// honoring the ?before= cursor. Metadata only: bodies are omitted (R12).
 func (h *handler) apiDeadList(w http.ResponseWriter, r *http.Request) {
 	channelID, ok := h.pathID(r, "id")
 	if !ok {

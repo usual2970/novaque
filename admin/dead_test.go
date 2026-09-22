@@ -91,8 +91,10 @@ func TestDeadListPageRendersRows(t *testing.T) {
 	if !strings.Contains(body, `href="/admin/channels/2/dead/`+strconv.FormatInt(newest, 10)+`"`) {
 		t.Fatalf("dead list: link to delivery %d missing", newest)
 	}
-	if !strings.Contains(body, `data-poll="/api/channels/2/dead"`) {
-		t.Fatal("dead list: data-poll missing")
+	// Review #9: the dead browse no longer arms a poller (the feed matched
+	// no apply() branch in admin.js and its responses were discarded).
+	if strings.Contains(body, "data-poll") {
+		t.Fatal("dead list: unexpected data-poll — dead surface is static")
 	}
 }
 
@@ -228,8 +230,8 @@ func TestDeadPaginationKeysetWalk(t *testing.T) {
 	if _, before, limit, prefix := f.lastDeadListCall(); before != maxID-49 || limit != 51 || prefix != 4096 {
 		t.Fatalf("page 2 store call: before=%d limit=%d prefix=%d, want before=%d limit=51 prefix=4096", before, limit, prefix, maxID-49)
 	}
-	if !strings.Contains(body, `data-poll="/api/channels/2/dead?before=`+strconv.FormatInt(maxID-49, 10)+`"`) {
-		t.Fatal("page 2: data-poll lacks the before cursor")
+	if strings.Contains(body, "data-poll") {
+		t.Fatal("page 2: unexpected data-poll — dead surface is static (review #9)")
 	}
 	if !strings.Contains(body, "Back to first page") {
 		t.Fatal("page 2: back-to-first-page link missing")
