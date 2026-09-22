@@ -19,6 +19,16 @@ go get github.com/usual2970/novaque
 
 Requires **Go 1.26.5+** and, for the shipped driver, **MySQL ≥ 8.0.1** (InnoDB).
 
+## Upgrading to v0.0.7
+
+v0.0.7 ships the mountable admin UI and grows the exported surface. Existing `*Client` callers keep compiling; out-of-tree implementors of the `store.Store` seam must add the new methods.
+
+- **`store.Store`**: `BacklogsForTopic(ctx, topicID int64) ([]BacklogRow, error)` — the batched pending/ready/in-flight/dead read per channel, replacing N separate `ChannelBacklog` calls — and `ListDead(ctx, channelID, before int64, limit, bodyPrefix int) ([]DeadDelivery, error)`.
+- **`store.DeadDelivery`**: new `BodyLen int64` is the `OCTET_LENGTH` of the full stored body. `Body` is the complete body when `bodyPrefix == 0` and at most `bodyPrefix` bytes otherwise, so a prefixed row can still report its true size.
+- **Dead-letter writes are channel-scoped**: `Client.RequeueDead(ctx, deliveryID, channelID)` and `Client.DeleteDead(ctx, deliveryID, channelID)` — pass the owning channel id alongside the delivery id; an id under a different channel is a no-op.
+
+Run `Client.Migrate` on deploy as usual; the admin UI adds no separate migration.
+
 ## Quick start
 
 ```go
@@ -253,6 +263,7 @@ novaque/
     cached.go         # WithCache — memoize EnsureTopic / EnsureChannel
   driver/mysql/       # MySQL Store + schema.sql
   admin/              # mountable admin UI + JSON API (stdlib http.Handler)
+  cmd/example/        # local HTTP demo: admin UI + publish/subscribe hooks
   cmd/loadtest/       # local publish/consume stress tool
   internal/testmysql/ # testcontainers helper (integration tests)
 ```
@@ -270,6 +281,19 @@ go test ./...
 # needs Docker
 go test -tags=integration ./...
 ```
+
+### Example server (admin + publish/subscribe)
+
+```bash
+# boots MySQL 8 via testcontainers, serves admin at /admin/
+go run ./cmd/example
+
+# publish and inspect the demo consumer
+curl -sS -X POST http://127.0.0.1:8080/demo/publish -d 'hello'
+curl -sS http://127.0.0.1:8080/demo/stats
+```
+
+Flags: `-addr`, `-dsn`, `-topic`, `-channel`, `-admin-user`, `-admin-pass`, `-pool`. Open `http://127.0.0.1:8080/admin/` for the dashboard.
 
 ### Load test
 
