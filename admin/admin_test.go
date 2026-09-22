@@ -30,9 +30,11 @@ import (
 
 // fakeStore implements only the store methods the admin surface exercises.
 // The embedded nil store.Store panics on any unimplemented call, so a read
-// path reaching for Ensure* (create-on-read) or a per-channel backlog read
-// (the N+1 the batched Backlogs query exists to avoid) fails the test
-// loudly instead of passing vacuously.
+// path reaching for Ensure* (create-on-read) fails the test loudly instead
+// of passing vacuously. Backlog reads are counted (backlogsN /
+// backlogsForTopicN / channelBacklogN) so tests can pin which shape a page
+// used: dashboards and topic pages must take the batched reads (R2), never
+// a per-channel N+1; the channel page takes exactly one point read.
 type fakeStore struct {
 	store.Store
 
@@ -54,6 +56,9 @@ type fakeStore struct {
 	listTopicsN   int
 	listChannelsN int
 	backlogsN     int
+
+	backlogsForTopicN int
+	channelBacklogN   int
 
 	requeuedDead []int64
 	deletedDead  []int64
@@ -296,6 +301,50 @@ func (f *fakeStore) Backlogs(_ context.Context) ([]store.BacklogRow, error) {
 		return nil, errors.New("boom-backlogs")
 	}
 	return f.backlogs, nil
+}
+
+// BacklogsForTopic mirrors the scoped contract: only the seeded rows of
+// channels under topicID; failBacklogs fails it like Backlogs.
+func (f *fakeStore) BacklogsForTopic(_ context.Context, topicID int64) ([]store.BacklogRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.backlogsForTopicN++
+	if f.failBacklogs {
+		return nil, errors.New("boom-backlogs")
+	}
+	under := map[int64]bool{}
+	for tName, tID := range f.topics {
+		if tID == topicID {
+			for _, cID := range f.channels[tName] {
+				under[cID] = true
+			}
+		}
+	}
+	var out []store.BacklogRow
+	for _, r := range f.backlogs {
+		if under[r.ChannelID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// ChannelBacklog point-reads one channel's counts out of the seeded batch; a
+// channel with no row zero-fills. failBacklogs fails it like Backlogs.
+func (f *fakeStore) ChannelBacklog(_ context.Context, channelID int64) (store.ChannelBacklog, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.channelBacklogN++
+	if f.failBacklogs {
+		return store.ChannelBacklog{}, errors.New("boom-backlogs")
+	}
+	var b store.ChannelBacklog
+	for _, r := range f.backlogs {
+		if r.ChannelID == channelID {
+			b = store.ChannelBacklog{Pending: r.Pending, Ready: r.Ready, InFlight: r.InFlight, Dead: r.Dead}
+		}
+	}
+	return b, nil
 }
 
 func (f *fakeStore) TopicDailyCounters(_ context.Context, topicID int64, days int) ([]store.DailyCounters, error) {
@@ -584,6 +633,70 @@ func TestDashboardQueryCountBounded(t *testing.T) {
 	lt, lc, lb = f.counts()
 	if lt != 2 || lc != 2 || lb != 2 {
 		t.Fatalf("after growth: ListTopics=%d ListChannels=%d Backlogs=%d, want 2/2/2 (constant per render)", lt, lc, lb)
+	}
+}
+
+// TestDetailPagesScopeBacklogReads pins the detail-page query shape (review
+// fix for the R2 aggregate): topic and channel pages must not pay the
+// all-channels Backlogs GROUP BY — the topic page takes the topic-scoped
+// batch, the channel page exactly one point read — and the dashboard keeps
+// the unfiltered batch (loadGroups above), never the scoped variants.
+func TestDetailPagesScopeBacklogReads(t *testing.T) {
+	ts, f := newTestServer(t, "/admin")
+
+	res, body := doGet(t, ts.Client(), ts.URL+"/admin/topics/1")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("topic page status = %d, want 200", res.StatusCode)
+	}
+	if !strings.Contains(body, `data-b="2-pending">3<`) {
+		t.Fatal("topic page: scoped read lost the channel's backlog row")
+	}
+	if f.backlogsN != 0 {
+		t.Fatalf("topic page ran the all-channels Backlogs %d times, want 0", f.backlogsN)
+	}
+	if f.backlogsForTopicN != 1 {
+		t.Fatalf("topic page BacklogsForTopic calls = %d, want 1", f.backlogsForTopicN)
+	}
+	if f.channelBacklogN != 0 {
+		t.Fatalf("topic page point reads = %d, want 0 (a list page must batch)", f.channelBacklogN)
+	}
+
+	res, body = doGet(t, ts.Client(), ts.URL+"/admin/channels/2")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("channel page status = %d, want 200", res.StatusCode)
+	}
+	if !strings.Contains(body, `data-b="2-pending">3<`) {
+		t.Fatal("channel page: point read lost the backlog box")
+	}
+	if f.backlogsN != 0 {
+		t.Fatalf("channel page ran the all-channels Backlogs %d times, want 0", f.backlogsN)
+	}
+	if f.channelBacklogN != 1 {
+		t.Fatalf("channel page point reads = %d, want exactly 1", f.channelBacklogN)
+	}
+
+	// The JSON detail endpoints ride the same loaders, so they inherit the
+	// scoped shape.
+	for _, path := range []string{"/admin/api/topics/1", "/admin/api/channels/2"} {
+		res, _ = doGet(t, ts.Client(), ts.URL+path)
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status = %d, want 200", path, res.StatusCode)
+		}
+	}
+	if f.backlogsN != 0 {
+		t.Fatalf("JSON detail endpoints ran the all-channels Backlogs %d times, want 0", f.backlogsN)
+	}
+
+	// The dashboard stays on the unfiltered batch — never the scoped reads.
+	res, _ = doGet(t, ts.Client(), ts.URL+"/admin/")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("dashboard status = %d, want 200", res.StatusCode)
+	}
+	if f.backlogsN != 1 {
+		t.Fatalf("dashboard Backlogs calls = %d, want 1", f.backlogsN)
+	}
+	if f.backlogsForTopicN != 2 || f.channelBacklogN != 2 {
+		t.Fatalf("dashboard used scoped reads: BacklogsForTopic=%d channelBacklog=%d, want 2/2 (unchanged by the dashboard)", f.backlogsForTopicN, f.channelBacklogN)
 	}
 }
 

@@ -295,6 +295,13 @@ type Store interface {
 	// callers zero-fill the rest against ListChannels.
 	Backlogs(ctx context.Context) ([]BacklogRow, error)
 
+	// BacklogsForTopic scopes that batched backlog aggregate to one topic's
+	// channels — the detail-page counterpart of Backlogs, so a single
+	// topic/channel page never pays the all-channels GROUP BY. Same row
+	// semantics: rows only for channels with at least one delivery, callers
+	// zero-fill the rest against ListChannels.
+	BacklogsForTopic(ctx context.Context, topicID int64) ([]BacklogRow, error)
+
 	// TopicDailyCounters returns the retained day-bucket counter rows for a
 	// topic — its per-channel rows plus the zero-channel sentinel row rolled
 	// up per day — over the trailing days-day UTC window ending today (day

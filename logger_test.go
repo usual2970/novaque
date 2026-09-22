@@ -54,6 +54,9 @@ func (nopStore) ListChannels(context.Context) ([]store.ChannelInfo, error) {
 	return nil, nil
 }
 func (nopStore) Backlogs(context.Context) ([]store.BacklogRow, error) { return nil, nil }
+func (nopStore) BacklogsForTopic(context.Context, int64) ([]store.BacklogRow, error) {
+	return nil, nil
+}
 func (nopStore) TopicDailyCounters(context.Context, int64, int) ([]store.DailyCounters, error) {
 	return nil, nil
 }

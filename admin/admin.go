@@ -428,7 +428,7 @@ func (h *handler) loadTopicBase(ctx context.Context, id int64) (topicView, error
 	if err != nil {
 		return v, fmt.Errorf("list channels: %w", err)
 	}
-	backlogs, err := h.client.Backlogs(ctx)
+	backlogs, err := h.client.BacklogsForTopic(ctx, id)
 	if err != nil {
 		return v, fmt.Errorf("backlogs: %w", err)
 	}
@@ -464,11 +464,12 @@ func (h *handler) loadChannelBase(ctx context.Context, id int64) (channelDetailV
 		TopicID:   m.TopicID,
 		TopicName: m.TopicName,
 	}
-	backlogs, err := h.client.Backlogs(ctx)
+	// Point read (R2): one channel's box must not pay a batched aggregate.
+	b, err := h.client.ChannelBacklogByID(ctx, id)
 	if err != nil {
-		return v, fmt.Errorf("backlogs: %w", err)
+		return v, fmt.Errorf("backlog: %w", err)
 	}
-	v.Backlog = backlogsByChannel(backlogs)[id] // zero value zero-fills
+	v.Backlog = novaque.BacklogRow{ChannelID: id, Pending: b.Pending, Ready: b.Ready, InFlight: b.InFlight, Dead: b.Dead}
 	return v, nil
 }
 

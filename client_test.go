@@ -74,6 +74,7 @@ type fakeStore struct {
 
 	lastDailyTopicID    int64
 	lastDailyTopicDays  int
+	lastBacklogsTopicID int64
 	lastDailyChannelID  int64
 	lastDailyChanDays   int
 	lastDeadChannelID   int64
@@ -335,6 +336,16 @@ func (f *fakeStore) ListChannels(_ context.Context) ([]store.ChannelInfo, error)
 func (f *fakeStore) Backlogs(_ context.Context) ([]store.BacklogRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.backlogs, nil
+}
+
+// BacklogsForTopic records the scoped topic id and returns the preset rows
+// verbatim (the fake is not row-accurate to one topic — the forwarding test
+// only pins that the id reached the store untouched).
+func (f *fakeStore) BacklogsForTopic(_ context.Context, topicID int64) ([]store.BacklogRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastBacklogsTopicID = topicID
 	return f.backlogs, nil
 }
 
@@ -1418,6 +1429,22 @@ func TestAdminListMethodsReturnStoreResultsUntransformed(t *testing.T) {
 		t.Fatalf("Backlogs %v, want preset %v", backlogs, presetBacklogs)
 	}
 
+	scoped, err := c.BacklogsForTopic(ctx, 13)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(scoped, presetBacklogs) {
+		t.Fatalf("BacklogsForTopic %v, want preset %v", scoped, presetBacklogs)
+	}
+
+	point, err := c.ChannelBacklogByID(ctx, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if point.Pending != 3014 {
+		t.Fatalf("ChannelBacklogByID %v, want the store's point row (Pending 3014)", point)
+	}
+
 	daily, err := c.TopicDailyCounters(ctx, 11, 7)
 	if err != nil {
 		t.Fatal(err)
@@ -1446,6 +1473,12 @@ func TestAdminListMethodsReturnStoreResultsUntransformed(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.lastDailyTopicID != 11 || f.lastDailyTopicDays != 7 {
 		t.Fatalf("TopicDailyCounters saw (%d, %d), want (11, 7)", f.lastDailyTopicID, f.lastDailyTopicDays)
+	}
+	if f.lastBacklogsTopicID != 13 {
+		t.Fatalf("BacklogsForTopic saw %d, want 13", f.lastBacklogsTopicID)
+	}
+	if f.lastBacklogID != 14 {
+		t.Fatalf("ChannelBacklogByID saw %d, want 14", f.lastBacklogID)
 	}
 	if f.lastDailyChannelID != 12 || f.lastDailyChanDays != 3 {
 		t.Fatalf("ChannelDailyCounters saw (%d, %d), want (12, 3)", f.lastDailyChannelID, f.lastDailyChanDays)

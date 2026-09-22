@@ -29,6 +29,7 @@ type countingStore struct {
 	listTopicsCalls     atomic.Int64
 	listChannelsCalls   atomic.Int64
 	backlogsCalls       atomic.Int64
+	backlogsTopicCalls  atomic.Int64
 	topicDailyCalls     atomic.Int64
 	channelDailyCalls   atomic.Int64
 	listDeadCalls       atomic.Int64
@@ -135,6 +136,11 @@ func (c *countingStore) ListChannels(context.Context) ([]store.ChannelInfo, erro
 func (c *countingStore) Backlogs(context.Context) ([]store.BacklogRow, error) {
 	c.backlogsCalls.Add(1)
 	return []store.BacklogRow{{ChannelID: 7, Pending: 11, Ready: 5, InFlight: 3, Dead: 2}}, nil
+}
+
+func (c *countingStore) BacklogsForTopic(_ context.Context, topicID int64) ([]store.BacklogRow, error) {
+	c.backlogsTopicCalls.Add(1)
+	return []store.BacklogRow{{ChannelID: topicID, Pending: 11, Ready: 5, InFlight: 3, Dead: 2}}, nil
 }
 
 func (c *countingStore) TopicDailyCounters(_ context.Context, topicID int64, days int) ([]store.DailyCounters, error) {
@@ -351,6 +357,9 @@ func TestCachingStoreForwardsAdminSurface(t *testing.T) {
 		if _, err := s.Backlogs(ctx); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := s.BacklogsForTopic(ctx, 5); err != nil {
+			t.Fatal(err)
+		}
 		rows, err := s.TopicDailyCounters(ctx, 5, 30)
 		if err != nil {
 			t.Fatal(err)
@@ -380,6 +389,7 @@ func TestCachingStoreForwardsAdminSurface(t *testing.T) {
 		"ListTopics":           inner.listTopicsCalls.Load(),
 		"ListChannels":         inner.listChannelsCalls.Load(),
 		"Backlogs":             inner.backlogsCalls.Load(),
+		"BacklogsForTopic":     inner.backlogsTopicCalls.Load(),
 		"TopicDailyCounters":   inner.topicDailyCalls.Load(),
 		"ChannelDailyCounters": inner.channelDailyCalls.Load(),
 		"ListDead":             inner.listDeadCalls.Load(),
@@ -520,6 +530,72 @@ func TestCachingStoreDeleteChannelSweepsMemoizedIDs(t *testing.T) {
 // InvalidateChannelID drop exactly the memoized entry resolving to the id
 // (the eviction half of the Client.Publish self-heal) and are a safe no-op
 // for unknown ids.
+// TestCachingStoreInvalidateTopicByName covers the full self-heal eviction
+// (review finding: foreign delete leaves ghost channel cache): after another
+// process cascade-deletes a topic, InvalidateTopic must drop the name entry
+// AND every channel entry under the name — not only the topic id — so a
+// subsequent EnsureChannel/Subscribe cannot be served a deleted channel id
+// from cache. Sibling topics sharing a name prefix are untouched.
+func TestCachingStoreInvalidateTopicByName(t *testing.T) {
+	inner := newCounting()
+	s := store.WithCache(inner)
+	ctx := context.Background()
+
+	if _, err := s.EnsureTopic(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "audit"); err != nil {
+		t.Fatal(err)
+	}
+	// A name-prefix sibling proves the sweep cannot straddle topics.
+	if _, err := s.EnsureChannel(ctx, "orders-archive", "email"); err != nil {
+		t.Fatal(err)
+	}
+
+	topicBase := inner.topicCalls.Load()
+	channelBase := inner.channelCalls.Load()
+
+	cs, ok := s.(*store.CachingStore)
+	if !ok {
+		t.Fatalf("expected *store.CachingStore, got %T", s)
+	}
+	cs.InvalidateTopic("orders")
+
+	// Both channels under "orders" miss the cache and hit Inner again...
+	if _, err := s.EnsureChannel(ctx, "orders", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "audit"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.channelCalls.Load(); n != channelBase+2 {
+		t.Fatalf("EnsureChannel after InvalidateTopic = %d inner calls (base %d), want +2 — channel memo survived the sweep", n, channelBase)
+	}
+	// ...the topic name entry was dropped too (EnsureChannel re-warms it)...
+	if n := inner.topicCalls.Load(); n != topicBase+1 {
+		t.Fatalf("EnsureTopic re-warm after InvalidateTopic = %d inner calls (base %d), want +1", n, topicBase)
+	}
+	// ...while the "orders-archive" sibling stays memoized.
+	if _, err := s.EnsureChannel(ctx, "orders-archive", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.channelCalls.Load(); n != channelBase+2 {
+		t.Fatalf("name-prefix sibling must stay memoized, inner calls = %d, want %d", n, channelBase+2)
+	}
+
+	// Unknown names are a silent no-op.
+	cs.InvalidateTopic("never-seen")
+	if _, err := s.EnsureChannel(ctx, "orders", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.channelCalls.Load(); n != channelBase+2 {
+		t.Fatalf("unknown-name invalidate must not evict, inner calls = %d, want %d", n, channelBase+2)
+	}
+}
+
 func TestCachingStoreInvalidateIDs(t *testing.T) {
 	inner := newCounting()
 	s := store.WithCache(inner)

@@ -168,6 +168,12 @@ func (c *CachingStore) Backlogs(ctx context.Context) ([]BacklogRow, error) {
 	return c.Inner.Backlogs(ctx)
 }
 
+// BacklogsForTopic passes through to Inner.BacklogsForTopic; backlog is a
+// live count, never cached.
+func (c *CachingStore) BacklogsForTopic(ctx context.Context, topicID int64) ([]BacklogRow, error) {
+	return c.Inner.BacklogsForTopic(ctx, topicID)
+}
+
 // TopicDailyCounters passes through to Inner.TopicDailyCounters; never cached
 // (see ChannelCounters).
 func (c *CachingStore) TopicDailyCounters(ctx context.Context, topicID int64, days int) ([]DailyCounters, error) {
@@ -232,14 +238,29 @@ func (c *CachingStore) DeleteChannel(ctx context.Context, channelID int64) error
 }
 
 // InvalidateTopicID drops the memoized topic name→id entry resolving to
-// topicID, if present. It is the eviction half of the Client.Publish
-// self-heal after ErrTopicGone — only Client knows the topic name to
-// re-Ensure, so the retry lives there. A no-op for unknown ids; channel
-// entries are not its concern (DeleteTopic sweeps those on real deletes).
+// topicID, if present. A no-op for unknown ids; channel entries are not its
+// concern (InvalidateTopic sweeps those by name, DeleteTopic on real deletes).
 func (c *CachingStore) InvalidateTopicID(topicID int64) {
 	c.topics.Range(func(name, id any) bool {
 		if id.(int64) == topicID {
 			c.topics.Delete(name)
+		}
+		return true
+	})
+}
+
+// InvalidateTopic drops the memoized name→id entry for topicName plus every
+// channel entry under it (the topicName\x00 prefix — the same sweep DeleteTopic
+// performs). It is the full eviction half of the Client.Publish self-heal
+// after ErrTopicGone: a foreign process's cascade delete removed the topic
+// row, so both the topic id and every channel id memoized under the name are
+// stale and must not be served from cache again. A no-op for unknown names.
+func (c *CachingStore) InvalidateTopic(topicName string) {
+	c.topics.Delete(topicName)
+	prefix := topicName + channelKeySep
+	c.channels.Range(func(key, _ any) bool {
+		if strings.HasPrefix(key.(string), prefix) {
+			c.channels.Delete(key)
 		}
 		return true
 	})

@@ -91,6 +91,40 @@ func (s *Store) Backlogs(ctx context.Context) ([]store.BacklogRow, error) {
 	return out, rows.Err()
 }
 
+// BacklogsForTopic scopes the batched backlog aggregate to one topic's
+// channels (the detail-page counterpart of Backlogs — review finding: topic
+// and channel pages must not pay the all-channels GROUP BY), interpolating
+// the same shared backlogSelectList so per-channel reads, the all-channels
+// batch, and this scoped batch can never disagree. Row semantics as per
+// Backlogs: rows only for channels with at least one delivery, callers
+// zero-fill the rest against ListChannels.
+func (s *Store) BacklogsForTopic(ctx context.Context, topicID int64) ([]store.BacklogRow, error) {
+	if topicID <= 0 {
+		return nil, fmt.Errorf("mysql admin: invalid topic id %d", topicID)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT channel_id,`+backlogSelectList+`
+		FROM novaque_deliveries
+		JOIN novaque_channels ON novaque_channels.id = novaque_deliveries.channel_id
+		WHERE novaque_channels.topic_id = ?
+		GROUP BY channel_id
+		ORDER BY channel_id ASC`,
+		store.StatusPending, store.StatusPending, store.StatusInFlight, store.StatusDead, topicID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []store.BacklogRow
+	for rows.Next() {
+		var r store.BacklogRow
+		if err := rows.Scan(&r.ChannelID, &r.Pending, &r.Ready, &r.InFlight, &r.Dead); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // TopicDailyCounters returns the topic's retained day-bucket counter rows —
 // per-channel rows plus the zero-channel sentinel (channel_id = 0) rolled up
 // per day, so a plain SUM per day is correct — over the trailing days-day UTC

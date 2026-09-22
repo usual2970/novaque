@@ -416,6 +416,30 @@ func (c *Client) Backlogs(ctx context.Context) ([]BacklogRow, error) {
 	return rows, nil
 }
 
+// BacklogsForTopic scopes that batched backlog read to one topic's channels
+// in a single query — the detail-page counterpart of Backlogs, which pays
+// the all-channels aggregate. Row and zero-fill semantics as per Backlogs;
+// never Ensures (KTD6).
+func (c *Client) BacklogsForTopic(ctx context.Context, topicID int64) ([]BacklogRow, error) {
+	rows, err := c.store.BacklogsForTopic(ctx, topicID)
+	if err != nil {
+		return nil, fmt.Errorf("novaque backlogs for topic: %w", err)
+	}
+	return rows, nil
+}
+
+// ChannelBacklogByID returns the live backlog snapshot for one channel id —
+// the ID-addressed, no-Ensure counterpart of the name-addressed
+// ChannelBacklog, for surfaces that already resolved the id (the admin
+// channel page's single box). A channel with no deliveries zero-fills.
+func (c *Client) ChannelBacklogByID(ctx context.Context, channelID int64) (ChannelBacklog, error) {
+	b, err := c.store.ChannelBacklog(ctx, channelID)
+	if err != nil {
+		return ChannelBacklog{}, fmt.Errorf("novaque channel backlog: %w", err)
+	}
+	return b, nil
+}
+
 // CreateTopic creates the named topic under the existing driver name rules
 // and returns its id. Ensure-backed, so creating an existing topic resolves
 // the same id instead of erroring (idempotent, R5).
@@ -567,8 +591,9 @@ type PublishOpts struct {
 // outside MaxDelay or the effective TTL returns ErrDelayNegative,
 // ErrDelayTooLong, or ErrDelayExceedsTTL (compare with errors.Is). When
 // another process deleted the topic after its id was resolved, Publish
-// evicts the memoized id, re-ensures the name (re-creating the topic), and
-// retries once before failing with ErrTopicGone.
+// evicts the memoized topic and channel ids for the name, re-ensures the
+// name (re-creating the topic), and retries once before failing with
+// ErrTopicGone.
 func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts PublishOpts) (int64, error) {
 	topicID, err := c.store.EnsureTopic(ctx, topic)
 	if err != nil {
@@ -592,12 +617,16 @@ func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts Pu
 	if errors.Is(err, store.ErrTopicGone) {
 		// Cross-process delete self-heal (KTD9): another process deleted the
 		// topic behind the id after it was resolved here. Evict the memoized
-		// id, re-Ensure the name (the Ensure insert re-creates the row —
-		// create-on-publish), and retry exactly once. Only Client knows the
-		// topic name, so the retry lives here, not in the store; any error on
-		// the retry — a second ErrTopicGone included — is returned unchanged.
-		if inv, ok := c.store.(interface{ InvalidateTopicID(int64) }); ok {
-			inv.InvalidateTopicID(topicID)
+		// id AND every channel id memoized under the name — the foreign
+		// cascade delete removed those rows too, so serving them from cache
+		// would fan deliveries out to deleted (or later recycled) channel
+		// ids — then re-Ensure the name (the Ensure insert re-creates the
+		// row — create-on-publish) and retry exactly once. Only Client knows
+		// the topic name, so the retry lives here, not in the store; any
+		// error on the retry — a second ErrTopicGone included — is returned
+		// unchanged.
+		if inv, ok := c.store.(interface{ InvalidateTopic(string) }); ok {
+			inv.InvalidateTopic(topic)
 		}
 		topicID, err = c.store.EnsureTopic(ctx, topic)
 		if err != nil {
