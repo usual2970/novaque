@@ -115,10 +115,11 @@ func New(client *novaque.Client, opts Options) (http.Handler, error) {
 	h.mux = http.NewServeMux()
 	h.routes()
 
-	// KTD4 chain: prefix strip → basic auth → CrossOriginProtection → mux.
+	// KTD4 chain: prefix strip → basic auth → CrossOriginProtection → mux,
+	// with the KTD11 header policy at the innermost (post-strip) layer.
 	// All mutations are POST; the cross-origin protection rejects browser
 	// cross-origin posts while same-origin forms and curl pass.
-	var chain http.Handler = h.preservePrefixRedirects(h.mux)
+	var chain http.Handler = h.preservePrefixRedirects(h.securityHeaders(h.mux))
 	var cop http.CrossOriginProtection
 	chain = cop.Handler(chain)
 	if opts.BasicAuthUser != "" {

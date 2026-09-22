@@ -1483,6 +1483,24 @@ func TestBasicAuthProtectsWhenConfigured(t *testing.T) {
 		t.Fatal("401 lacks WWW-Authenticate")
 	}
 
+	// Wrong credentials answer the same 401 + challenge.
+	reqBad, err := http.NewRequest(http.MethodGet, ts.URL+"/admin/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqBad.SetBasicAuth("ops", "not-the-pass")
+	resBad, err := ts.Client().Do(reqBad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resBad.Body.Close()
+	if resBad.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong creds: status = %d, want 401", resBad.StatusCode)
+	}
+	if resBad.Header.Get("WWW-Authenticate") == "" {
+		t.Fatal("wrong-creds 401 lacks WWW-Authenticate")
+	}
+
 	req, err := http.NewRequest(http.MethodGet, ts.URL+"/admin/", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1495,5 +1513,54 @@ func TestBasicAuthProtectsWhenConfigured(t *testing.T) {
 	res2.Body.Close()
 	if res2.StatusCode != http.StatusOK {
 		t.Fatalf("with creds: status = %d, want 200", res2.StatusCode)
+	}
+}
+
+// --- cross-origin protection (AE6 / KTD4) ---
+
+// TestCrossOriginPostRejected proves the CrossOriginProtection wired into
+// New's chain: a browser POST with a mismatched Origin is rejected before
+// any mutation runs, while the same POST without Origin (curl-style) and a
+// same-origin browser POST both pass.
+func TestCrossOriginPostRejected(t *testing.T) {
+	ts, _ := newTestServer(t, "/admin")
+
+	post := func(origin string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/admin/topics",
+			strings.NewReader(url.Values{"name": {"csrf-probe"}}.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		res, err := noRedirect().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res
+	}
+
+	// Cross-origin browser POST (mismatched Origin) → 403, no mutation.
+	if res := post("https://evil.example"); res.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin POST: status = %d, want 403", res.StatusCode)
+	}
+
+	// The same POST without Origin (curl-style) → 303 to the topic page.
+	res := post("")
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("curl-style POST: status = %d, want 303", res.StatusCode)
+	}
+	if loc := res.Header.Get("Location"); loc != "/admin/topics/4" {
+		t.Fatalf("curl-style POST: Location = %q, want /admin/topics/4", loc)
+	}
+
+	// Same-origin browser POST (Origin matching the request host) passes —
+	// the admin's own forms must work in a real browser.
+	if res := post(ts.URL); res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("same-origin POST: status = %d, want 303", res.StatusCode)
 	}
 }

@@ -81,7 +81,7 @@ func main() {
 
 ## Documentation
 
-Every exported symbol in `novaque`, `novaque/store`, and `novaque/driver/mysql` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
+Every exported symbol in `novaque`, `novaque/store`, `novaque/admin`, and `novaque/driver/mysql` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
 
 ```bash
 go doc github.com/usual2970/novaque.Client
@@ -181,6 +181,53 @@ Semantics worth knowing:
 - **Privacy.** Stats store ids and counts only — never message payloads.
 - **Shutdown order.** Stop Consumers before the Client so their final acks land before the Client's last counter flush.
 
+## Admin UI
+
+`novaque/admin` ships a zero-build admin UI and JSON API as one stdlib `http.Handler`: a dashboard with live backlog, topic/channel detail pages with day-bucket trends, create and cascade-delete flows, and dead-letter browse (truncated list, full body on demand) with requeue/delete. Templates, CSS, and vanilla JS are embedded — no Node toolchain, no new runtime dependencies.
+
+```go
+h, err := admin.New(client, admin.Options{
+	Prefix:        "/admin", // default; "/" mounts at the root
+	BasicAuthUser: "ops",    // optional single pair — both or neither
+	BasicAuthPass: "hunter2",
+})
+```
+
+The handler strips its own prefix and re-applies it to every generated URL and redirect, so the host never wraps `http.StripPrefix`. Mount recipes:
+
+```go
+r.Any("/admin/*any", gin.WrapH(h))       // gin
+e.Any("/admin/*", echo.WrapHandler(h))   // echo — needs the bare route too:
+e.Any("/admin", echo.WrapHandler(h))
+r.Mount("/admin", h)                     // chi
+mux.Handle("/admin/", h)                 // net/http
+```
+
+### Auth and CSRF
+
+The only auth the package provides is the optional single basic-auth pair — no sessions, no RBAC. Real authentication belongs in host middleware mounted before the admin handler. **Basic auth without TLS on the host sends decodable credentials on every request**: serve the admin path over HTTPS whenever the pair is set.
+
+Every mutation is a POST (no mutating GET). Cross-origin browser mutations are rejected by the stdlib `http.CrossOriginProtection`: a POST with a mismatched `Origin` header answers 403, while same-origin forms and curl (no `Origin`) pass.
+
+### Delete semantics
+
+- **Topic delete cascades** in one transaction: the topic's channels, messages, deliveries, and retained day-bucket stats rows (including the zero-channel sentinel rows) all go. It is idempotent on an already-deleted id, and publishers self-heal — the next publish to the topic name re-creates it.
+- **Channel delete removes only that channel's deliveries and stats rows.** Shared message rows survive, so sibling channels keep their deliveries.
+- **Remove the channel from your consumer configuration before restarting consumers.** A consumer restarted while still subscribed re-creates the channel (create-on-subscribe), and a running consumer left subscribed idles forever until restarted. The delete confirmation page warns about this.
+
+### Dead letters
+
+Dead deliveries are browsable per channel — body preview truncated in the list, full body on demand — with attempts, remaining TTL, and per-delivery requeue/delete. Two semantics worth knowing:
+
+- **Requeue restarts the clock.** The original per-publish TTL is not stored: a requeued dead delivery gets a fresh TTL from the Client's `DefaultTTL`, with attempts reset and available now.
+- **Requeue is a retry, not immortality.** The fresh TTL is bounded by the message's remaining life / `DefaultTTL` — the TTL purge still reclaims any row whose `expires_at` passes. Dead-letter requeue buys another processing window; it does not exempt the message from expiry.
+
+### Caveats
+
+- **Collation.** MySQL's default utf8mb4 collation is case-insensitive: `Orders` and `orders` are the same topic. Duplicate creates resolve idempotently to the existing entity either way.
+- **Counter lag.** Counters buffer in-process and flush every `StatsFlushInterval` (default 2s); each process flushes only its own deltas, so with multiple publisher processes the UI's numbers may lag by a few seconds (the page footer notes this). Backlog is a live COUNT and does not lag.
+- **`purge` counter.** The `purge` day-bucket counter totals TTL purges **plus manual dead-letter deletions** from the admin UI — deleting a dead delivery bumps `purge`.
+
 ## Guarantees
 
 | Behavior | Contract |
@@ -205,6 +252,7 @@ novaque/
     store.go          # Store interface (dialect-agnostic)
     cached.go         # WithCache — memoize EnsureTopic / EnsureChannel
   driver/mysql/       # MySQL Store + schema.sql
+  admin/              # mountable admin UI + JSON API (stdlib http.Handler)
   cmd/loadtest/       # local publish/consume stress tool
   internal/testmysql/ # testcontainers helper (integration tests)
 ```
@@ -237,8 +285,6 @@ Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
 ## Status / non-goals
 
-Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), loadtest, complete identifier-first godoc with compile-verified examples.
-
-In progress: admin surface — `store.Store`-level listings, backlog reads, and dead-letter operations are committed with their MySQL implementation; Client-level admin methods and a mountable admin UI are under active development.
+Shipped: MySQL driver, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), mountable admin UI (`novaque/admin`), loadtest, complete identifier-first godoc with compile-verified examples.
 
 Not in MVP: Postgres/SQLite drivers, NSQ wire protocol, standalone broker, deferred requeue/backoff.
