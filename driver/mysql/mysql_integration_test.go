@@ -302,18 +302,9 @@ func TestPublishDeletedTopicErrTopicGone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Delete the topic out from under the resolved id, child-first (KTD7
-	// ordering) with raw SQL so the driver sees only the vanished parent.
-	for _, q := range []string{
-		`DELETE FROM novaque_messages WHERE topic_id = ?`,
-		`DELETE FROM novaque_channels WHERE topic_id = ?`,
-		`DELETE FROM novaque_stats_daily WHERE topic_id = ?`,
-		`DELETE FROM novaque_topics WHERE id = ?`,
-	} {
-		if _, err := db.ExecContext(ctx, q, topicID); err != nil {
-			t.Fatalf("raw delete %q: %v", q, err)
-		}
-	}
+	// Delete the topic out from under the resolved id with raw SQL so the
+	// driver sees only the vanished parent.
+	killTopicRaw(t, ctx, db, topicID)
 
 	_, err = s.Publish(ctx, topicID, []byte("too late"), store.PublishOpts{TTL: time.Hour})
 	if !errors.Is(err, store.ErrTopicGone) {
