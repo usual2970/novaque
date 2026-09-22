@@ -348,6 +348,188 @@ func (c *Client) FlushStats(ctx context.Context) error {
 	return nil
 }
 
+// --- Admin API (mountable admin UI): ID-addressed reads and mutations over
+// the admin Store surface. Read paths never create rows — no Ensure on read
+// (KTD6); ids come from the list methods. CreateTopic/CreateChannel are the
+// only Ensure-backed calls, which makes them idempotent by construction. ---
+
+// TopicInfo is one topic row from the admin listing (re-export of
+// store.TopicInfo).
+type TopicInfo = store.TopicInfo
+
+// ChannelInfo is one channel row from the all-channels admin listing
+// (re-export of store.ChannelInfo).
+type ChannelInfo = store.ChannelInfo
+
+// BacklogRow is one channel's live backlog snapshot from the batched
+// all-channels query (re-export of store.BacklogRow).
+type BacklogRow = store.BacklogRow
+
+// DailyCounters is one retained UTC day bucket of the event counters
+// (re-export of store.DailyCounters).
+type DailyCounters = store.DailyCounters
+
+// DeadDelivery is one dead delivery row for the dead-letter browse — the only
+// admin surface carrying message bodies (re-export of store.DeadDelivery).
+type DeadDelivery = store.DeadDelivery
+
+var (
+	// ErrTopicGone is returned (wrapped) by Publish when the resolved topic
+	// id no longer exists; Client.Publish self-heals it once (re-export of
+	// store.ErrTopicGone; compare with errors.Is).
+	ErrTopicGone = store.ErrTopicGone
+	// ErrDeadGone is returned (wrapped) by RequeueDead and DeleteDead when
+	// the delivery was no longer dead — already requeued or deleted — so a
+	// retry is idempotent-safe (re-export of store.ErrDeadGone).
+	ErrDeadGone = store.ErrDeadGone
+)
+
+// ListTopics returns every topic, ascending by name (KTD6: a straight store
+// read — no Ensure, so listing never creates rows).
+func (c *Client) ListTopics(ctx context.Context) ([]TopicInfo, error) {
+	topics, err := c.store.ListTopics(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("novaque list topics: %w", err)
+	}
+	return topics, nil
+}
+
+// ListChannels returns every channel across all topics — each carrying its
+// TopicID — ordered by topic name then channel name (KTD6: no Ensure).
+func (c *Client) ListChannels(ctx context.Context) ([]ChannelInfo, error) {
+	channels, err := c.store.ListChannels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("novaque list channels: %w", err)
+	}
+	return channels, nil
+}
+
+// Backlogs returns live per-channel backlog counts for every channel in one
+// query. Rows appear only for channels with at least one delivery; zero-fill
+// the rest against ListChannels. Backlog is a live row count, so it needs no
+// FlushStats and never Ensures (KTD6).
+func (c *Client) Backlogs(ctx context.Context) ([]BacklogRow, error) {
+	rows, err := c.store.Backlogs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("novaque backlogs: %w", err)
+	}
+	return rows, nil
+}
+
+// CreateTopic creates the named topic under the existing driver name rules
+// and returns its id. Ensure-backed, so creating an existing topic resolves
+// the same id instead of erroring (idempotent, R5).
+func (c *Client) CreateTopic(ctx context.Context, name string) (int64, error) {
+	id, err := c.store.EnsureTopic(ctx, name)
+	if err != nil {
+		return 0, fmt.Errorf("novaque create topic: %w", err)
+	}
+	return id, nil
+}
+
+// CreateChannel creates the named channel under topic (creating the topic
+// when missing) and returns the channel id. Ensure-backed and idempotent
+// (R5). A channel created after a publish receives only future publishes.
+func (c *Client) CreateChannel(ctx context.Context, topic, channel string) (int64, error) {
+	id, err := c.store.EnsureChannel(ctx, topic, channel)
+	if err != nil {
+		return 0, fmt.Errorf("novaque create channel: %w", err)
+	}
+	return id, nil
+}
+
+// DeleteTopic removes the topic and everything under it — channels, messages,
+// deliveries, and retained stats rows — in one transaction (R6). Idempotent:
+// deleting an already-deleted id succeeds as a no-op. This process's memoized
+// ids are evicted; other processes self-heal on their next publish.
+func (c *Client) DeleteTopic(ctx context.Context, topicID int64) error {
+	if err := c.store.DeleteTopic(ctx, topicID); err != nil {
+		return fmt.Errorf("novaque delete topic: %w", err)
+	}
+	return nil
+}
+
+// DeleteChannel removes the channel's deliveries and stats rows, keeping the
+// shared messages so sibling channels keep their deliveries (R6). Idempotent
+// on already-deleted ids. Consumers of a deleted channel idle until
+// restarted — stop and re-Subscribe them.
+func (c *Client) DeleteChannel(ctx context.Context, channelID int64) error {
+	if err := c.store.DeleteChannel(ctx, channelID); err != nil {
+		return fmt.Errorf("novaque delete channel: %w", err)
+	}
+	return nil
+}
+
+// ListDead returns a channel's dead deliveries newest-first, keyset-paginated:
+// before > 0 returns only rows with id < before, and limit bounds the page
+// (non-positive falls back to a driver default). The channel id comes from
+// ListChannels; the read never Ensures (KTD6).
+func (c *Client) ListDead(ctx context.Context, channelID, before int64, limit int) ([]DeadDelivery, error) {
+	rows, err := c.store.ListDead(ctx, channelID, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("novaque list dead: %w", err)
+	}
+	return rows, nil
+}
+
+// RequeueDead returns one dead delivery to pending — attempts reset, lease
+// cleared, available now — writing a fresh TTL of the client's DefaultTTL on
+// both the delivery and its message (the original per-publish TTL is not
+// stored, so the clock restarts). ErrDeadGone (wrapped) means the delivery
+// was no longer dead — already requeued or deleted — and a retry is
+// idempotent-safe.
+func (c *Client) RequeueDead(ctx context.Context, deliveryID int64) error {
+	if err := c.store.RequeueDead(ctx, deliveryID, c.opts.DefaultTTL); err != nil {
+		return fmt.Errorf("novaque requeue dead: %w", err)
+	}
+	return nil
+}
+
+// DeleteDead removes one dead delivery; the shared message row is reclaimed
+// by the orphan purge once its sibling deliveries are gone. ErrDeadGone
+// (wrapped) when the delivery was no longer dead.
+func (c *Client) DeleteDead(ctx context.Context, deliveryID int64) error {
+	if err := c.store.DeleteDead(ctx, deliveryID); err != nil {
+		return fmt.Errorf("novaque delete dead: %w", err)
+	}
+	return nil
+}
+
+// TopicDailyCounters returns the retained day-bucket counter rows for a topic
+// rolled up per day over the trailing days-day UTC window ending today.
+// Existing-day rows only, ascending by day; zero-filling the window is the
+// caller's job. This process's buffered counter deltas are flushed
+// best-effort first (KTD12) — other processes' buffers may still lag.
+func (c *Client) TopicDailyCounters(ctx context.Context, topicID int64, days int) ([]DailyCounters, error) {
+	c.flushStatsBestEffort(ctx)
+	rows, err := c.store.TopicDailyCounters(ctx, topicID, days)
+	if err != nil {
+		return nil, fmt.Errorf("novaque topic daily counters: %w", err)
+	}
+	return rows, nil
+}
+
+// ChannelDailyCounters returns the retained day-bucket counter rows for one
+// channel over the trailing days-day UTC window ending today. Flush/lag
+// semantics and zero-filling as per TopicDailyCounters.
+func (c *Client) ChannelDailyCounters(ctx context.Context, channelID int64, days int) ([]DailyCounters, error) {
+	c.flushStatsBestEffort(ctx)
+	rows, err := c.store.ChannelDailyCounters(ctx, channelID, days)
+	if err != nil {
+		return nil, fmt.Errorf("novaque channel daily counters: %w", err)
+	}
+	return rows, nil
+}
+
+// flushStatsBestEffort drains this process's buffered counter deltas so the
+// daily-counter reads see them (KTD12: the sink is per-process). Failure is
+// logged and swallowed — a read must not fail because a flush did.
+func (c *Client) flushStatsBestEffort(ctx context.Context) {
+	if err := c.store.FlushStats(ctx); err != nil {
+		c.logger().Error("stats flush failed", zap.String("op", "flush_stats"), zap.NamedError("err", err))
+	}
+}
+
 // MaxDelay is the maximum publish Delay (re-export of store.MaxDelay).
 const MaxDelay = store.MaxDelay
 
@@ -383,7 +565,10 @@ type PublishOpts struct {
 // publish to a topic with no channels still stores the message. The topic is
 // created on demand. TTL and MaxAttempts default-fill from Options; a Delay
 // outside MaxDelay or the effective TTL returns ErrDelayNegative,
-// ErrDelayTooLong, or ErrDelayExceedsTTL (compare with errors.Is).
+// ErrDelayTooLong, or ErrDelayExceedsTTL (compare with errors.Is). When
+// another process deleted the topic after its id was resolved, Publish
+// evicts the memoized id, re-ensures the name (re-creating the topic), and
+// retries once before failing with ErrTopicGone.
 func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts PublishOpts) (int64, error) {
 	topicID, err := c.store.EnsureTopic(ctx, topic)
 	if err != nil {
@@ -404,6 +589,22 @@ func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts Pu
 		return 0, fmt.Errorf("novaque publish: %w", err)
 	}
 	id, err := c.store.Publish(ctx, topicID, body, po)
+	if errors.Is(err, store.ErrTopicGone) {
+		// Cross-process delete self-heal (KTD9): another process deleted the
+		// topic behind the id after it was resolved here. Evict the memoized
+		// id, re-Ensure the name (the Ensure insert re-creates the row —
+		// create-on-publish), and retry exactly once. Only Client knows the
+		// topic name, so the retry lives here, not in the store; any error on
+		// the retry — a second ErrTopicGone included — is returned unchanged.
+		if inv, ok := c.store.(interface{ InvalidateTopicID(int64) }); ok {
+			inv.InvalidateTopicID(topicID)
+		}
+		topicID, err = c.store.EnsureTopic(ctx, topic)
+		if err != nil {
+			return 0, fmt.Errorf("novaque publish: %w", err)
+		}
+		id, err = c.store.Publish(ctx, topicID, body, po)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("novaque publish: %w", err)
 	}

@@ -150,6 +150,84 @@ func TestHighConcurrencyCompete(t *testing.T) {
 // (StatsFlushInterval wiring), Client reads equal direct store reads, backlog
 // tracks the pending/ready/in_flight transitions including delayed publishes,
 // and PruneStats removes only expired day buckets.
+// TestClientPublishSelfHealAfterForeignTopicDelete covers AE9 (R11): two
+// Clients share one DB (separate CachingStores); B memoizes a topic id via a
+// publish, A deletes the topic, and B's next publish self-heals — evict the
+// memo, re-Ensure the name, retry once — landing on a re-created topic row
+// with a new id.
+func TestClientPublishSelfHealAfterForeignTopicDelete(t *testing.T) {
+	db := testmysql.Open(t)
+	mk := func() *novaque.Client {
+		client, err := novaque.Open(mysqldriver.New(db), novaque.Options{
+			PurgeInterval: time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client
+	}
+	procA, procB := mk(), mk()
+	ctx := context.Background()
+	if err := procA.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	topic := "heal_" + time.Now().Format("150405.000")
+
+	// B memoizes the topic id in its own CachingStore via a first publish.
+	if _, err := procB.Publish(ctx, topic, []byte("one"), novaque.PublishOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A resolves the id the way the admin surface does — from the list — and
+	// deletes the topic (a foreign delete as far as B's memo is concerned).
+	topics, err := procA.ListTopics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldID int64
+	for _, ti := range topics {
+		if ti.Name == topic {
+			oldID = ti.ID
+		}
+	}
+	if oldID == 0 {
+		t.Fatalf("topic %q not listed", topic)
+	}
+	if err := procA.DeleteTopic(ctx, oldID); err != nil {
+		t.Fatal(err)
+	}
+
+	// B publishes again: the memoized id is stale, the driver maps the topic
+	// FK failure to ErrTopicGone, and the client retry re-creates the row.
+	msgID, err := procB.Publish(ctx, topic, []byte("two"), novaque.PublishOpts{})
+	if err != nil {
+		t.Fatalf("publish after foreign delete must self-heal, got %v", err)
+	}
+
+	// The retried publish landed on a re-created row with a new id.
+	topics, err = procA.ListTopics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var newID int64
+	for _, ti := range topics {
+		if ti.Name == topic {
+			newID = ti.ID
+		}
+	}
+	if newID == 0 || newID == oldID {
+		t.Fatalf("topic re-created with id %d, want a new id (was %d)", newID, oldID)
+	}
+	var gotTopicID int64
+	if err := db.QueryRowContext(ctx, `SELECT topic_id FROM novaque_messages WHERE id = ?`, msgID).Scan(&gotTopicID); err != nil {
+		t.Fatal(err)
+	}
+	if gotTopicID != newID {
+		t.Fatalf("message %d lives on topic %d, want re-created topic %d", msgID, gotTopicID, newID)
+	}
+}
+
 func TestClientStatsEndToEnd(t *testing.T) {
 	db := testmysql.Open(t)
 	st := mysqldriver.New(db)

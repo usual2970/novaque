@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -30,6 +31,16 @@ type fakeStore struct {
 	lastOpts    store.PublishOpts
 	publishN    int
 
+	// Publish self-heal capture (U3 admin plan): forced per-call errors
+	// (one-shot queue, drained before failPublish), a call counter that
+	// includes failed attempts, the topic id each attempt saw, and an
+	// EnsureTopic/EnsureChannel call count. Under mu.
+	publishErrs     []error
+	publishCalls    int
+	publishTopicIDs []int64
+	ensureTopicN    int
+	ensureChannelN  int
+
 	// Failure toggles and a claimable-delivery queue, hit from consumer and
 	// maintenance goroutines; always read/written under mu.
 	failClaim   bool
@@ -52,6 +63,27 @@ type fakeStore struct {
 	lastBacklogID         int64
 	pruneRetentions       []int
 	flushN                int
+
+	// Admin-surface capture (U3 admin plan): reads return these preset rows
+	// verbatim and record the id/window args each call saw; dead ops and
+	// deletes record their targets. Under mu.
+	backlogs     []store.BacklogRow
+	topicDaily   []store.DailyCounters
+	channelDaily []store.DailyCounters
+	deadRows     []store.DeadDelivery
+
+	lastDailyTopicID    int64
+	lastDailyTopicDays  int
+	lastDailyChannelID  int64
+	lastDailyChanDays   int
+	lastDeadChannelID   int64
+	lastDeadBefore      int64
+	lastDeadLimit       int
+	lastRequeueDeadID   int64
+	lastRequeueDeadTTL  time.Duration
+	lastDeleteDeadID    int64
+	lastDeleteTopicID   int64
+	lastDeleteChannelID int64
 }
 
 // setFlag flips a failure/block toggle under mu (toggles are read by client loops).
@@ -93,6 +125,7 @@ func (f *fakeStore) Migrate(context.Context) error { return nil }
 func (f *fakeStore) EnsureTopic(_ context.Context, name string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ensureTopicN++
 	if id, ok := f.topics[name]; ok {
 		return id, nil
 	}
@@ -109,6 +142,7 @@ func (f *fakeStore) EnsureChannel(ctx context.Context, topic, channel string) (i
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ensureChannelN++
 	if id, ok := f.channels[topic][channel]; ok {
 		return id, nil
 	}
@@ -119,13 +153,21 @@ func (f *fakeStore) EnsureChannel(ctx context.Context, topic, channel string) (i
 }
 
 func (f *fakeStore) Publish(_ context.Context, topicID int64, body []byte, opts store.PublishOpts) (int64, error) {
-	if f.failPublish {
-		return 0, errors.New("boom")
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.lastOpts = opts
-	f.publishN++
+	f.publishCalls++
+	f.publishTopicIDs = append(f.publishTopicIDs, topicID)
+	var forced error
+	if len(f.publishErrs) > 0 {
+		forced = f.publishErrs[0]
+		f.publishErrs = f.publishErrs[1:]
+	}
+	if forced == nil && f.failPublish {
+		forced = errors.New("boom")
+	}
+	if forced != nil {
+		return 0, forced
+	}
 	var topic string
 	for name, id := range f.topics {
 		if id == topicID {
@@ -133,6 +175,14 @@ func (f *fakeStore) Publish(_ context.Context, topicID int64, body []byte, opts 
 			break
 		}
 	}
+	if topic == "" {
+		// Mirror the driver contract: publishing to an id with no topic row
+		// (the topic was deleted behind this process's memo) is
+		// store.ErrTopicGone.
+		return 0, store.ErrTopicGone
+	}
+	f.lastOpts = opts
+	f.publishN++
 	var chans []string
 	for name := range f.channels[topic] {
 		chans = append(chans, name)
@@ -248,7 +298,8 @@ func (f *fakeStore) FlushStats(context.Context) error {
 
 // Admin surface (mountable admin UI plan U1): listings and deletes are
 // minimal in-memory implementations over the maps; backlog, daily counters,
-// and dead ops are zero-value stubs. Reads never create rows.
+// and dead ops return preset rows verbatim while recording the args each call
+// saw (U3 capture). Reads never create rows.
 func (f *fakeStore) ListTopics(_ context.Context) ([]store.TopicInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -281,28 +332,56 @@ func (f *fakeStore) ListChannels(_ context.Context) ([]store.ChannelInfo, error)
 	return out, nil
 }
 
-func (f *fakeStore) Backlogs(context.Context) ([]store.BacklogRow, error) {
-	return nil, nil // the fake tracks no delivery rows
+func (f *fakeStore) Backlogs(_ context.Context) ([]store.BacklogRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.backlogs, nil
 }
 
-func (f *fakeStore) TopicDailyCounters(context.Context, int64, int) ([]store.DailyCounters, error) {
-	return nil, nil
+func (f *fakeStore) TopicDailyCounters(_ context.Context, topicID int64, days int) ([]store.DailyCounters, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastDailyTopicID = topicID
+	f.lastDailyTopicDays = days
+	return f.topicDaily, nil
 }
 
-func (f *fakeStore) ChannelDailyCounters(context.Context, int64, int) ([]store.DailyCounters, error) {
-	return nil, nil
+func (f *fakeStore) ChannelDailyCounters(_ context.Context, channelID int64, days int) ([]store.DailyCounters, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastDailyChannelID = channelID
+	f.lastDailyChanDays = days
+	return f.channelDaily, nil
 }
 
-func (f *fakeStore) ListDead(context.Context, int64, int64, int) ([]store.DeadDelivery, error) {
-	return nil, nil
+func (f *fakeStore) ListDead(_ context.Context, channelID int64, before int64, limit int) ([]store.DeadDelivery, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastDeadChannelID = channelID
+	f.lastDeadBefore = before
+	f.lastDeadLimit = limit
+	return f.deadRows, nil
 }
 
-func (f *fakeStore) RequeueDead(context.Context, int64, time.Duration) error { return nil }
-func (f *fakeStore) DeleteDead(context.Context, int64) error                 { return nil }
+func (f *fakeStore) RequeueDead(_ context.Context, deliveryID int64, freshTTL time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastRequeueDeadID = deliveryID
+	f.lastRequeueDeadTTL = freshTTL
+	return nil
+}
+
+func (f *fakeStore) DeleteDead(_ context.Context, deliveryID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastDeleteDeadID = deliveryID
+	return nil
+}
 
 func (f *fakeStore) DeleteTopic(_ context.Context, topicID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastDeleteTopicID = topicID
 	for name, id := range f.topics {
 		if id == topicID {
 			delete(f.topics, name)
@@ -315,6 +394,7 @@ func (f *fakeStore) DeleteTopic(_ context.Context, topicID int64) error {
 func (f *fakeStore) DeleteChannel(_ context.Context, channelID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastDeleteChannelID = channelID
 	for _, chans := range f.channels {
 		for cName, id := range chans {
 			if id == channelID {
@@ -1052,5 +1132,382 @@ func TestCanceledContextClaimErrorNotLogged(t *testing.T) {
 	}
 	if got := spy.sink.countLevel("error"); got != 0 {
 		t.Fatalf("expected zero Error entries around shutdown, got %d", got)
+	}
+}
+
+// --- U3 (admin plan): publish self-heal + admin surface ---
+
+// TestPublishSelfHealAfterErrTopicGone covers the KTD9 client retry: a
+// publish against a memoized-but-deleted topic id evicts the memo, re-Ensures
+// the name, and retries exactly once against the re-created row.
+func TestPublishSelfHealAfterErrTopicGone(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("retry publishes against re-created topic", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Publish(ctx, "orders", []byte("one"), novaque.PublishOpts{}); err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		oldID := f.topics["orders"]
+		f.mu.Unlock()
+
+		// Foreign-process delete: hit the fake directly so the client's
+		// CachingStore keeps its stale memo — exactly the cross-process case.
+		if err := f.DeleteTopic(ctx, oldID); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := c.Publish(ctx, "orders", []byte("two"), novaque.PublishOpts{}); err != nil {
+			t.Fatalf("publish after foreign delete must self-heal, got %v", err)
+		}
+
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		newID := f.topics["orders"]
+		if newID == oldID {
+			t.Fatalf("topic was not re-created, id still %d", newID)
+		}
+		if got := f.publishTopicIDs; len(got) != 3 || got[0] != oldID || got[1] != oldID || got[2] != newID {
+			t.Fatalf("publish attempts saw topic ids %v, want [%d %d %d]", got, oldID, oldID, newID)
+		}
+		// The memo must have been evicted between attempts: EnsureTopic hit
+		// the fake exactly twice (initial resolve + re-Ensure), never a third.
+		if f.ensureTopicN != 2 {
+			t.Fatalf("EnsureTopic called %d times, want exactly 2 (memo not evicted)", f.ensureTopicN)
+		}
+	})
+
+	t.Run("second ErrTopicGone is returned", func(t *testing.T) {
+		f := newFake()
+		f.mu.Lock()
+		f.publishErrs = []error{store.ErrTopicGone, store.ErrTopicGone}
+		f.mu.Unlock()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Publish(ctx, "orders", []byte("x"), novaque.PublishOpts{}); !errors.Is(err, store.ErrTopicGone) {
+			t.Fatalf("got %v, want wrapped ErrTopicGone", err)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.publishCalls != 2 {
+			t.Fatalf("publish attempted %d times, want exactly 2 (one retry)", f.publishCalls)
+		}
+	})
+
+	t.Run("non-sentinel error is not retried", func(t *testing.T) {
+		f := newFake()
+		boom := errors.New("boom")
+		f.mu.Lock()
+		f.publishErrs = []error{boom}
+		f.mu.Unlock()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Publish(ctx, "orders", []byte("x"), novaque.PublishOpts{}); !errors.Is(err, boom) {
+			t.Fatalf("got %v, want the original error surfaced", err)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.publishCalls != 1 {
+			t.Fatalf("publish attempted %d times, want 1 (no retry)", f.publishCalls)
+		}
+		if f.ensureTopicN != 1 {
+			t.Fatalf("EnsureTopic called %d times, want 1 (no re-Ensure)", f.ensureTopicN)
+		}
+	})
+}
+
+// TestCreateTopicChannelIdempotent covers R5 client wiring: creates are
+// Ensure-backed, so a duplicate create resolves the same id, not an error.
+func TestCreateTopicChannelIdempotent(t *testing.T) {
+	ctx := context.Background()
+	f := newFake()
+	c, err := novaque.Open(f, novaque.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id1, err := c.CreateTopic(ctx, "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, err := c.CreateTopic(ctx, "orders")
+	if err != nil {
+		t.Fatalf("duplicate create must be idempotent: %v", err)
+	}
+	if id1 != id2 {
+		t.Fatalf("duplicate create resolved %d then %d", id1, id2)
+	}
+	cid1, err := c.CreateChannel(ctx, "orders", "email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cid2, err := c.CreateChannel(ctx, "orders", "email")
+	if err != nil {
+		t.Fatalf("duplicate channel create must be idempotent: %v", err)
+	}
+	if cid1 != cid2 {
+		t.Fatalf("duplicate channel create resolved %d then %d", cid1, cid2)
+	}
+}
+
+// TestDeleteForwardsIDWithoutEnsure covers KTD6/R6 client wiring: deletes are
+// ID-addressed straight through to the store — no name Ensure anywhere on the
+// path — and the id is forwarded unchanged.
+func TestDeleteForwardsIDWithoutEnsure(t *testing.T) {
+	ctx := context.Background()
+	f := newFake()
+	c, err := novaque.Open(f, novaque.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := c.CreateTopic(ctx, "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	channelID, err := c.CreateChannel(ctx, "orders", "email")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	ensureTopics, ensureChans := f.ensureTopicN, f.ensureChannelN
+	f.mu.Unlock()
+
+	if err := c.DeleteTopic(ctx, topicID); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteChannel(ctx, channelID); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lastDeleteTopicID != topicID {
+		t.Fatalf("DeleteTopic forwarded id %d, want %d", f.lastDeleteTopicID, topicID)
+	}
+	if f.lastDeleteChannelID != channelID {
+		t.Fatalf("DeleteChannel forwarded id %d, want %d", f.lastDeleteChannelID, channelID)
+	}
+	if f.ensureTopicN != ensureTopics || f.ensureChannelN != ensureChans {
+		t.Fatalf("delete paths must not Ensure: topics %d->%d, channels %d->%d",
+			ensureTopics, f.ensureTopicN, ensureChans, f.ensureChannelN)
+	}
+}
+
+// TestDeadOpsForwardThroughClient covers R7 client wiring: RequeueDead passes
+// the client's DefaultTTL (explicit option and zero-value default) and
+// DeleteDead forwards the id.
+func TestDeadOpsForwardThroughClient(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("requeue passes configured DefaultTTL", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{DefaultTTL: 3 * time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.RequeueDead(ctx, 77); err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.lastRequeueDeadID != 77 || f.lastRequeueDeadTTL != 3*time.Hour {
+			t.Fatalf("RequeueDead saw (%d, %v), want (77, 3h)", f.lastRequeueDeadID, f.lastRequeueDeadTTL)
+		}
+	})
+
+	t.Run("requeue falls back to default TTL", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.RequeueDead(ctx, 1); err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.lastRequeueDeadTTL != 7*24*time.Hour {
+			t.Fatalf("RequeueDead TTL %v, want the 7d default", f.lastRequeueDeadTTL)
+		}
+	})
+
+	t.Run("delete dead forwards the id", func(t *testing.T) {
+		f := newFake()
+		c, err := novaque.Open(f, novaque.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.DeleteDead(ctx, 99); err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.lastDeleteDeadID != 99 {
+			t.Fatalf("DeleteDead forwarded %d, want 99", f.lastDeleteDeadID)
+		}
+	})
+}
+
+// TestAdminListMethodsReturnStoreResultsUntransformed covers the thin
+// forwarding layer: every admin read returns the store's rows verbatim with
+// ids and window args forwarded unchanged.
+func TestAdminListMethodsReturnStoreResultsUntransformed(t *testing.T) {
+	ctx := context.Background()
+	f := newFake()
+	presetBacklogs := []store.BacklogRow{{ChannelID: 5, Pending: 7, Ready: 1, InFlight: 2, Dead: 3}}
+	presetTopicDaily := []store.DailyCounters{{Day: time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC), Publish: 4}}
+	presetChannelDaily := []store.DailyCounters{{Day: time.Date(2026, 9, 21, 0, 0, 0, 0, time.UTC), Claim: 6}}
+	presetDead := []store.DeadDelivery{{ID: 9, ChannelID: 5, Body: []byte("poison")}}
+	f.mu.Lock()
+	f.backlogs = presetBacklogs
+	f.topicDaily = presetTopicDaily
+	f.channelDaily = presetChannelDaily
+	f.deadRows = presetDead
+	f.mu.Unlock()
+
+	if _, err := f.EnsureChannel(ctx, "t1", "c1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.EnsureChannel(ctx, "t2", "a1"); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := novaque.Open(f, novaque.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantTopics, err := f.ListTopics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topics, err := c.ListTopics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(topics, wantTopics) {
+		t.Fatalf("ListTopics %v, want store rows %v", topics, wantTopics)
+	}
+
+	wantChannels, err := f.ListChannels(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels, err := c.ListChannels(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(channels, wantChannels) {
+		t.Fatalf("ListChannels %v, want store rows %v", channels, wantChannels)
+	}
+
+	backlogs, err := c.Backlogs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(backlogs, presetBacklogs) {
+		t.Fatalf("Backlogs %v, want preset %v", backlogs, presetBacklogs)
+	}
+
+	daily, err := c.TopicDailyCounters(ctx, 11, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(daily, presetTopicDaily) {
+		t.Fatalf("TopicDailyCounters %v, want preset %v", daily, presetTopicDaily)
+	}
+
+	daily, err = c.ChannelDailyCounters(ctx, 12, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(daily, presetChannelDaily) {
+		t.Fatalf("ChannelDailyCounters %v, want preset %v", daily, presetChannelDaily)
+	}
+
+	dead, err := c.ListDead(ctx, 5, 40, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(dead, presetDead) {
+		t.Fatalf("ListDead %v, want preset %v", dead, presetDead)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lastDailyTopicID != 11 || f.lastDailyTopicDays != 7 {
+		t.Fatalf("TopicDailyCounters saw (%d, %d), want (11, 7)", f.lastDailyTopicID, f.lastDailyTopicDays)
+	}
+	if f.lastDailyChannelID != 12 || f.lastDailyChanDays != 3 {
+		t.Fatalf("ChannelDailyCounters saw (%d, %d), want (12, 3)", f.lastDailyChannelID, f.lastDailyChanDays)
+	}
+	if f.lastDeadChannelID != 5 || f.lastDeadBefore != 40 || f.lastDeadLimit != 20 {
+		t.Fatalf("ListDead saw (%d, %d, %d), want (5, 40, 20)", f.lastDeadChannelID, f.lastDeadBefore, f.lastDeadLimit)
+	}
+}
+
+// TestDailyCountersFlushStatsBeforeRead covers KTD12: the two daily-counter
+// reads drain this process's buffered counter deltas best-effort first — and
+// only they do (lists and dead reads never flush); a failing flush never
+// fails the read.
+func TestDailyCountersFlushStatsBeforeRead(t *testing.T) {
+	ctx := context.Background()
+	f := newFake()
+	c, err := novaque.Open(f, novaque.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.ListTopics(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Backlogs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ListDead(ctx, 5, 0, 20); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	flushed := f.flushN
+	f.mu.Unlock()
+	if flushed != 0 {
+		t.Fatalf("non-counter reads must not flush, saw %d FlushStats calls", flushed)
+	}
+
+	if _, err := c.TopicDailyCounters(ctx, 11, 7); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	flushed = f.flushN
+	f.mu.Unlock()
+	if flushed != 1 {
+		t.Fatalf("TopicDailyCounters must flush first, saw %d FlushStats calls", flushed)
+	}
+
+	if _, err := c.ChannelDailyCounters(ctx, 12, 3); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	flushed = f.flushN
+	f.mu.Unlock()
+	if flushed != 2 {
+		t.Fatalf("ChannelDailyCounters must flush first, saw %d FlushStats calls", flushed)
+	}
+
+	// Best-effort: a failing flush is logged and swallowed, never fatal to
+	// the read.
+	f.setFlag(&f.failFlushStats, true)
+	defer f.setFlag(&f.failFlushStats, false)
+	if _, err := c.TopicDailyCounters(ctx, 11, 1); err != nil {
+		t.Fatalf("daily-counter read must survive a failed flush, got %v", err)
 	}
 }
