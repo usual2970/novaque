@@ -38,12 +38,43 @@ const statsFlushBatch = 500
 // batch in a drain sends byte-identical SQL, so only a tail batch re-renders.
 var statsFlushFullSQL = statsFlushSQL(statsFlushBatch)
 
+// discardTopicStats drops every buffered delta for topicID. A topic cascade
+// calls it after committing: the stats rows are already deleted, and
+// novaque_stats_daily has no FK, so leaving the deltas buffered would let the
+// next FlushStats upsert recreate them. Best-effort by necessity — a
+// publisher can buffer a delta concurrently — and FlushStats' existence
+// filter is the durable backstop.
+func (s *Store) discardTopicStats(topicID int64) {
+	s.statMu.Lock()
+	for k := range s.statBuf {
+		if k.topicID == topicID {
+			delete(s.statBuf, k)
+		}
+	}
+	s.statMu.Unlock()
+}
+
+// discardChannelStats drops every buffered delta for channelID (same rationale
+// as discardTopicStats, after a channel cascade commits).
+func (s *Store) discardChannelStats(channelID int64) {
+	s.statMu.Lock()
+	for k := range s.statBuf {
+		if k.channelID == channelID {
+			delete(s.statBuf, k)
+		}
+	}
+	s.statMu.Unlock()
+}
+
 // FlushStats drains the buffered counter sink into novaque_stats_daily in
 // batched upserts. The day bucket comes from the DB clock (date('now'), the
 // UTC day, never host time), so a flush spanning UTC midnight attributes its
-// whole delta to the flush-time day. On error the not-yet-flushed deltas are
-// merged back into the sink so a transient DB failure loses no counts
-// (at-least-once).
+// whole delta to the flush-time day. Coords whose topic/channel was deleted
+// while the delta sat buffered are dropped rather than written: the table has
+// no foreign key, so the upsert would otherwise recreate rows for a resource
+// a cascade removed (this also blocks another process' buffered deltas from
+// resurrecting rows). On error the not-yet-flushed deltas are merged back
+// into the sink so a transient DB failure loses no counts (at-least-once).
 func (s *Store) FlushStats(ctx context.Context) error {
 	s.statMu.Lock()
 	if len(s.statBuf) == 0 {
@@ -79,6 +110,32 @@ func (s *Store) FlushStats(ctx context.Context) error {
 		return order[i].channelID < order[j].channelID
 	})
 
+	// Drop coords for resources gone by flush time (a cascade delete raced
+	// the buffering, in this pool or another process). This is the durable
+	// backstop to the cascade's in-memory discard.
+	live, err := s.liveStatsCoords(ctx, order)
+	if err != nil {
+		// Same at-least-once path as a failed upsert: merge every pending
+		// delta back into the sink.
+		for k, n := range pending {
+			s.recordStat(k.topicID, k.channelID, k.kind, n)
+		}
+		return fmt.Errorf("sqlite stats flush: %w", err)
+	}
+	kept := order[:0]
+	for _, rk := range order {
+		if _, ok := live[rk]; ok {
+			kept = append(kept, rk)
+		} else {
+			delete(counts, rk)
+		}
+	}
+	order = kept
+	if len(order) == 0 {
+		// Every buffered coord named a deleted resource; no statements.
+		return nil
+	}
+
 	for start := 0; start < len(order); start += statsFlushBatch {
 		end := min(start+statsFlushBatch, len(order))
 		args := make([]any, 0, (end-start)*(3+int(numStatKinds)))
@@ -109,6 +166,65 @@ func (s *Store) FlushStats(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// liveStatsCoords returns the subset of coords that still name an existing
+// resource, in one read per statsFlushBatch-coord page. A real coord
+// (channelID > 0) must match a channel row by (topic_id, id); a channelID = 0
+// sentinel coord needs only its topic row — AUTOINCREMENT channel ids begin at
+// 1, so no channel id 0 exists. Row-value IN needs SQLite 3.15, well under the
+// 3.39 floor; both sides are rendered only when that coord kind is in the page.
+func (s *Store) liveStatsCoords(ctx context.Context, coords []statCoord) (map[statCoord]struct{}, error) {
+	live := make(map[statCoord]struct{}, len(coords))
+	for start := 0; start < len(coords); start += statsFlushBatch {
+		end := min(start+statsFlushBatch, len(coords))
+		var pairs, sentinels []int64
+		for _, c := range coords[start:end] {
+			if c.channelID == 0 {
+				sentinels = append(sentinels, c.topicID)
+			} else {
+				pairs = append(pairs, c.topicID, c.channelID)
+			}
+		}
+		var b strings.Builder
+		var args []any
+		if len(pairs) > 0 {
+			b.WriteString("SELECT topic_id, id FROM novaque_channels WHERE (topic_id, id) IN (")
+			for i := 0; i < len(pairs); i += 2 {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString("(?,?)")
+				args = append(args, pairs[i], pairs[i+1])
+			}
+			b.WriteString(")")
+		}
+		if len(sentinels) > 0 {
+			if len(pairs) > 0 {
+				b.WriteString(" UNION ALL ")
+			}
+			marks, sargs := idPlaceholders(sentinels)
+			b.WriteString("SELECT id, 0 FROM novaque_topics WHERE id IN (" + marks + ")")
+			args = append(args, sargs...)
+		}
+		rows, err := s.db.QueryContext(ctx, b.String(), args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var c statCoord
+			if err := rows.Scan(&c.topicID, &c.channelID); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			live[c] = struct{}{}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return live, nil
 }
 
 // statsFlushSQL renders the batched counter upsert for n rows. Column names

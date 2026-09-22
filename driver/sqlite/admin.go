@@ -357,33 +357,54 @@ func (s *Store) DeleteDead(ctx context.Context, deliveryID, channelID int64) err
 // Zero rows affected anywhere is an already-deleted topic: the whole tx still
 // commits as an idempotent no-op. A concurrent publisher that re-creates the
 // topic mid-tx fails the topic delete on its FK and aborts with an error;
-// callers retry into idempotent success.
+// callers retry into idempotent success. After the cascade commits, buffered
+// counter deltas for the topic are discarded too, so the next flush cannot
+// upsert them back into the just-deleted stats rows.
 func (s *Store) DeleteTopic(ctx context.Context, topicID int64) error {
 	if topicID <= 0 {
 		return fmt.Errorf("sqlite admin: invalid topic id %d", topicID)
 	}
-	return s.runCascade(ctx, []cascadeStep{
+	err := s.runCascade(ctx, []cascadeStep{
 		{"messages", `DELETE FROM novaque_messages WHERE topic_id = ?`},
 		{"channels", `DELETE FROM novaque_channels WHERE topic_id = ?`},
 		{"stats", `DELETE FROM novaque_stats_daily WHERE topic_id = ?`},
 		{"topic", `DELETE FROM novaque_topics WHERE id = ?`},
 	}, topicID)
+	if err != nil {
+		return err
+	}
+	// Discard only after the commit: on error the tx rolled back and every
+	// row still exists. A publisher that committed just before the cascade
+	// can still leave a buffered delta; FlushStats filters coords against
+	// live rows and is the durable backstop.
+	s.discardTopicStats(topicID)
+	return nil
 }
 
 // DeleteChannel removes one channel's deliveries and stats rows in one
 // transaction, then the channel row itself (KTD7). Messages are never
 // touched: deleting them would cascade away sibling channels' deliveries, so
 // orphaned message rows are left for the existing orphan purge. Idempotent on
-// already-deleted ids.
+// already-deleted ids. After the cascade commits, buffered counter deltas for
+// the channel are discarded too, so the next flush cannot upsert them back
+// into the just-deleted stats rows.
 func (s *Store) DeleteChannel(ctx context.Context, channelID int64) error {
 	if channelID <= 0 {
 		return fmt.Errorf("sqlite admin: invalid channel id %d", channelID)
 	}
-	return s.runCascade(ctx, []cascadeStep{
+	err := s.runCascade(ctx, []cascadeStep{
 		{"deliveries", `DELETE FROM novaque_deliveries WHERE channel_id = ?`},
 		{"stats", `DELETE FROM novaque_stats_daily WHERE channel_id = ?`},
 		{"channel", `DELETE FROM novaque_channels WHERE id = ?`},
 	}, channelID)
+	if err != nil {
+		return err
+	}
+	// Discard only after the commit: on error the tx rolled back and the
+	// channel's rows still exist. FlushStats' existence filter covers a
+	// delta buffered by a publisher that committed just before the cascade.
+	s.discardChannelStats(channelID)
+	return nil
 }
 
 // cascadeStep is one child-first DELETE of a cascade transaction.

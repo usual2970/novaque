@@ -53,7 +53,38 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	// Fail fast if the runtime SQLite is older than the supported floor,
 	// 3.39.0 (KTD2, OQ2).
-	return s.checkSQLiteVersion(ctx)
+	if err := s.checkSQLiteVersion(ctx); err != nil {
+		return err
+	}
+	return s.checkForeignKeys(ctx)
+}
+
+// checkForeignKeys gates Migrate on PRAGMA foreign_keys=1. The pragma is
+// per-connection: flipping it on one pooled connection leaves the rest of the
+// pool at SQLite's default (off), so it must be set in the DSN so every newly
+// opened pool connection inherits it, e.g.
+// file:<path>?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000).
+// The schema's cascade deletes (ON DELETE CASCADE, see DeleteTopic and
+// DeleteChannel) only fire while enforcement is on; with it off a topic
+// delete reports success but strands its delivery rows.
+func (s *Store) checkForeignKeys(ctx context.Context) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("novaque sqlite: acquire connection: %w", err)
+	}
+	defer conn.Close()
+
+	var fk int
+	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil {
+		return fmt.Errorf("novaque sqlite: read foreign_keys pragma: %w", err)
+	}
+	if fk != 1 {
+		return fmt.Errorf("novaque sqlite: foreign keys are disabled (PRAGMA foreign_keys=%d): "+
+			"open the database with the DSN pragma _pragma=foreign_keys(1), e.g. "+
+			"file:<path>?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000); "+
+			"cascade deletes depend on foreign-key enforcement", fk)
+	}
+	return nil
 }
 
 func splitSQL(s string) []string {

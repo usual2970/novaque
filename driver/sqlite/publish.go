@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
@@ -73,49 +74,30 @@ func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts st
 		return 0, err
 	}
 
+	// TTL decision made once: an explicit TTL overrides the default; an
+	// absolute ExpiresAt (with no TTL) takes the absolute INSERT below.
 	ttlSec := store.DurationSec(store.DefaultPublishTTL)
-	switch {
-	case opts.TTL > 0:
+	if opts.TTL > 0 {
 		ttlSec = store.DurationSec(opts.TTL)
-	case !opts.ExpiresAt.IsZero():
-		ttlSec = 0 // absolute path below
 	}
 
 	var messageID int64
-	switch {
-	case opts.TTL > 0:
-		res, err := tx.ExecContext(ctx, `
-			INSERT INTO novaque_messages (topic_id, body, expires_at)
-			VALUES (?, ?, ? + ?)`, topicID, body, nowUnix, ttlSec)
-		if err != nil {
-			return 0, err
-		}
-		messageID, err = res.LastInsertId()
-		if err != nil {
-			return 0, err
-		}
-	case !opts.ExpiresAt.IsZero():
-		res, err := tx.ExecContext(ctx, `
+	var res sql.Result
+	if opts.TTL <= 0 && !opts.ExpiresAt.IsZero() {
+		res, err = tx.ExecContext(ctx, `
 			INSERT INTO novaque_messages (topic_id, body, expires_at) VALUES (?, ?, ?)`,
 			topicID, body, timeToSec(opts.ExpiresAt))
-		if err != nil {
-			return 0, err
-		}
-		messageID, err = res.LastInsertId()
-		if err != nil {
-			return 0, err
-		}
-	default:
-		res, err := tx.ExecContext(ctx, `
+	} else {
+		res, err = tx.ExecContext(ctx, `
 			INSERT INTO novaque_messages (topic_id, body, expires_at)
 			VALUES (?, ?, ? + ?)`, topicID, body, nowUnix, ttlSec)
-		if err != nil {
-			return 0, err
-		}
-		messageID, err = res.LastInsertId()
-		if err != nil {
-			return 0, err
-		}
+	}
+	if err != nil {
+		return 0, err
+	}
+	messageID, err = res.LastInsertId()
+	if err != nil {
+		return 0, err
 	}
 
 	delaySec := store.DelaySec(opts.Delay)

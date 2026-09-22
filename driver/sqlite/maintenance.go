@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"github.com/usual2970/novaque/store"
@@ -42,20 +43,19 @@ func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error)
 
 // PurgeExpired deletes expired deliveries (and orphan messages) to keep the
 // claim index small. Counters need no transaction (they are buffered, not
-// written in-tx): a read-only SELECT captures the doomed batch with its
-// per-channel attribution, the DELETE rechecks eligibility so a mid-batch ack
-// cannot die, and purge deltas are recorded only after the delete succeeds.
-// Attribution comes from the SELECT, so a mid-batch race can over-count purge
-// by a hair — acceptable on a maintenance path.
+// written in-tx): a read-only SELECT captures the doomed batch ids, the
+// DELETE rechecks eligibility and RETURNINGs the per-channel stats
+// coordinates of the rows it actually removed, so purge deltas are exact
+// even when a concurrent admin action deletes or requeues rows between the
+// two statements. Rows that changed state in between survive the guard.
 func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	// Prefer purging by delivery.expires_at (hot-path column); skip valid leases.
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT d.id, d.channel_id, c.topic_id
+		SELECT d.id
 		FROM novaque_deliveries d
-		INNER JOIN novaque_channels c ON c.id = d.channel_id
 		WHERE d.expires_at < `+sqlNow+`
 		  AND (
 		    d.status IN (?, ?)
@@ -67,16 +67,14 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("sqlite: select expired deliveries: %w", err)
 	}
-	counts := make(map[statCoord]int64)
 	var ids []int64
 	for rows.Next() {
-		var id, channelID, topicID int64
-		if err := rows.Scan(&id, &channelID, &topicID); err != nil {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("sqlite: scan expired delivery: %w", err)
 		}
 		ids = append(ids, id)
-		counts[statCoord{topicID: topicID, channelID: channelID}]++
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -87,7 +85,9 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 	if len(ids) > 0 {
 		marks, args := idPlaceholders(ids)
 		// Keep the eligibility conditions in the DELETE so rows that changed
-		// state between SELECT and DELETE survive (mid-batch acks etc.).
+		// state between SELECT and DELETE survive (mid-batch acks etc.). The
+		// RETURNING rows attribute stats only to rows actually deleted, so a
+		// concurrent DeleteDead/RequeueDead cannot inflate purge counts.
 		q := fmt.Sprintf(`
 			DELETE FROM novaque_deliveries
 			WHERE id IN (%s)
@@ -95,13 +95,31 @@ func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
 			  AND (
 			    status IN (?, ?)
 			    OR (status = ? AND (lease_until IS NULL OR lease_until < `+sqlNow+`))
-			  )`, marks)
+			  )`, marks) + statAttribution
 		args = append(args, store.StatusPending, store.StatusDead, store.StatusInFlight)
-		res, err := s.db.ExecContext(ctx, q, args...)
+		delRows, err := s.db.QueryContext(ctx, q, args...)
 		if err != nil {
 			return 0, fmt.Errorf("sqlite: delete expired deliveries: %w", err)
 		}
-		n1, _ = res.RowsAffected()
+		counts := make(map[statCoord]int64)
+		for delRows.Next() {
+			// Topic is SQL NULL when the channel row is missing: the deletion
+			// still counts toward n1, but no stat is recorded for it.
+			var topic sql.NullInt64
+			var channelID int64
+			if err := delRows.Scan(&topic, &channelID); err != nil {
+				delRows.Close()
+				return 0, fmt.Errorf("sqlite: scan purged delivery: %w", err)
+			}
+			n1++
+			if topic.Valid {
+				counts[statCoord{topicID: topic.Int64, channelID: channelID}]++
+			}
+		}
+		delRows.Close()
+		if err := delRows.Err(); err != nil {
+			return 0, fmt.Errorf("sqlite: iterate purged deliveries: %w", err)
+		}
 		for k, n := range counts {
 			s.recordStat(k.topicID, k.channelID, statPurged, n)
 		}

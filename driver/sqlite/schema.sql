@@ -44,6 +44,16 @@ CREATE TABLE IF NOT EXISTS novaque_deliveries (
 CREATE INDEX IF NOT EXISTS idx_novaque_deliveries_claim
 ON novaque_deliveries(channel_id, status, available_at, id);
 
+-- Maintenance ticks must not full-scan the hot table: the partial reap index
+-- holds only leased in_flight rows (the only rows ReapExpiredLeases touches;
+-- status transitions keep it small), and the expires index lets PurgeExpired
+-- seek by expires_at.
+CREATE INDEX IF NOT EXISTS idx_novaque_deliveries_reap
+ON novaque_deliveries(lease_until) WHERE status = 'in_flight';
+
+CREATE INDEX IF NOT EXISTS idx_novaque_deliveries_expires
+ON novaque_deliveries(expires_at);
+
 -- Day-bucket event counters (UTC day; the one non-Unix-second clock on purpose).
 -- channel_id = 0 is the sentinel for topic-only publish rows (zero-channel
 -- publishes); no FK to channels so the sentinel and pruning stay cheap.

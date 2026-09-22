@@ -127,9 +127,9 @@ func (s *Store) runClaimTx(ctx context.Context, channelID int64, owner string, l
 	// Covering-style poll on the ready slice only (Solid Queue ready_executions analogue).
 	// No FOR UPDATE SKIP LOCKED here: SQLite has no row locks and never
 	// implemented that clause in any version. The pending→in_flight UPDATE
-	// below re-checks status, so a concurrent claim with a stale snapshot can
-	// never re-lease; its first write fails SQLITE_BUSY_SNAPSHOT (517) and the
-	// caller retries with a fresh snapshot.
+	// below re-checks status and both time-window predicates, so a concurrent
+	// claim with a stale snapshot can never re-lease; its first write fails
+	// SQLITE_BUSY_SNAPSHOT (517) and the caller retries with a fresh snapshot.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id
 		FROM novaque_deliveries
@@ -167,35 +167,63 @@ func (s *Store) runClaimTx(ctx context.Context, channelID int64, owner string, l
 	// row. Each token is generated in the statement itself:
 	// lower(hex(randomblob(16))) is the same 32-hex-char, 128-bit-per-row
 	// format newLeaseToken produced in Go (randomblob uses SQLite's RNG;
-	// tokens are distinct per row). The status='pending' guard in the WHERE
-	// is the same fencing as before: any commit that changed one of these
-	// rows after this transaction's snapshot invalidates it, so the first
-	// write fails SQLITE_BUSY_SNAPSHOT (517) and the caller retries — a
-	// silent zero-row lease cannot happen on a fresh snapshot.
+	// tokens are distinct per row). The WHERE clause re-checks the full poll
+	// eligibility, not just status. unixepoch() is evaluated afresh by this
+	// statement, and wall time can cross a polled row's expires_at between
+	// the two statements — while this UPDATE waits on the writer lock under
+	// busy_timeout, or during a scheduler stall — so the time predicates must
+	// run again to keep an expired delivery from being leased. expires_at is
+	// NOT NULL and always populated at publish, so the same plain predicate
+	// as the poll suffices. A concurrent commit that changed any of these
+	// rows also invalidates this snapshot: the write then fails
+	// SQLITE_BUSY_SNAPSHOT (517) and the caller retries. RETURNING id yields
+	// exactly the rows actually leased; only those are loaded below.
 	leaseMarks, leaseMarkArgs := idPlaceholders(ids)
 	leaseArgs := make([]any, 0, len(ids)+4)
 	leaseArgs = append(leaseArgs, store.StatusInFlight, owner, leaseSec)
 	leaseArgs = append(leaseArgs, leaseMarkArgs...)
 	leaseArgs = append(leaseArgs, store.StatusPending)
-	res, err := tx.ExecContext(ctx, fmt.Sprintf(`
+	leaseRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		UPDATE novaque_deliveries
 		SET status = ?,
 		    attempts = attempts + 1,
 		    lease_owner = ?,
 		    lease_token = lower(hex(randomblob(16))),
 		    lease_until = `+sqlNow+` + ?
-		WHERE id IN (%s) AND status = ?`, leaseMarks), leaseArgs...)
+		WHERE id IN (%s)
+		  AND status = ?
+		  AND available_at <= `+sqlNow+`
+		  AND expires_at > `+sqlNow+`
+		RETURNING id`, leaseMarks), leaseArgs...)
 	if err != nil {
 		return nil, 0, 0, 0, err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	leased := make(map[int64]struct{}, len(ids))
+	for leaseRows.Next() {
+		var id int64
+		if err := leaseRows.Scan(&id); err != nil {
+			leaseRows.Close()
+			return nil, 0, 0, 0, err
+		}
+		leased[id] = struct{}{}
+	}
+	leaseRows.Close()
+	if err := leaseRows.Err(); err != nil {
+		return nil, 0, 0, 0, err
+	}
+	// Keep poll order (available_at, id): RETURNING does not promise it.
+	claimedIDs := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := leased[id]; ok {
+			claimedIDs = append(claimedIDs, id)
+		}
+	}
+	if len(claimedIDs) == 0 {
 		if err := tx.Commit(); err != nil {
 			return nil, 0, 0, 0, err
 		}
 		return nil, 0, 0, 0, nil
 	}
-	claimedIDs := ids
 
 	marks, args := idPlaceholders(claimedIDs)
 	q := fmt.Sprintf(`
