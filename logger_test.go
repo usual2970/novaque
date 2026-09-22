@@ -63,7 +63,7 @@ func (nopStore) TopicDailyCounters(context.Context, int64, int) ([]store.DailyCo
 func (nopStore) ChannelDailyCounters(context.Context, int64, int) ([]store.DailyCounters, error) {
 	return nil, nil
 }
-func (nopStore) ListDead(context.Context, int64, int64, int) ([]store.DeadDelivery, error) {
+func (nopStore) ListDead(context.Context, int64, int64, int, int) ([]store.DeadDelivery, error) {
 	return nil, nil
 }
 func (nopStore) RequeueDead(context.Context, int64, int64, time.Duration) error { return nil }

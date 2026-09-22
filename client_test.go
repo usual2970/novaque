@@ -80,6 +80,7 @@ type fakeStore struct {
 	lastDeadChannelID   int64
 	lastDeadBefore      int64
 	lastDeadLimit       int
+	lastDeadPrefix      int
 	lastRequeueDeadID   int64
 	lastRequeueDeadChan int64
 	lastRequeueDeadTTL  time.Duration
@@ -367,13 +368,25 @@ func (f *fakeStore) ChannelDailyCounters(_ context.Context, channelID int64, day
 	return f.channelDaily, nil
 }
 
-func (f *fakeStore) ListDead(_ context.Context, channelID int64, before int64, limit int) ([]store.DeadDelivery, error) {
+func (f *fakeStore) ListDead(_ context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]store.DeadDelivery, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastDeadChannelID = channelID
 	f.lastDeadBefore = before
 	f.lastDeadLimit = limit
-	return f.deadRows, nil
+	f.lastDeadPrefix = bodyPrefix
+	// Mirror the store contract (review #13): BodyLen always carries the
+	// true length; a positive prefix caps Body. Return copies so the stored
+	// preset rows are never mutated.
+	rows := make([]store.DeadDelivery, 0, len(f.deadRows))
+	for _, d := range f.deadRows {
+		d.BodyLen = int64(len(d.Body))
+		if bodyPrefix > 0 && len(d.Body) > bodyPrefix {
+			d.Body = d.Body[:bodyPrefix]
+		}
+		rows = append(rows, d)
+	}
+	return rows, nil
 }
 
 func (f *fakeStore) RequeueDead(_ context.Context, deliveryID, channelID int64, freshTTL time.Duration) error {
@@ -1382,7 +1395,7 @@ func TestAdminListMethodsReturnStoreResultsUntransformed(t *testing.T) {
 	presetBacklogs := []store.BacklogRow{{ChannelID: 5, Pending: 7, Ready: 1, InFlight: 2, Dead: 3}}
 	presetTopicDaily := []store.DailyCounters{{Day: time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC), Publish: 4}}
 	presetChannelDaily := []store.DailyCounters{{Day: time.Date(2026, 9, 21, 0, 0, 0, 0, time.UTC), Claim: 6}}
-	presetDead := []store.DeadDelivery{{ID: 9, ChannelID: 5, Body: []byte("poison")}}
+	presetDead := []store.DeadDelivery{{ID: 9, ChannelID: 5, Body: []byte("poison"), BodyLen: 6}}
 	f.mu.Lock()
 	f.backlogs = presetBacklogs
 	f.topicDaily = presetTopicDaily
@@ -1466,7 +1479,7 @@ func TestAdminListMethodsReturnStoreResultsUntransformed(t *testing.T) {
 		t.Fatalf("ChannelDailyCounters %v, want preset %v", daily, presetChannelDaily)
 	}
 
-	dead, err := c.ListDead(ctx, 5, 40, 20)
+	dead, err := c.ListDead(ctx, 5, 40, 20, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1488,8 +1501,8 @@ func TestAdminListMethodsReturnStoreResultsUntransformed(t *testing.T) {
 	if f.lastDailyChannelID != 12 || f.lastDailyChanDays != 3 {
 		t.Fatalf("ChannelDailyCounters saw (%d, %d), want (12, 3)", f.lastDailyChannelID, f.lastDailyChanDays)
 	}
-	if f.lastDeadChannelID != 5 || f.lastDeadBefore != 40 || f.lastDeadLimit != 20 {
-		t.Fatalf("ListDead saw (%d, %d, %d), want (5, 40, 20)", f.lastDeadChannelID, f.lastDeadBefore, f.lastDeadLimit)
+	if f.lastDeadChannelID != 5 || f.lastDeadBefore != 40 || f.lastDeadLimit != 20 || f.lastDeadPrefix != 20 {
+		t.Fatalf("ListDead saw (%d, %d, %d, prefix=%d), want (5, 40, 20, 20)", f.lastDeadChannelID, f.lastDeadBefore, f.lastDeadLimit, f.lastDeadPrefix)
 	}
 }
 
@@ -1511,7 +1524,7 @@ func TestDailyCountersFlushStatsBeforeRead(t *testing.T) {
 	if _, err := c.Backlogs(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.ListDead(ctx, 5, 0, 20); err != nil {
+	if _, err := c.ListDead(ctx, 5, 0, 20, 0); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()

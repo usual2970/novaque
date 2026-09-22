@@ -33,6 +33,7 @@ type countingStore struct {
 	topicDailyCalls     atomic.Int64
 	channelDailyCalls   atomic.Int64
 	listDeadCalls       atomic.Int64
+	lastListDeadPrefix  atomic.Int64
 	requeueDeadCalls    atomic.Int64
 	deleteDeadCalls     atomic.Int64
 	deleteTopicCalls    atomic.Int64
@@ -155,8 +156,9 @@ func (c *countingStore) ChannelDailyCounters(_ context.Context, channelID int64,
 	return []store.DailyCounters{{Day: time.Unix(0, 0).UTC(), Publish: channelID, Claim: int64(days)}}, nil
 }
 
-func (c *countingStore) ListDead(_ context.Context, channelID int64, before int64, limit int) ([]store.DeadDelivery, error) {
+func (c *countingStore) ListDead(_ context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]store.DeadDelivery, error) {
 	c.listDeadCalls.Add(1)
+	c.lastListDeadPrefix.Store(int64(bodyPrefix))
 	return []store.DeadDelivery{{ID: before, ChannelID: channelID, Status: store.StatusDead, Attempts: limit}}, nil
 }
 
@@ -374,7 +376,7 @@ func TestCachingStoreForwardsAdminSurface(t *testing.T) {
 		if _, err := s.ChannelDailyCounters(ctx, 7, 14); err != nil {
 			t.Fatal(err)
 		}
-		dead, err := s.ListDead(ctx, 7, 42, 50)
+		dead, err := s.ListDead(ctx, 7, 42, 50, 33)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -418,6 +420,9 @@ func TestCachingStoreForwardsAdminSurface(t *testing.T) {
 	}
 	if got := inner.lastDeleteDeadChan.Load(); got != 7 {
 		t.Errorf("DeleteDead channelID = %d, want 7 (channel scope forwarded)", got)
+	}
+	if got := inner.lastListDeadPrefix.Load(); got != 33 {
+		t.Errorf("ListDead bodyPrefix = %d, want 33 (prefix forwarded)", got)
 	}
 }
 

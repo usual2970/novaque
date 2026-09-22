@@ -486,10 +486,12 @@ func (c *Client) DeleteChannel(ctx context.Context, channelID int64) error {
 
 // ListDead returns a channel's dead deliveries newest-first, keyset-paginated:
 // before > 0 returns only rows with id < before, and limit bounds the page
-// (non-positive falls back to a driver default). The channel id comes from
-// ListChannels; the read never Ensures (KTD6).
-func (c *Client) ListDead(ctx context.Context, channelID, before int64, limit int) ([]DeadDelivery, error) {
-	rows, err := c.store.ListDead(ctx, channelID, before, limit)
+// (non-positive falls back to a driver default). bodyPrefix > 0 caps each
+// Body at that many bytes while BodyLen keeps the full length (review #13 —
+// list pages never join full LONGBLOBs); <= 0 reads whole bodies. The
+// channel id comes from ListChannels; the read never Ensures (KTD6).
+func (c *Client) ListDead(ctx context.Context, channelID, before int64, limit int, bodyPrefix int) ([]DeadDelivery, error) {
+	rows, err := c.store.ListDead(ctx, channelID, before, limit, bodyPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("novaque list dead: %w", err)
 	}

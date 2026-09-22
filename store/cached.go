@@ -186,9 +186,10 @@ func (c *CachingStore) ChannelDailyCounters(ctx context.Context, channelID int64
 	return c.Inner.ChannelDailyCounters(ctx, channelID, days)
 }
 
-// ListDead passes through to Inner.ListDead.
-func (c *CachingStore) ListDead(ctx context.Context, channelID int64, before int64, limit int) ([]DeadDelivery, error) {
-	return c.Inner.ListDead(ctx, channelID, before, limit)
+// ListDead passes through to Inner.ListDead; dead rows are live state,
+// never cached.
+func (c *CachingStore) ListDead(ctx context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]DeadDelivery, error) {
+	return c.Inner.ListDead(ctx, channelID, before, limit, bodyPrefix)
 }
 
 // RequeueDead passes through to Inner.RequeueDead (channel-scoped mutation,

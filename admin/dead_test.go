@@ -182,8 +182,8 @@ func TestDeadPaginationKeysetWalk(t *testing.T) {
 	if strings.Contains(body, `href="/admin/channels/2/dead/`+strconv.FormatInt(minID, 10)+`"`) {
 		t.Fatal("page 1: oldest delivery leaked into the first page")
 	}
-	if _, before, limit := f.lastDeadListCall(); before != 0 || limit != 51 {
-		t.Fatalf("page 1 store call: before=%d limit=%d, want 0/51 (page probe)", before, limit)
+	if _, before, limit, prefix := f.lastDeadListCall(); before != 0 || limit != 51 || prefix != 4096 {
+		t.Fatalf("page 1 store call: before=%d limit=%d prefix=%d, want 0/51/4096 (page probe, preview-bounded read)", before, limit, prefix)
 	}
 
 	// Walk Older links to the end: no skips, no dupes, cursor carried.
@@ -225,8 +225,8 @@ func TestDeadPaginationKeysetWalk(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("page 2: status = %d, want 200", res.StatusCode)
 	}
-	if _, before, limit := f.lastDeadListCall(); before != maxID-49 || limit != 51 {
-		t.Fatalf("page 2 store call: before=%d limit=%d, want before=%d limit=51", before, limit, maxID-49)
+	if _, before, limit, prefix := f.lastDeadListCall(); before != maxID-49 || limit != 51 || prefix != 4096 {
+		t.Fatalf("page 2 store call: before=%d limit=%d prefix=%d, want before=%d limit=51 prefix=4096", before, limit, prefix, maxID-49)
 	}
 	if !strings.Contains(body, `data-poll="/api/channels/2/dead?before=`+strconv.FormatInt(maxID-49, 10)+`"`) {
 		t.Fatal("page 2: data-poll lacks the before cursor")
@@ -285,6 +285,11 @@ func TestDeadDeliveryFullBodyPage(t *testing.T) {
 	res, body := doGet(t, ts.Client(), ts.URL+"/admin/channels/2/dead/"+strconv.FormatInt(id, 10))
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("full-body page: status = %d, want 200", res.StatusCode)
+	}
+	// The per-delivery read requests whole bodies (prefix 0); only list
+	// reads pass a prefix (review #13).
+	if _, _, _, prefix := f.lastDeadListCall(); prefix != 0 {
+		t.Fatalf("delivery store call: prefix=%d, want 0 (full body)", prefix)
 	}
 	for _, want := range []string{
 		"full-body-view-payload",
@@ -349,8 +354,8 @@ func TestDeadListJSONOmitsBodies(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("dead list json (paged): status = %d", res.StatusCode)
 	}
-	if _, before, _ := f.lastDeadListCall(); before != id {
-		t.Fatalf("paged json store call: before=%d, want %d", before, id)
+	if _, before, _, prefix := f.lastDeadListCall(); before != id || prefix != 4096 {
+		t.Fatalf("paged json store call: before=%d prefix=%d, want %d/4096 (list reads are preview-bounded)", before, prefix, id)
 	}
 	if !strings.Contains(raw, `"dead":[]`) {
 		t.Fatalf("paged json should be empty past the only row: %s", raw)

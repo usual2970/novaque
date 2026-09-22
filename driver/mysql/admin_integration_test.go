@@ -674,7 +674,7 @@ func TestAdminListDeadPagination(t *testing.T) {
 	}
 
 	// Driver default page size.
-	p0, err := s.ListDead(ctx, chID, 0, 0)
+	p0, err := s.ListDead(ctx, chID, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +688,7 @@ func TestAdminListDeadPagination(t *testing.T) {
 	seenSet := make(map[int64]bool)
 	before := int64(0)
 	for {
-		page, err := s.ListDead(ctx, chID, before, 50)
+		page, err := s.ListDead(ctx, chID, before, 50, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -726,7 +726,7 @@ func TestAdminListDeadPagination(t *testing.T) {
 		t.Fatalf("walked %d dead rows, want %d (no skips)", len(seen), total)
 	}
 	// A cursor at or below the oldest dead id returns nothing.
-	if page, err := s.ListDead(ctx, chID, seen[len(seen)-1], 50); err != nil || len(page) != 0 {
+	if page, err := s.ListDead(ctx, chID, seen[len(seen)-1], 50, 0); err != nil || len(page) != 0 {
 		t.Fatalf("below-oldest cursor = %d rows err=%v, want 0", len(page), err)
 	}
 	// The walk's newest row is the highest id in the channel.
@@ -737,6 +737,22 @@ func TestAdminListDeadPagination(t *testing.T) {
 	}
 	if seen[0] != maxID {
 		t.Fatalf("newest walked id = %d, want MAX(id) = %d", seen[0], maxID)
+	}
+
+	// Review #13: a positive bodyPrefix pushes truncation into the read.
+	// Every body is 12 bytes ("deadbody-NNN"), so a prefix-4 page returns
+	// 4-byte Bodies while BodyLen keeps 12 on every row.
+	pref, err := s.ListDead(ctx, chID, 0, 50, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pref) != 50 {
+		t.Fatalf("prefix page = %d rows, want 50", len(pref))
+	}
+	for _, d := range pref {
+		if len(d.Body) != 4 || d.BodyLen != 12 {
+			t.Fatalf("prefix row %d: body=%d bytes bodyLen=%d, want 4/12", d.ID, len(d.Body), d.BodyLen)
+		}
 	}
 }
 
@@ -794,7 +810,7 @@ func TestAdminDeleteDead(t *testing.T) {
 	if n := countRow(t, ctx, db, `SELECT COUNT(*) FROM novaque_deliveries WHERE id = ?`, deadIDs[1]); n != 0 {
 		t.Fatalf("deleted row still present = %d, want 0", n)
 	}
-	left, err := s.ListDead(ctx, chID, 0, 10)
+	left, err := s.ListDead(ctx, chID, 0, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

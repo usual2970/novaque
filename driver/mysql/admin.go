@@ -200,15 +200,26 @@ func (s *Store) dailyCounters(ctx context.Context, whereCol string, id int64, da
 // bounds the page, non-positive falling back to defaultDeadPage. The body is
 // joined per page — this is the one admin surface that carries payloads
 // (R12).
-func (s *Store) ListDead(ctx context.Context, channelID int64, before int64, limit int) ([]store.DeadDelivery, error) {
+func (s *Store) ListDead(ctx context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]store.DeadDelivery, error) {
 	if channelID <= 0 {
 		return nil, fmt.Errorf("mysql admin: invalid channel id %d", channelID)
 	}
 	if limit <= 0 {
 		limit = defaultDeadPage
 	}
+	if bodyPrefix < 0 {
+		bodyPrefix = 0
+	}
+	// The body column is the read's only heavyweight payload, and the polled
+	// list never renders more than a preview (review #13): bodyPrefix > 0
+	// pushes the truncation into the scan itself (LEFT is byte-safe on
+	// LONGBLOB — payloads are opaque bytes, not guaranteed UTF-8), while
+	// OCTET_LENGTH keeps the true size for the truncation marker and
+	// body_bytes fields. bodyPrefix = 0 reads whole bodies (per-delivery
+	// endpoints).
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT d.id, d.message_id, d.channel_id, t.name, c.name, m.body,
+		SELECT d.id, d.message_id, d.channel_id, t.name, c.name,
+		       IF(? = 0, m.body, LEFT(m.body, ?)), OCTET_LENGTH(m.body),
 		       d.status, d.attempts, d.max_attempts, d.available_at, d.expires_at
 		FROM novaque_deliveries d
 		INNER JOIN novaque_messages m ON m.id = d.message_id
@@ -219,7 +230,7 @@ func (s *Store) ListDead(ctx context.Context, channelID int64, before int64, lim
 		  AND (? = 0 OR d.id < ?)
 		ORDER BY d.id DESC
 		LIMIT ?`,
-		channelID, store.StatusDead, before, before, limit)
+		bodyPrefix, bodyPrefix, channelID, store.StatusDead, before, before, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +240,7 @@ func (s *Store) ListDead(ctx context.Context, channelID int64, before int64, lim
 		var d store.DeadDelivery
 		var availableSec, expiresSec int64
 		if err := rows.Scan(
-			&d.ID, &d.MessageID, &d.ChannelID, &d.Topic, &d.Channel, &d.Body,
+			&d.ID, &d.MessageID, &d.ChannelID, &d.Topic, &d.Channel, &d.Body, &d.BodyLen,
 			&d.Status, &d.Attempts, &d.MaxAttempts, &availableSec, &expiresSec,
 		); err != nil {
 			return nil, err

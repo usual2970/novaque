@@ -194,9 +194,14 @@ type DeadDelivery struct {
 	// Topic and Channel are the resolved destination names of the delivery.
 	Topic   string
 	Channel string
-	// Body is the message payload, identical across every channel copy; the
-	// admin list truncates it and a per-delivery read returns it in full.
+	// Body is the message payload, identical across every channel copy. A
+	// list read caps it at the caller's body prefix while a per-delivery
+	// read returns it in full; BodyLen always carries the full length.
 	Body []byte
+	// BodyLen is the payload's true byte length — OCTET_LENGTH of the stored
+	// body — so a prefixed Body can still report its full size and flag the
+	// truncation (review #13: list reads never join full LONGBLOBs).
+	BodyLen int64
 	// Status is always StatusDead here; carried for uniformity with Delivery.
 	Status string
 	// Attempts is the number of claims at death; RequeueDead resets it.
@@ -318,7 +323,11 @@ type Store interface {
 	// ListDead returns a channel's dead deliveries newest-first (id DESC),
 	// keyset-paginated: before > 0 returns only rows with id < before; limit
 	// bounds the page, non-positive falling back to a driver default.
-	ListDead(ctx context.Context, channelID int64, before int64, limit int) ([]DeadDelivery, error)
+	// bodyPrefix > 0 caps each row's Body at that many bytes — pushed into
+	// the read itself (review #13) so a polled list page never pulls the
+	// full LONGBLOB — while BodyLen always carries the full length;
+	// bodyPrefix <= 0 fetches whole bodies.
+	ListDead(ctx context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]DeadDelivery, error)
 
 	// RequeueDead returns one dead delivery of channelID to pending —
 	// attempts reset, lease cleared, available now — writing freshTTL as its

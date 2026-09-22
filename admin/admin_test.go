@@ -58,7 +58,7 @@ type fakeStore struct {
 
 	requeuedDead []int64
 	deletedDead  []int64
-	lastDeadCall [3]int64 // channelID, before, limit of the latest ListDead
+	lastDeadCall [4]int64 // channelID, before, limit, bodyPrefix of the latest ListDead
 
 	failBacklogs    bool
 	failEnsureTopic error
@@ -195,10 +195,10 @@ func (f *fakeStore) deadOps() (requeued, deleted []int64) {
 	return append([]int64{}, f.requeuedDead...), append([]int64{}, f.deletedDead...)
 }
 
-func (f *fakeStore) lastDeadListCall() (channelID, before, limit int64) {
+func (f *fakeStore) lastDeadListCall() (channelID, before, limit, bodyPrefix int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.lastDeadCall[0], f.lastDeadCall[1], f.lastDeadCall[2]
+	return f.lastDeadCall[0], f.lastDeadCall[1], f.lastDeadCall[2], f.lastDeadCall[3]
 }
 
 func (f *fakeStore) topicNames() []string {
@@ -384,11 +384,14 @@ func (f *fakeStore) DeleteChannel(_ context.Context, channelID int64) error {
 }
 
 // ListDead mirrors the store contract: newest-first (id DESC), before > 0
-// keeps only ids strictly below it, limit bounds the page.
-func (f *fakeStore) ListDead(_ context.Context, channelID int64, before int64, limit int) ([]store.DeadDelivery, error) {
+// keeps only ids strictly below it, limit bounds the page, and bodyPrefix > 0
+// caps each returned Body at that many bytes while BodyLen keeps the true
+// full length (review #13 — the handler derives the truncation marker from
+// the pair, so the fake must not re-truncate or leave BodyLen zero).
+func (f *fakeStore) ListDead(_ context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]store.DeadDelivery, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.lastDeadCall = [3]int64{channelID, before, int64(limit)}
+	f.lastDeadCall = [4]int64{channelID, before, int64(limit), int64(bodyPrefix)}
 	if f.failListDead != nil {
 		return nil, f.failListDead
 	}
@@ -396,6 +399,10 @@ func (f *fakeStore) ListDead(_ context.Context, channelID int64, before int64, l
 	for _, d := range f.dead[channelID] {
 		if before > 0 && d.ID >= before {
 			continue
+		}
+		d.BodyLen = int64(len(d.Body))
+		if bodyPrefix > 0 && len(d.Body) > bodyPrefix {
+			d.Body = d.Body[:bodyPrefix]
 		}
 		rows = append(rows, d)
 	}

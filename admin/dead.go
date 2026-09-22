@@ -21,9 +21,11 @@ import (
 const (
 	// deadPageSize is the fixed dead-list page size (R4).
 	deadPageSize = 50
-	// deadBodyTruncate bounds the body preview in the list. Byte truncation
-	// on purpose: payloads are opaque bytes, not guaranteed UTF-8, and the
-	// template's contextual escaping handles whatever the slice contains.
+	// deadBodyTruncate bounds the body preview requested from the store's
+	// list read (review #13 pushes the truncation into SQL, so the list
+	// never joins full LONGBLOBs). Byte truncation on purpose: payloads are
+	// opaque bytes, not guaranteed UTF-8, and the template's contextual
+	// escaping handles whatever the slice contains.
 	deadBodyTruncate = 4096
 )
 
@@ -140,13 +142,18 @@ func deadRemaining(expiresAt time.Time) (remaining string, expired bool) {
 	return left.Round(time.Second).String(), false
 }
 
+// newDeadRowView builds one list/detail row. Truncation already happened in
+// the read: the store returns at most the caller-requested body prefix while
+// BodyLen carries the true length, so the preview marker is derived from the
+// pair — never re-truncated (or discarded) here (review #18).
 func newDeadRowView(d novaque.DeadDelivery) deadRowView {
 	remaining, expired := deadRemaining(d.ExpiresAt)
-	v := deadRowView{
+	return deadRowView{
 		ID:          d.ID,
 		MessageID:   d.MessageID,
 		Body:        string(d.Body),
-		BodyBytes:   len(d.Body),
+		Truncated:   d.BodyLen > int64(len(d.Body)),
+		BodyBytes:   int(d.BodyLen),
 		Attempts:    d.Attempts,
 		MaxAttempts: d.MaxAttempts,
 		Remaining:   remaining,
@@ -154,11 +161,6 @@ func newDeadRowView(d novaque.DeadDelivery) deadRowView {
 		AvailableAt: d.AvailableAt,
 		ExpiresAt:   d.ExpiresAt,
 	}
-	if len(d.Body) > deadBodyTruncate {
-		v.Body = string(d.Body[:deadBodyTruncate])
-		v.Truncated = true
-	}
-	return v
 }
 
 // loadDeadList assembles the list model: channel names plus one page of dead
@@ -169,7 +171,7 @@ func (h *handler) loadDeadList(ctx context.Context, channelID, before int64) (de
 	if err != nil {
 		return deadView{}, err
 	}
-	rows, err := h.client.ListDead(ctx, channelID, before, deadPageSize+1)
+	rows, err := h.client.ListDead(ctx, channelID, before, deadPageSize+1, deadBodyTruncate)
 	if err != nil {
 		return deadView{}, fmt.Errorf("list dead: %w", err)
 	}
@@ -198,15 +200,17 @@ func (h *handler) loadDeadList(ctx context.Context, channelID, before int64) (de
 // loadDeadDelivery fetches one dead delivery with the pagination query the
 // store already exports — before = deliveryID+1 with limit 1 returns the
 // highest dead id <= deliveryID in this channel, so an empty or mismatched
-// row means the delivery is not dead in this channel → errNotFound.
-// (deliveryID+1 at math.MaxInt64 wraps negative, which reads as "no bound":
-// the newest row is still returned, so the trick holds at the boundary.)
+// row means the delivery is not dead in this channel → errNotFound. The
+// bodyPrefix argument is 0: the per-delivery endpoints read the FULL body
+// (only the list passes a prefix, review #13). (deliveryID+1 at
+// math.MaxInt64 wraps negative, which reads as "no bound": the newest row is
+// still returned, so the trick holds at the boundary.)
 func (h *handler) loadDeadDelivery(ctx context.Context, channelID, deliveryID int64) (channelMeta, novaque.DeadDelivery, error) {
 	meta, err := h.resolveChannel(ctx, channelID)
 	if err != nil {
 		return meta, novaque.DeadDelivery{}, err
 	}
-	rows, err := h.client.ListDead(ctx, channelID, deliveryID+1, 1)
+	rows, err := h.client.ListDead(ctx, channelID, deliveryID+1, 1, 0)
 	if err != nil {
 		return meta, novaque.DeadDelivery{}, fmt.Errorf("load dead delivery: %w", err)
 	}
@@ -295,8 +299,10 @@ func (h *handler) pageDeadDelivery(w http.ResponseWriter, r *http.Request) {
 		h.renderError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// newDeadRowView alone: the read fetched the full body (prefix 0), so
+	// BodyLen == len(Body) and the derived Truncated is already false — the
+	// old truncate-then-overwrite dance is gone (review #18).
 	row := newDeadRowView(d)
-	row.Body, row.Truncated = string(d.Body), false // full body: never truncated here
 	v := deadView{
 		ChannelID:   meta.ChannelID,
 		ChannelName: meta.ChannelName,
@@ -500,7 +506,7 @@ func (h *handler) apiDeadDelivery(w http.ResponseWriter, r *http.Request) {
 		Topic:        d.Topic,
 		Channel:      d.Channel,
 		Body:         d.Body,
-		BodyBytes:    len(d.Body),
+		BodyBytes:    int(d.BodyLen),
 		Attempts:     d.Attempts,
 		MaxAttempts:  d.MaxAttempts,
 		AvailableAt:  d.AvailableAt.Format(time.RFC3339),
