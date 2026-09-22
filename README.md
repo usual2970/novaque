@@ -7,8 +7,8 @@ You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. To
 | | |
 |---|---|
 | Topology | topic → channels (multicast); compete within a channel |
-| Durability | rows in MySQL (`SKIP LOCKED`) or SQLite (serializable transactions) |
-| Extensibility | `store.Store` seam — Postgres drivers can plug in later |
+| Durability | rows in MySQL or PostgreSQL (`SKIP LOCKED`) or SQLite (serializable transactions) |
+| Extensibility | `store.Store` seam — MySQL, PostgreSQL, and SQLite drivers all ship |
 | Form | library module, not a long-running service |
 
 ## Install
@@ -17,7 +17,7 @@ You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. To
 go get github.com/usual2970/novaque
 ```
 
-Requires **Go 1.26.5+** and one of the shipped drivers: **MySQL ≥ 8.0.1** (InnoDB) or **SQLite ≥ 3.39.0** (the embedded pure-Go modernc driver bundles a recent SQLite, so no system library is needed).
+Requires **Go 1.26.5+** and one of the shipped drivers: **MySQL ≥ 8.0.1** (InnoDB), **PostgreSQL ≥ 14**, or **SQLite ≥ 3.39.0** (the embedded pure-Go modernc driver bundles a recent SQLite, so no system library is needed).
 
 ## Upgrading to v0.0.7
 
@@ -120,11 +120,47 @@ client, err := novaque.Open(sqlite.New(db), novaque.Options{MaxInFlight: 4})
 
 **Concurrency — different from MySQL.** SQLite has no row locks and never supports `FOR UPDATE SKIP LOCKED` in any version. Competing claim is still multi-process safe: transactions are serializable, the pending→in_flight lease update is status-guarded (`WHERE id=? AND status='pending'`), and stale-snapshot conflicts (`SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`) retry the whole claim transaction. A busy timeout covers ordinary lock waits.
 
-**When not to use SQLite.** It allows **one writer at a time** database-wide, so high-throughput or many-process deployments should stay on MySQL. SQLite is the right fit for embedded/edge/single-node deployments, local tools and demos, and test suites (the SQLite integration tests need no Docker) — not for a fleet of publisher processes.
+**When not to use SQLite.** It allows **one writer at a time** database-wide, so high-throughput or many-process deployments should stay on MySQL or PostgreSQL. SQLite is the right fit for embedded/edge/single-node deployments, local tools and demos, and test suites (the SQLite integration tests need no Docker) — not for a fleet of publisher processes.
+
+## PostgreSQL driver
+
+`driver/postgres` implements the same `store.Store` semantics on **PostgreSQL 14+**: topic→channel fan-out, `FOR UPDATE SKIP LOCKED` claiming, lease/ack, TTL purge, day-bucket stats, and the admin/dead-letter surface behave identically to the MySQL driver. `Migrate` checks `server_version_num` and refuses any server below 14, then applies the embedded schema.
+
+```bash
+go get github.com/jackc/pgx/v5
+```
+
+```go
+import (
+	"database/sql"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/usual2970/novaque"
+	"github.com/usual2970/novaque/driver/postgres"
+)
+
+db, err := sql.Open("pgx",
+	"postgres://user:pass@127.0.0.1:5432/app?sslmode=disable&TimeZone=UTC")
+if err != nil {
+	log.Fatal(err)
+}
+db.SetMaxOpenConns(32)
+
+client, err := novaque.Open(postgres.New(db), novaque.Options{
+	MaxInFlight: 8, // concurrent handlers per consumer
+})
+```
+
+- **DSN.** pgx v5 connection string over `database/sql`. `sslmode=disable` is for local dev only — require TLS (`sslmode=require` or stricter) for any off-host database.
+- **UTC.** Every clock on the hot path is derived server-side (`clock_timestamp()` and `NOW() AT TIME ZONE 'UTC'`), so correctness does not depend on the session time zone; setting `TimeZone=UTC` in the DSN keeps manual inspection and logs aligned.
+- **Case sensitivity.** Unlike MySQL's default utf8mb4 collation, PostgreSQL names are case-sensitive: `Orders` and `orders` are distinct topics.
+- **Connection pool.** Same sizing rule as MySQL: `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroom, and a primary-writable connection (no read replicas) for claim/ack/publish.
+- **Statement timeouts.** Driver transactions set `lock_timeout=5s` and `statement_timeout=30s` locally (the settings revert at commit/rollback), so a maintenance `UPDATE`/`DELETE` cannot wait forever behind a large topic cascade. Autocommit statements issued outside transactions are not covered; set pool-wide defaults with runtime parameters on the connection string (e.g. `?sslmode=disable&lock_timeout=5s&statement_timeout=30s`) or persist them with `ALTER ROLE`/`ALTER DATABASE ... SET lock_timeout`/`statement_timeout`.
 
 ## Documentation
 
-Every exported symbol in `novaque`, `novaque/store`, `novaque/admin`, `novaque/driver/mysql`, and `novaque/driver/sqlite` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
+Every exported symbol in `novaque`, `novaque/store`, `novaque/admin`, `novaque/driver/mysql`, `novaque/driver/postgres`, and `novaque/driver/sqlite` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
 
 ```bash
 go doc github.com/usual2970/novaque.Client
@@ -295,15 +331,17 @@ novaque/
     store.go          # Store interface (dialect-agnostic)
     cached.go         # WithCache — memoize EnsureTopic / EnsureChannel
   driver/mysql/       # MySQL Store + schema.sql
+  driver/postgres/    # PostgreSQL 14+ Store + schema.sql
   driver/sqlite/      # SQLite Store + schema.sql (pure-Go modernc driver)
   admin/              # mountable admin UI + JSON API (stdlib http.Handler)
   cmd/example/        # local HTTP demo: admin UI + publish/subscribe hooks
   cmd/loadtest/       # local publish/consume stress tool
-  internal/testmysql/ # testcontainers helper (MySQL integration tests)
-  internal/testsqlite/ # temp-file helper (SQLite integration tests; no Docker)
+  internal/testmysql/    # testcontainers helper (MySQL integration tests)
+  internal/testpostgres/ # testcontainers helper (PostgreSQL integration tests)
+  internal/testsqlite/   # temp-file helper (SQLite integration tests; no Docker)
 ```
 
-- Domain code talks only to `store.Store`; MySQL SQL/locking stays in `driver/mysql`.
+- Domain code talks only to `store.Store`; dialect SQL/locking stays inside each `driver/` package.
 - `Open` wraps the driver with `store.WithCache` so steady-state publish/subscribe skips name→id round-trips.
 - Claim path uses **channel id** and denormalized `expires_at` on `novaque_deliveries` (no hot-path JOIN).
 - Each consumer runs **one batch poller** + `MaxInFlight` workers (Solid Queue–style), not N independent empty polls.
@@ -313,9 +351,13 @@ novaque/
 ```bash
 go test ./...
 
-# MySQL integration needs Docker; SQLite integration needs none
+# MySQL/PostgreSQL integration need Docker; SQLite integration needs none
 go test -tags=integration ./...
+
+# one dialect at a time
 go test -tags=integration ./driver/sqlite/...
+go test -tags=integration ./driver/postgres/...
+go test -tags=integration ./driver/mysql/...
 ```
 
 ### Example server (admin + publish/subscribe)
@@ -345,6 +387,6 @@ Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
 ## Status / non-goals
 
-Shipped: MySQL and SQLite drivers, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), mountable admin UI (`novaque/admin`), loadtest, complete identifier-first godoc with compile-verified examples.
+Shipped: MySQL, PostgreSQL 14+, and SQLite drivers, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), mountable admin UI (`novaque/admin`), loadtest, complete identifier-first godoc with compile-verified examples.
 
-Not in MVP: Postgres driver, NSQ wire protocol, standalone broker, deferred requeue/backoff.
+Not in MVP: NSQ wire protocol, standalone broker, deferred requeue/backoff.
