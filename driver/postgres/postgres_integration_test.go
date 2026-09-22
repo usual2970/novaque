@@ -1019,3 +1019,366 @@ func TestClaimConcurrentHammer(t *testing.T) {
 		t.Fatalf("want 0 deliveries after acks, got %d", left)
 	}
 }
+
+// TestReapExpiredLeasesRedelivery (AE3, full): Claim with a 1s lease, wait
+// past lease_until, then ReapExpiredLeases resets the row to pending with all
+// lease fields cleared (and does not bump attempts). The ORIGINAL stale token
+// can no longer ack or requeue (both mutations fence on status=in_flight plus
+// token; the row is pending); a fresh Claim redelivers the same message with
+// attempts incremented and the NEW token works. Reap itself records no stats
+// (reap != requeue), mirroring driver/mysql/maintenance.go.
+func TestReapExpiredLeasesRedelivery(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "reapredeliver_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish(ctx, topicID, []byte("job"), store.PublishOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Claim(ctx, chID, "w1", time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 claim, got %d", len(got))
+	}
+	d := got[0]
+	if d.Attempts != 1 {
+		t.Fatalf("first claim attempts = %d, want 1", d.Attempts)
+	}
+	staleToken := d.LeaseToken
+
+	// 2.5s for a 1s lease: DB-second flooring means a shorter sleep can land
+	// on the same DB second as lease_until (same margin as driver/mysql).
+	time.Sleep(2500 * time.Millisecond)
+
+	n, err := s.ReapExpiredLeases(ctx, 100)
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("reap affected %d rows, want >= 1", n)
+	}
+
+	// Back to pending with lease fields cleared; attempts unchanged.
+	var status string
+	var attempts int
+	var availableAt int64
+	var leaseOwner, leaseToken sql.NullString
+	var leaseUntil sql.NullInt64
+	if err := db.QueryRowContext(ctx, `
+		SELECT status, attempts, available_at, lease_owner, lease_token, lease_until
+		FROM novaque_deliveries WHERE id = $1`, d.ID).
+		Scan(&status, &attempts, &availableAt, &leaseOwner, &leaseToken, &leaseUntil); err != nil {
+		t.Fatal(err)
+	}
+	if status != store.StatusPending {
+		t.Fatalf("status = %s, want pending", status)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (reap does not bump attempts)", attempts)
+	}
+	if availableAt > time.Now().Unix() {
+		t.Fatalf("available_at = %d, want <= now", availableAt)
+	}
+	if leaseOwner.Valid || leaseToken.Valid || leaseUntil.Valid {
+		t.Fatalf("lease fields not cleared: owner=%#v token=%#v until=%#v",
+			leaseOwner, leaseToken, leaseUntil)
+	}
+
+	// The ORIGINAL stale token can no longer drive ack/requeue.
+	if err := s.Ack(ctx, d.ID, staleToken); err == nil {
+		t.Fatal("stale-token ack after reap: want error, got nil")
+	}
+	if err := s.Requeue(ctx, d.ID, staleToken, time.Time{}); err == nil {
+		t.Fatal("stale-token requeue after reap: want error, got nil")
+	}
+
+	// Redelivery: same message, attempts incremented, a fresh token.
+	again, err := s.Claim(ctx, chID, "w2", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 {
+		t.Fatalf("redelivery claim got %d rows, want 1", len(again))
+	}
+	if again[0].MessageID != d.MessageID {
+		t.Fatalf("redelivered message %d, want original %d", again[0].MessageID, d.MessageID)
+	}
+	if again[0].Attempts != 2 {
+		t.Fatalf("redelivery attempts = %d, want 2", again[0].Attempts)
+	}
+	if again[0].LeaseToken == "" || again[0].LeaseToken == staleToken {
+		t.Fatalf("redelivery token not refreshed: %q", again[0].LeaseToken)
+	}
+	// The NEW token works.
+	if err := s.Ack(ctx, again[0].ID, again[0].LeaseToken); err != nil {
+		t.Fatalf("new-token ack: %v", err)
+	}
+}
+
+// TestReapExpiredLeasesLimit (limit behavior): five expired leases reaped
+// with limit 2 — per call at most 2 of this channel's rows reset, and the
+// remainder survives as in_flight between calls until drained. Counts are
+// scoped to this channel, so the reaper's global reach over the shared test
+// database cannot perturb them.
+func TestReapExpiredLeasesLimit(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "reaplimit_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const total = 5
+	for i := 0; i < total; i++ {
+		if _, err := s.Publish(ctx, topicID, []byte{byte(i)}, store.PublishOpts{TTL: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Claim(ctx, chID, "w1", time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != total {
+		t.Fatalf("want %d leased, got %d", total, len(got))
+	}
+	time.Sleep(2500 * time.Millisecond)
+
+	pending := int64(0)
+	for rounds := 0; ; rounds++ {
+		if _, err := s.ReapExpiredLeases(ctx, 2); err != nil {
+			t.Fatalf("reap round %d: %v", rounds, err)
+		}
+		newPending := countRow(t, ctx, db, `
+			SELECT COUNT(*) FROM novaque_deliveries
+			WHERE channel_id = $1 AND status = $2`, chID, store.StatusPending)
+		inFlight := countRow(t, ctx, db, `
+			SELECT COUNT(*) FROM novaque_deliveries
+			WHERE channel_id = $1 AND status = $2`, chID, store.StatusInFlight)
+		reaped := newPending - pending
+		if reaped < 0 || reaped > 2 {
+			t.Fatalf("round %d reset %d of this channel's rows, want 0..2", rounds, reaped)
+		}
+		if rounds == 0 {
+			// First batch is capped: at most 2 reset, at least 3 survive.
+			if newPending > 2 {
+				t.Fatalf("first reap reset %d rows, limit is 2", newPending)
+			}
+			if inFlight < 3 {
+				t.Fatalf("remainder after first reap = %d, want >= 3", inFlight)
+			}
+		}
+		pending = newPending
+		if inFlight == 0 {
+			break
+		}
+		if rounds > 10 {
+			t.Fatal("reap did not drain within 11 rounds")
+		}
+	}
+	if pending != total {
+		t.Fatalf("reaped %d rows total, want %d", pending, total)
+	}
+}
+
+// TestPurgeExpiredTTL (AE6): an expired delivery (TTL 1s) is removed by
+// PurgeExpired and afterward is NOT claimable; in the same run a still-valid
+// delivery survives and is claimable. The expired message row is reaped by
+// the orphan-message pass once its delivery is gone; the valid message stays
+// with its delivery.
+func TestPurgeExpiredTTL(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "purgettl_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish(ctx, topicID, []byte("short"), store.PublishOpts{TTL: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish(ctx, topicID, []byte("valid"), store.PublishOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2.6s for a 1s TTL: expires_at floors to publish-second+1, so the DB
+	// clock needs a full extra second of margin to pass it strictly.
+	time.Sleep(2600 * time.Millisecond)
+
+	n, err := s.PurgeExpired(ctx, 100)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("purge removed %d rows, want >= 1", n)
+	}
+
+	// Only the still-valid delivery is claimable.
+	got, err := s.Claim(ctx, chID, "w", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || string(got[0].Body) != "valid" {
+		t.Fatalf("claim after purge = %#v, want one 'valid' delivery", got)
+	}
+
+	// One delivery left (the valid one); the expired message row was removed
+	// by the orphan pass, the valid message survives with its delivery.
+	if left := countRow(t, ctx, db, `
+		SELECT COUNT(*) FROM novaque_deliveries WHERE channel_id = $1`, chID); left != 1 {
+		t.Fatalf("deliveries after purge = %d, want 1", left)
+	}
+	if msgs := countRow(t, ctx, db, `
+		SELECT COUNT(*) FROM novaque_messages WHERE topic_id = $1`, topicID); msgs != 1 {
+		t.Fatalf("messages after purge = %d, want 1", msgs)
+	}
+	if err := s.Ack(ctx, got[0].ID, got[0].LeaseToken); err != nil {
+		t.Fatalf("final ack: %v", err)
+	}
+}
+
+// TestPurgeExpiredLimit (limit behavior): five expired deliveries purged
+// with limit 2 — per call at most 2 of this channel's rows are deleted and
+// the remainder survives between calls until drained. Each delivery's
+// message becomes an orphan and is removed by the same call's orphan pass,
+// so message and delivery counts for this topic stay in lockstep. Counts are
+// scoped to this channel/topic.
+func TestPurgeExpiredLimit(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "purgelimit_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const total = 5
+	for i := 0; i < total; i++ {
+		if _, err := s.Publish(ctx, topicID, []byte{byte(i)}, store.PublishOpts{TTL: time.Second}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(2600 * time.Millisecond)
+
+	remaining := int64(total)
+	for rounds := 0; ; rounds++ {
+		if _, err := s.PurgeExpired(ctx, 2); err != nil {
+			t.Fatalf("purge round %d: %v", rounds, err)
+		}
+		left := countRow(t, ctx, db, `
+			SELECT COUNT(*) FROM novaque_deliveries WHERE channel_id = $1`, chID)
+		msgs := countRow(t, ctx, db, `
+			SELECT COUNT(*) FROM novaque_messages WHERE topic_id = $1`, topicID)
+		gone := remaining - left
+		if gone < 0 || gone > 2 {
+			t.Fatalf("round %d deleted %d of this channel's rows, want 0..2", rounds, gone)
+		}
+		if msgs != left {
+			t.Fatalf("round %d: messages = %d but deliveries = %d (orphan pass mismatch)",
+				rounds, msgs, left)
+		}
+		if rounds == 0 {
+			// First batch capped: at most 2 deleted, at least 3 survive.
+			if left < 3 {
+				t.Fatalf("remainder after first purge = %d, want >= 3", left)
+			}
+		}
+		remaining = left
+		if left == 0 {
+			break
+		}
+		if rounds > 10 {
+			t.Fatal("purge did not drain within 11 rounds")
+		}
+	}
+}
+
+// TestMaintenanceEdgeDefaultsAndErrors covers happy/edge/error paths: a
+// non-positive limit defaults without error while this channel's live row is
+// untouched (no expired lease, no expired TTL), and both methods surface an
+// error when the database handle is closed.
+func TestMaintenanceEdgeDefaultsAndErrors(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "maintedge_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish(ctx, topicID, []byte("live"), store.PublishOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default-limit path; this channel owns no qualifying row. The reaper is
+	// global, so the fate of this channel's single row is pinned directly
+	// rather than asserting a global zero count.
+	if _, err := s.ReapExpiredLeases(ctx, 0); err != nil {
+		t.Fatalf("reap with default limit on clean channel: %v", err)
+	}
+	if left := countRow(t, ctx, db, `
+		SELECT COUNT(*) FROM novaque_deliveries
+		WHERE channel_id = $1 AND status = $2`, chID, store.StatusPending); left != 1 {
+		t.Fatalf("reap touched the live row; pending left = %d, want 1", left)
+	}
+	if _, err := s.PurgeExpired(ctx, -1); err != nil {
+		t.Fatalf("purge with default limit on clean channel: %v", err)
+	}
+	if left := countRow(t, ctx, db, `
+		SELECT COUNT(*) FROM novaque_deliveries WHERE channel_id = $1`, chID); left != 1 {
+		t.Fatalf("purge touched the live row; left = %d, want 1", left)
+	}
+
+	// Error path: closed handle.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReapExpiredLeases(ctx, 10); err == nil {
+		t.Fatal("reap on closed db: want error, got nil")
+	}
+	if _, err := s.PurgeExpired(ctx, 10); err == nil {
+		t.Fatal("purge on closed db: want error, got nil")
+	}
+}

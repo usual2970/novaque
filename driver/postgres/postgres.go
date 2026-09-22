@@ -324,16 +324,6 @@ func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts st
 	return messageID, nil
 }
 
-// ReapExpiredLeases resets in_flight rows whose lease_until is in the past.
-func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error) {
-	return 0, errNotImplemented("ReapExpiredLeases")
-}
-
-// PurgeExpired deletes expired messages and their non-live deliveries.
-func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
-	return 0, errNotImplemented("PurgeExpired")
-}
-
 // ChannelCounters sums the retained day-bucket event counters for one channel.
 func (s *Store) ChannelCounters(ctx context.Context, channelID int64) (store.ChannelCounters, error) {
 	return store.ChannelCounters{}, errNotImplemented("ChannelCounters")
