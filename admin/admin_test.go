@@ -799,9 +799,9 @@ func TestTrendZeroFillsEveryDay(t *testing.T) {
 	if !strings.Contains(body, `contrib-cell--l`) {
 		t.Fatal("heatmap missing intensity level classes")
 	}
-	// Seeded publish max 8 → today (5) should not be level 0.
-	if !strings.Contains(body, `contrib-cell--l2`) && !strings.Contains(body, `contrib-cell--l3`) {
-		t.Fatal("heatmap should show non-zero publish intensity for seeded counters")
+	// Seeded publish max 8 (below scale floor) → busiest day is l1, not l0.
+	if !strings.Contains(body, `contrib-cell--l1"`) {
+		t.Fatal("heatmap should show l1 for seeded publish counts under scale floor")
 	}
 	if got := strings.Count(body, `class="day-row"`); got != 30 {
 		t.Fatalf("counter table rows = %d, want 30 (zero-filled window)", got)

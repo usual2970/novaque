@@ -13,12 +13,14 @@ func TestPublishLevel(t *testing.T) {
 		want         int
 	}{
 		{0, 10, 0},
-		{1, 10, 1},
-		{3, 10, 2},
-		{5, 10, 2},
-		{6, 10, 3},
-		{10, 10, 4},
-		{100, 100, 4},
+		{1, 1000, 1},
+		{2, 2, 1}, // quiet row: scaled against floor, not l4
+		{500, 500, 2},
+		{500, 5000, 1},
+		{2500, 5000, 2},
+		{5000, 5000, 4},
+		{10_000, 10_000, 4},
+		{100_000, 100_000, 4},
 	}
 	for _, tc := range tests {
 		if got := publishLevel(tc.publish, tc.max); got != tc.want {

@@ -33,6 +33,11 @@ type metricDef struct {
 	value func(dayView) int64
 }
 
+// heatmapScaleFloor avoids mapping a tiny row max (e.g. 2) to l4 when that day
+// is only the busiest among quiet days. Rows whose 30-day max meets or exceeds
+// the floor use pure relative quartiles against that max.
+const heatmapScaleFloor int64 = 1000
+
 var heatmapMetrics = []metricDef{
 	{"publish", "Publish", func(d dayView) int64 { return d.Publish }},
 	{"claim", "Claim", func(d dayView) int64 { return d.Claim }},
@@ -42,12 +47,18 @@ var heatmapMetrics = []metricDef{
 	{"dead", "Dead", func(d dayView) int64 { return d.Dead }},
 }
 
-// counterLevel maps a count to heat intensity 0–4 (quartiles vs window max).
+// counterLevel maps a count to heat intensity 0–4 (quartiles). Uses the row
+// max when it is at least heatmapScaleFloor; otherwise scales against the
+// floor so low-volume rows stay subdued.
 func counterLevel(value, max int64) int {
 	if value <= 0 || max <= 0 {
 		return 0
 	}
-	lvl := int((value*4 + max - 1) / max)
+	scale := max
+	if scale < heatmapScaleFloor {
+		scale = heatmapScaleFloor
+	}
+	lvl := int((value*4 + scale - 1) / scale)
 	if lvl < 1 {
 		return 1
 	}
