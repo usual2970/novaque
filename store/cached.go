@@ -2,16 +2,22 @@ package store
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 )
 
 // CachingStore memos EnsureTopic / EnsureChannel results around an inner Store.
-// Topic and channel ids are immutable once created, so no invalidation is needed
-// until a future delete API exists. Wrap at Open so all drivers share the cache.
+// Topic and channel ids are immutable once created, so entries never go stale
+// while the rows exist; the admin delete API is the one source of staleness,
+// and it is handled: DeleteTopic / DeleteChannel sweep every memoized entry
+// resolving to the deleted id before forwarding, and InvalidateTopicID /
+// InvalidateChannelID evict entries explicitly (the Client publish self-heal
+// after ErrTopicGone). Wrap at Open so all drivers share the cache.
 // The caches are sync.Maps, so a CachingStore is safe for concurrent use;
-// stats reads, backlog counts, and prune always pass straight through to
-// Inner because counters and delivery rows mutate constantly.
+// every other call — mutations, stats reads, backlog counts, prune, flush,
+// and the whole admin surface — passes straight through to Inner because
+// counters and delivery rows mutate constantly.
 type CachingStore struct {
 	// Inner is the wrapped Store; every non-cached call lands here.
 	Inner Store
@@ -135,4 +141,117 @@ func (c *CachingStore) PruneStats(ctx context.Context, retentionDays int) (int64
 // counter deltas.
 func (c *CachingStore) FlushStats(ctx context.Context) error {
 	return c.Inner.FlushStats(ctx)
+}
+
+// --- Admin surface (mountable admin UI): pure passthrough, never memoized
+// (plan 004 R7 posture — live listings, counters, and dead rows mutate
+// constantly), with cache sweeps on the two delete paths. ---
+
+// ListTopics passes through to Inner.ListTopics.
+func (c *CachingStore) ListTopics(ctx context.Context) ([]TopicInfo, error) {
+	return c.Inner.ListTopics(ctx)
+}
+
+// ListChannels passes through to Inner.ListChannels.
+func (c *CachingStore) ListChannels(ctx context.Context) ([]ChannelInfo, error) {
+	return c.Inner.ListChannels(ctx)
+}
+
+// Backlogs passes through to Inner.Backlogs; backlog is a live count, never
+// cached.
+func (c *CachingStore) Backlogs(ctx context.Context) ([]BacklogRow, error) {
+	return c.Inner.Backlogs(ctx)
+}
+
+// TopicDailyCounters passes through to Inner.TopicDailyCounters; never cached
+// (see ChannelCounters).
+func (c *CachingStore) TopicDailyCounters(ctx context.Context, topicID int64, days int) ([]DailyCounters, error) {
+	return c.Inner.TopicDailyCounters(ctx, topicID, days)
+}
+
+// ChannelDailyCounters passes through to Inner.ChannelDailyCounters; never
+// cached (see ChannelCounters).
+func (c *CachingStore) ChannelDailyCounters(ctx context.Context, channelID int64, days int) ([]DailyCounters, error) {
+	return c.Inner.ChannelDailyCounters(ctx, channelID, days)
+}
+
+// ListDead passes through to Inner.ListDead.
+func (c *CachingStore) ListDead(ctx context.Context, channelID int64, before int64, limit int) ([]DeadDelivery, error) {
+	return c.Inner.ListDead(ctx, channelID, before, limit)
+}
+
+// RequeueDead passes through to Inner.RequeueDead.
+func (c *CachingStore) RequeueDead(ctx context.Context, deliveryID int64, freshTTL time.Duration) error {
+	return c.Inner.RequeueDead(ctx, deliveryID, freshTTL)
+}
+
+// DeleteDead passes through to Inner.DeleteDead.
+func (c *CachingStore) DeleteDead(ctx context.Context, deliveryID int64) error {
+	return c.Inner.DeleteDead(ctx, deliveryID)
+}
+
+// DeleteTopic evicts this process's memoized ids for the topic — its name
+// entry plus every channel entry under it (R11: the deleting process must not
+// keep publishing or subscribing against the stale id) — before forwarding to
+// Inner.DeleteTopic. Topic names cannot contain \x00 (driver name rules), so
+// a topicName\x00 channel-key prefix cannot straddle two topics.
+func (c *CachingStore) DeleteTopic(ctx context.Context, topicID int64) error {
+	var prefixes []string
+	c.topics.Range(func(name, id any) bool {
+		if id.(int64) == topicID {
+			c.topics.Delete(name)
+			prefixes = append(prefixes, name.(string)+"\x00")
+		}
+		return true
+	})
+	if len(prefixes) > 0 {
+		c.channels.Range(func(key, _ any) bool {
+			for _, p := range prefixes {
+				if strings.HasPrefix(key.(string), p) {
+					c.channels.Delete(key)
+					break
+				}
+			}
+			return true
+		})
+	}
+	return c.Inner.DeleteTopic(ctx, topicID)
+}
+
+// DeleteChannel evicts this process's memoized channel entries resolving to
+// channelID before forwarding to Inner.DeleteChannel; entries for sibling
+// channels and the topic itself are untouched.
+func (c *CachingStore) DeleteChannel(ctx context.Context, channelID int64) error {
+	c.channels.Range(func(key, id any) bool {
+		if id.(int64) == channelID {
+			c.channels.Delete(key)
+		}
+		return true
+	})
+	return c.Inner.DeleteChannel(ctx, channelID)
+}
+
+// InvalidateTopicID drops the memoized topic name→id entry resolving to
+// topicID, if present. It is the eviction half of the Client.Publish
+// self-heal after ErrTopicGone — only Client knows the topic name to
+// re-Ensure, so the retry lives there. A no-op for unknown ids; channel
+// entries are not its concern (DeleteTopic sweeps those on real deletes).
+func (c *CachingStore) InvalidateTopicID(topicID int64) {
+	c.topics.Range(func(name, id any) bool {
+		if id.(int64) == topicID {
+			c.topics.Delete(name)
+		}
+		return true
+	})
+}
+
+// InvalidateChannelID drops the memoized channel entry resolving to
+// channelID, if present; a no-op for unknown ids.
+func (c *CachingStore) InvalidateChannelID(channelID int64) {
+	c.channels.Range(func(key, id any) bool {
+		if id.(int64) == channelID {
+			c.channels.Delete(key)
+		}
+		return true
+	})
 }

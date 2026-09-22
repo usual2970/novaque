@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -12,6 +13,22 @@ const (
 	StatusPending  = "pending"
 	StatusInFlight = "in_flight"
 	StatusDead     = "dead"
+)
+
+// Sentinel errors shared across drivers: drivers map dialect-specific
+// conditions onto them so callers stay dialect-agnostic.
+var (
+	// ErrTopicGone is returned by Publish when the resolved topic id no
+	// longer exists — another process deleted the topic after this process
+	// memoized or resolved the id. Callers may evict the id, re-Ensure the
+	// name (re-creating the topic), and retry; Client.Publish does exactly
+	// that once.
+	ErrTopicGone = errors.New("novaque: topic no longer exists")
+	// ErrDeadGone is returned by RequeueDead and DeleteDead when the
+	// status = 'dead' guard matched no row — the delivery was already
+	// requeued, deleted, or never dead. A second call is idempotent-safe;
+	// admin surfaces may map it to success.
+	ErrDeadGone = errors.New("novaque: dead delivery no longer exists")
 )
 
 // Delivery is one channel's copy of a published message, possibly claimed.
@@ -100,6 +117,100 @@ type ChannelBacklog struct {
 	Dead int64
 }
 
+// TopicInfo is one topic row for the admin listing surface. Admin reads are
+// ID-addressed and never create rows (no Ensure on read).
+type TopicInfo struct {
+	// ID is the numeric topic id every ID-addressed admin call uses.
+	ID int64
+	// Name is the topic's unique name.
+	Name string
+}
+
+// ChannelInfo is one channel row from the all-channels listing; TopicID lets
+// the UI group channels under their topic without a second query.
+type ChannelInfo struct {
+	// ID is the numeric channel id every ID-addressed admin call uses.
+	ID int64
+	// TopicID is the owning topic's id.
+	TopicID int64
+	// Name is the channel's name, unique within its topic.
+	Name string
+}
+
+// BacklogRow is one channel's live backlog snapshot from the batched
+// all-channels query; the counts mirror ChannelBacklog's. Rows appear only
+// for channels with at least one delivery — callers zero-fill the rest
+// against ListChannels.
+type BacklogRow struct {
+	// ChannelID identifies the channel the counts belong to.
+	ChannelID int64
+	// Pending counts deliveries waiting to be claimed, including delayed
+	// ones not yet due and TTL-expired rows not yet purged.
+	Pending int64
+	// Ready is the claimable slice of Pending: due now and not expired.
+	Ready int64
+	// InFlight counts deliveries currently leased to a handler.
+	InFlight int64
+	// Dead counts deliveries that exceeded MaxAttempts.
+	Dead int64
+}
+
+// DailyCounters is one retained UTC day bucket of the event counters; the
+// fields carry the same meanings as in ChannelCounters, scoped to one day.
+// Only days with recorded rows are returned — zero-filling the window is the
+// caller's job.
+type DailyCounters struct {
+	// Day is the bucket's UTC midnight; drivers return it in UTC.
+	Day time.Time
+	// Publish counts deliveries created by fan-out this day, one per publish
+	// per channel (see ChannelCounters.Publish).
+	Publish int64
+	// Claim counts successful claims this day, including the final claim
+	// that terminalizes a poisoned delivery (see ChannelCounters.Claim).
+	Claim int64
+	// Ack counts deliveries completed by an ack this day.
+	Ack int64
+	// Requeue counts handler-driven requeues this day, including dead-letter
+	// requeues from the admin surface; lease reaps never count (see
+	// ChannelCounters.Requeue).
+	Requeue int64
+	// Dead counts deliveries that exceeded MaxAttempts this day.
+	Dead int64
+	// Purge counts deliveries removed by TTL purge this day (manual
+	// dead-letter deletions count here too — KTD8).
+	Purge int64
+}
+
+// DeadDelivery is one dead delivery row for the admin dead-letter browse —
+// the only admin surface that carries message bodies (R12).
+type DeadDelivery struct {
+	// ID identifies the delivery row; requeue and delete address it directly.
+	ID int64
+	// MessageID identifies the shared message row this delivery fanned out
+	// from.
+	MessageID int64
+	// ChannelID is the numeric id of the channel the delivery belongs to.
+	ChannelID int64
+	// Topic and Channel are the resolved destination names of the delivery.
+	Topic   string
+	Channel string
+	// Body is the message payload, identical across every channel copy; the
+	// admin list truncates it and a per-delivery read returns it in full.
+	Body []byte
+	// Status is always StatusDead here; carried for uniformity with Delivery.
+	Status string
+	// Attempts is the number of claims at death; RequeueDead resets it.
+	Attempts int
+	// MaxAttempts is the claim cap that was exceeded.
+	MaxAttempts int
+	// AvailableAt is the earliest claim time recorded on the row, on the
+	// database clock.
+	AvailableAt time.Time
+	// ExpiresAt is the delivery's TTL expiry on the database clock; the dead
+	// list renders remaining TTL from it and RequeueDead writes a fresh one.
+	ExpiresAt time.Time
+}
+
 // Store is the persistence seam used by Client, Consumer, and maintenance loops.
 // Method names must stay dialect-agnostic (no SKIP LOCKED / MySQL identifiers).
 type Store interface {
@@ -166,4 +277,63 @@ type Store interface {
 	// instead of writing counters inside mutation transactions; a no-op
 	// return is valid when nothing is buffered.
 	FlushStats(ctx context.Context) error
+
+	// --- Admin surface (mountable admin UI). Listing and detail reads are
+	// ID-addressed and never create rows — no Ensure on read — and backlog /
+	// counter reads are batched, never per-channel N+1. ---
+
+	// ListTopics returns every topic, ascending by name.
+	ListTopics(ctx context.Context) ([]TopicInfo, error)
+
+	// ListChannels returns every channel across all topics — each carrying
+	// TopicID — ordered by topic name then channel name, so the UI can group
+	// without re-sorting.
+	ListChannels(ctx context.Context) ([]ChannelInfo, error)
+
+	// Backlogs returns live per-channel backlog counts for every channel in
+	// one query. Rows appear only for channels with at least one delivery;
+	// callers zero-fill the rest against ListChannels.
+	Backlogs(ctx context.Context) ([]BacklogRow, error)
+
+	// TopicDailyCounters returns the retained day-bucket counter rows for a
+	// topic — its per-channel rows plus the zero-channel sentinel row rolled
+	// up per day — over the trailing days-day UTC window ending today (day
+	// boundary from the DB clock). Existing-day rows only, ascending by day;
+	// zero-filling the window is the caller's job. days must be >= 1.
+	TopicDailyCounters(ctx context.Context, topicID int64, days int) ([]DailyCounters, error)
+
+	// ChannelDailyCounters returns the retained day-bucket counter rows for
+	// one channel over the trailing days-day UTC window ending today (day
+	// boundary from the DB clock). Existing-day rows only, ascending by day;
+	// zero-filling the window is the caller's job. days must be >= 1.
+	ChannelDailyCounters(ctx context.Context, channelID int64, days int) ([]DailyCounters, error)
+
+	// ListDead returns a channel's dead deliveries newest-first (id DESC),
+	// keyset-paginated: before > 0 returns only rows with id < before; limit
+	// bounds the page, non-positive falling back to a driver default.
+	ListDead(ctx context.Context, channelID int64, before int64, limit int) ([]DeadDelivery, error)
+
+	// RequeueDead returns one dead delivery to pending — attempts reset,
+	// lease cleared, available now — writing freshTTL as its new expiry on
+	// both the delivery and its message. Guarded on status = dead:
+	// ErrDeadGone is returned when no dead row matched (already requeued or
+	// deleted), so retries land as idempotent success.
+	RequeueDead(ctx context.Context, deliveryID int64, freshTTL time.Duration) error
+
+	// DeleteDead removes one dead delivery; the shared message row is
+	// reclaimed by the orphan purge once its sibling deliveries are gone.
+	// Guarded on status = dead: ErrDeadGone when no dead row matched.
+	DeleteDead(ctx context.Context, deliveryID int64) error
+
+	// DeleteTopic removes the topic and everything under it — channels,
+	// messages, deliveries, and retained stats rows including the
+	// zero-channel sentinel — in one transaction. Idempotent: deleting an
+	// already-deleted id succeeds as a no-op.
+	DeleteTopic(ctx context.Context, topicID int64) error
+
+	// DeleteChannel removes one channel's deliveries and stats rows in one
+	// transaction, keeping the shared message rows so sibling channels keep
+	// their deliveries; orphans are reclaimed by the orphan purge.
+	// Idempotent: deleting an already-deleted id succeeds as a no-op.
+	DeleteChannel(ctx context.Context, channelID int64) error
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -242,6 +243,85 @@ func (f *fakeStore) FlushStats(context.Context) error {
 		return errors.New("flush boom")
 	}
 	f.flushN++
+	return nil
+}
+
+// Admin surface (mountable admin UI plan U1): listings and deletes are
+// minimal in-memory implementations over the maps; backlog, daily counters,
+// and dead ops are zero-value stubs. Reads never create rows.
+func (f *fakeStore) ListTopics(_ context.Context) ([]store.TopicInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.TopicInfo
+	for name, id := range f.topics {
+		out = append(out, store.TopicInfo{ID: id, Name: name})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (f *fakeStore) ListChannels(_ context.Context) ([]store.ChannelInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.ChannelInfo
+	for tName, chans := range f.channels {
+		topicID := f.topics[tName]
+		for cName, id := range chans {
+			out = append(out, store.ChannelInfo{ID: id, TopicID: topicID, Name: cName})
+		}
+	}
+	// Topic ids ascend with creation, so (TopicID, Name) is a stable stand-in
+	// for the contract's topic-name-then-channel-name order.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TopicID != out[j].TopicID {
+			return out[i].TopicID < out[j].TopicID
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+func (f *fakeStore) Backlogs(context.Context) ([]store.BacklogRow, error) {
+	return nil, nil // the fake tracks no delivery rows
+}
+
+func (f *fakeStore) TopicDailyCounters(context.Context, int64, int) ([]store.DailyCounters, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) ChannelDailyCounters(context.Context, int64, int) ([]store.DailyCounters, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) ListDead(context.Context, int64, int64, int) ([]store.DeadDelivery, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) RequeueDead(context.Context, int64, time.Duration) error { return nil }
+func (f *fakeStore) DeleteDead(context.Context, int64) error                 { return nil }
+
+func (f *fakeStore) DeleteTopic(_ context.Context, topicID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for name, id := range f.topics {
+		if id == topicID {
+			delete(f.topics, name)
+			delete(f.channels, name)
+		}
+	}
+	return nil
+}
+
+func (f *fakeStore) DeleteChannel(_ context.Context, channelID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, chans := range f.channels {
+		for cName, id := range chans {
+			if id == channelID {
+				delete(chans, cName)
+			}
+		}
+	}
 	return nil
 }
 

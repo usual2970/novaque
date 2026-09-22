@@ -45,6 +45,29 @@ func (nopStore) ChannelBacklog(context.Context, int64) (store.ChannelBacklog, er
 func (nopStore) PruneStats(context.Context, int) (int64, error) { return 0, nil }
 func (nopStore) FlushStats(context.Context) error               { return nil }
 
+// Admin surface (mountable admin UI plan U1): zero-value stubs — nopStore
+// only backs logger wiring tests and never exercises them.
+func (nopStore) ListTopics(context.Context) ([]store.TopicInfo, error) {
+	return nil, nil
+}
+func (nopStore) ListChannels(context.Context) ([]store.ChannelInfo, error) {
+	return nil, nil
+}
+func (nopStore) Backlogs(context.Context) ([]store.BacklogRow, error) { return nil, nil }
+func (nopStore) TopicDailyCounters(context.Context, int64, int) ([]store.DailyCounters, error) {
+	return nil, nil
+}
+func (nopStore) ChannelDailyCounters(context.Context, int64, int) ([]store.DailyCounters, error) {
+	return nil, nil
+}
+func (nopStore) ListDead(context.Context, int64, int64, int) ([]store.DeadDelivery, error) {
+	return nil, nil
+}
+func (nopStore) RequeueDead(context.Context, int64, time.Duration) error { return nil }
+func (nopStore) DeleteDead(context.Context, int64) error                 { return nil }
+func (nopStore) DeleteTopic(context.Context, int64) error                { return nil }
+func (nopStore) DeleteChannel(context.Context, int64) error              { return nil }
+
 // nopStore must keep satisfying the full Store contract, stats included
 // (U4 fake completeness check).
 var _ store.Store = nopStore{}

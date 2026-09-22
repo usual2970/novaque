@@ -22,6 +22,25 @@ type countingStore struct {
 	backlogCalls         atomic.Int64
 	pruneCalls           atomic.Int64
 	flushCalls           atomic.Int64
+
+	// Admin surface (U1): every method counts one inner call per outer call;
+	// mutations capture their id/ttl arguments so forwarding tests can assert
+	// the values actually reached the inner Store.
+	listTopicsCalls     atomic.Int64
+	listChannelsCalls   atomic.Int64
+	backlogsCalls       atomic.Int64
+	topicDailyCalls     atomic.Int64
+	channelDailyCalls   atomic.Int64
+	listDeadCalls       atomic.Int64
+	requeueDeadCalls    atomic.Int64
+	deleteDeadCalls     atomic.Int64
+	deleteTopicCalls    atomic.Int64
+	deleteChannelCalls  atomic.Int64
+	lastRequeueID       atomic.Int64
+	lastRequeueTTL      atomic.Int64
+	lastDeleteDeadID    atomic.Int64
+	lastDeleteTopicID   atomic.Int64
+	lastDeleteChannelID atomic.Int64
 }
 
 func newCounting() *countingStore {
@@ -88,6 +107,73 @@ func (c *countingStore) PruneStats(_ context.Context, retentionDays int) (int64,
 }
 func (c *countingStore) FlushStats(context.Context) error {
 	c.flushCalls.Add(1)
+	return nil
+}
+
+// topicID returns the id inner assigned to name, or -1 when unknown.
+func (c *countingStore) topicID(name string) int64 {
+	v, ok := c.topics.Load(name)
+	if !ok {
+		return -1
+	}
+	return v.(int64)
+}
+
+// Admin surface (U1): reads return recognizable rows derived from their
+// arguments; mutations record their id/ttl so forwarding tests can pin both
+// the call count and the exact values that reached inner.
+func (c *countingStore) ListTopics(context.Context) ([]store.TopicInfo, error) {
+	c.listTopicsCalls.Add(1)
+	return []store.TopicInfo{{ID: 1, Name: "counted"}}, nil
+}
+
+func (c *countingStore) ListChannels(context.Context) ([]store.ChannelInfo, error) {
+	c.listChannelsCalls.Add(1)
+	return []store.ChannelInfo{{ID: 2, TopicID: 1, Name: "counted"}}, nil
+}
+
+func (c *countingStore) Backlogs(context.Context) ([]store.BacklogRow, error) {
+	c.backlogsCalls.Add(1)
+	return []store.BacklogRow{{ChannelID: 7, Pending: 11, Ready: 5, InFlight: 3, Dead: 2}}, nil
+}
+
+func (c *countingStore) TopicDailyCounters(_ context.Context, topicID int64, days int) ([]store.DailyCounters, error) {
+	c.topicDailyCalls.Add(1)
+	return []store.DailyCounters{{Day: time.Unix(0, 0).UTC(), Publish: topicID, Claim: int64(days)}}, nil
+}
+
+func (c *countingStore) ChannelDailyCounters(_ context.Context, channelID int64, days int) ([]store.DailyCounters, error) {
+	c.channelDailyCalls.Add(1)
+	return []store.DailyCounters{{Day: time.Unix(0, 0).UTC(), Publish: channelID, Claim: int64(days)}}, nil
+}
+
+func (c *countingStore) ListDead(_ context.Context, channelID int64, before int64, limit int) ([]store.DeadDelivery, error) {
+	c.listDeadCalls.Add(1)
+	return []store.DeadDelivery{{ID: before, ChannelID: channelID, Status: store.StatusDead, Attempts: limit}}, nil
+}
+
+func (c *countingStore) RequeueDead(_ context.Context, deliveryID int64, freshTTL time.Duration) error {
+	c.requeueDeadCalls.Add(1)
+	c.lastRequeueID.Store(deliveryID)
+	c.lastRequeueTTL.Store(int64(freshTTL))
+	return nil
+}
+
+func (c *countingStore) DeleteDead(_ context.Context, deliveryID int64) error {
+	c.deleteDeadCalls.Add(1)
+	c.lastDeleteDeadID.Store(deliveryID)
+	return nil
+}
+
+func (c *countingStore) DeleteTopic(_ context.Context, topicID int64) error {
+	c.deleteTopicCalls.Add(1)
+	c.lastDeleteTopicID.Store(topicID)
+	return nil
+}
+
+func (c *countingStore) DeleteChannel(_ context.Context, channelID int64) error {
+	c.deleteChannelCalls.Add(1)
+	c.lastDeleteChannelID.Store(channelID)
 	return nil
 }
 
@@ -240,5 +326,250 @@ func TestCachingStoreStatsConcurrentSmoke(t *testing.T) {
 	}
 	if n := inner.flushCalls.Load(); n != want {
 		t.Errorf("FlushStats inner calls = %d, want %d", n, want)
+	}
+}
+
+// TestCachingStoreForwardsAdminSurface covers U1: every admin-surface method
+// is a pure passthrough — exactly one inner call per outer call, nothing
+// memoized (plan 004 R7 posture), arguments and results untouched.
+func TestCachingStoreForwardsAdminSurface(t *testing.T) {
+	inner := newCounting()
+	s := store.WithCache(inner)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		topics, err := s.ListTopics(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(topics) != 1 || topics[0].Name != "counted" {
+			t.Fatalf("ListTopics passthrough mangled: %#v", topics)
+		}
+		if _, err := s.ListChannels(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Backlogs(ctx); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := s.TopicDailyCounters(ctx, 5, 30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0].Publish != 5 || rows[0].Claim != 30 {
+			t.Fatalf("TopicDailyCounters passthrough mangled: %#v", rows)
+		}
+		if _, err := s.ChannelDailyCounters(ctx, 7, 14); err != nil {
+			t.Fatal(err)
+		}
+		dead, err := s.ListDead(ctx, 7, 42, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(dead) != 1 || dead[0].ID != 42 || dead[0].ChannelID != 7 || dead[0].Attempts != 50 {
+			t.Fatalf("ListDead passthrough mangled: %#v", dead)
+		}
+		if err := s.RequeueDead(ctx, 42, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeleteDead(ctx, 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for name, got := range map[string]int64{
+		"ListTopics":           inner.listTopicsCalls.Load(),
+		"ListChannels":         inner.listChannelsCalls.Load(),
+		"Backlogs":             inner.backlogsCalls.Load(),
+		"TopicDailyCounters":   inner.topicDailyCalls.Load(),
+		"ChannelDailyCounters": inner.channelDailyCalls.Load(),
+		"ListDead":             inner.listDeadCalls.Load(),
+		"RequeueDead":          inner.requeueDeadCalls.Load(),
+		"DeleteDead":           inner.deleteDeadCalls.Load(),
+	} {
+		if got != 2 {
+			t.Errorf("%s inner calls = %d, want 2", name, got)
+		}
+	}
+	if got := inner.lastRequeueID.Load(); got != 42 {
+		t.Errorf("RequeueDead deliveryID = %d, want 42", got)
+	}
+	if got := inner.lastRequeueTTL.Load(); got != int64(time.Hour) {
+		t.Errorf("RequeueDead freshTTL = %d, want %d", got, int64(time.Hour))
+	}
+	if got := inner.lastDeleteDeadID.Load(); got != 42 {
+		t.Errorf("DeleteDead deliveryID = %d, want 42", got)
+	}
+}
+
+// TestCachingStoreDeleteTopicSweepsMemoizedIDs covers U1/KTD9+R11:
+// DeleteTopic forwards the id to inner exactly once and first sweeps this
+// process's memoized name→id entries — the topic's entry plus every channel
+// entry under it — while an unrelated topic's entries stay memoized.
+func TestCachingStoreDeleteTopicSweepsMemoizedIDs(t *testing.T) {
+	inner := newCounting()
+	s := store.WithCache(inner)
+	ctx := context.Background()
+
+	if _, err := s.EnsureTopic(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "audit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureTopic(ctx, "billing"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "billing", "email"); err != nil {
+		t.Fatal(err)
+	}
+	ordersID := inner.topicID("orders")
+
+	if err := s.DeleteTopic(ctx, ordersID); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.deleteTopicCalls.Load(); n != 1 {
+		t.Fatalf("DeleteTopic inner calls = %d, want 1", n)
+	}
+	if got := inner.lastDeleteTopicID.Load(); got != ordersID {
+		t.Fatalf("DeleteTopic forwarded id %d, want %d", got, ordersID)
+	}
+
+	// Swept entries: re-ensuring the deleted topic and its channels must
+	// reach inner again instead of answering from the stale memo.
+	topicBase := inner.topicCalls.Load()
+	channelBase := inner.channelCalls.Load()
+	if _, err := s.EnsureTopic(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "audit"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.topicCalls.Load(); n != topicBase+1 {
+		t.Fatalf("EnsureTopic after delete = %d inner calls (base %d), want +1 — memo not swept", n, topicBase)
+	}
+	if n := inner.channelCalls.Load(); n != channelBase+2 {
+		t.Fatalf("EnsureChannel after delete = %d inner calls (base %d), want +2 — channel memos not swept", n, channelBase)
+	}
+
+	// Untouched entries: the sibling topic and its channel stay memoized.
+	if _, err := s.EnsureTopic(ctx, "billing"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "billing", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.topicCalls.Load(); n != topicBase+1 {
+		t.Fatalf("sibling topic must stay memoized, inner calls = %d, want %d", n, topicBase+1)
+	}
+	if n := inner.channelCalls.Load(); n != channelBase+2 {
+		t.Fatalf("sibling channel must stay memoized, inner calls = %d, want %d", n, channelBase+2)
+	}
+}
+
+// TestCachingStoreDeleteChannelSweepsMemoizedIDs covers U1: DeleteChannel
+// forwards the id and drops only the memoized entry resolving to it — the
+// sibling channel under the same topic keeps its memo.
+func TestCachingStoreDeleteChannelSweepsMemoizedIDs(t *testing.T) {
+	inner := newCounting()
+	s := store.WithCache(inner)
+	ctx := context.Background()
+
+	if _, err := s.EnsureTopic(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	emailID, err := s.EnsureChannel(ctx, "orders", "email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "audit"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteChannel(ctx, emailID); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.deleteChannelCalls.Load(); n != 1 {
+		t.Fatalf("DeleteChannel inner calls = %d, want 1", n)
+	}
+	if got := inner.lastDeleteChannelID.Load(); got != emailID {
+		t.Fatalf("DeleteChannel forwarded id %d, want %d", got, emailID)
+	}
+
+	channelBase := inner.channelCalls.Load()
+	if _, err := s.EnsureChannel(ctx, "orders", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.channelCalls.Load(); n != channelBase+1 {
+		t.Fatalf("EnsureChannel after delete = %d inner calls (base %d), want +1 — memo not swept", n, channelBase)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "audit"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.channelCalls.Load(); n != channelBase+1 {
+		t.Fatalf("sibling channel must stay memoized, inner calls = %d, want %d", n, channelBase+1)
+	}
+}
+
+// TestCachingStoreInvalidateIDs covers U1/KTD9: InvalidateTopicID and
+// InvalidateChannelID drop exactly the memoized entry resolving to the id
+// (the eviction half of the Client.Publish self-heal) and are a safe no-op
+// for unknown ids.
+func TestCachingStoreInvalidateIDs(t *testing.T) {
+	inner := newCounting()
+	s := store.WithCache(inner)
+	ctx := context.Background()
+
+	topicID, err := s.EnsureTopic(ctx, "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	channelID, err := s.EnsureChannel(ctx, "orders", "email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, ok := s.(*store.CachingStore)
+	if !ok {
+		t.Fatalf("expected *store.CachingStore, got %T", s)
+	}
+
+	topicBase := inner.topicCalls.Load()
+	channelBase := inner.channelCalls.Load()
+
+	cs.InvalidateTopicID(topicID)
+	if _, err := s.EnsureTopic(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.topicCalls.Load(); n != topicBase+1 {
+		t.Fatalf("EnsureTopic after InvalidateTopicID = %d inner calls (base %d), want +1", n, topicBase)
+	}
+
+	cs.InvalidateChannelID(channelID)
+	if _, err := s.EnsureChannel(ctx, "orders", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.channelCalls.Load(); n != channelBase+1 {
+		t.Fatalf("EnsureChannel after InvalidateChannelID = %d inner calls (base %d), want +1", n, channelBase)
+	}
+
+	// Unknown ids must be a silent no-op, and the fresh memos stay valid.
+	cs.InvalidateTopicID(1 << 40)
+	cs.InvalidateChannelID(1 << 40)
+	if _, err := s.EnsureTopic(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureChannel(ctx, "orders", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.topicCalls.Load(); n != topicBase+1 {
+		t.Fatalf("unknown-id invalidate must not evict, inner topic calls = %d, want %d", n, topicBase+1)
+	}
+	if n := inner.channelCalls.Load(); n != channelBase+1 {
+		t.Fatalf("unknown-id invalidate must not evict, inner channel calls = %d, want %d", n, channelBase+1)
 	}
 }
