@@ -123,6 +123,7 @@ client, err := novaque.Open(postgres.New(db), novaque.Options{
 - **UTC.** Every clock on the hot path is derived server-side (`clock_timestamp()` and `NOW() AT TIME ZONE 'UTC'`), so correctness does not depend on the session time zone; setting `TimeZone=UTC` in the DSN keeps manual inspection and logs aligned.
 - **Case sensitivity.** Unlike MySQL's default utf8mb4 collation, PostgreSQL names are case-sensitive: `Orders` and `orders` are distinct topics.
 - **Connection pool.** Same sizing rule as MySQL: `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroom, and a primary-writable connection (no read replicas) for claim/ack/publish.
+- **Statement timeouts.** Driver transactions set `lock_timeout=5s` and `statement_timeout=30s` locally (the settings revert at commit/rollback), so a maintenance `UPDATE`/`DELETE` cannot wait forever behind a large topic cascade. Autocommit statements issued outside transactions are not covered; set pool-wide defaults with runtime parameters on the connection string (e.g. `?sslmode=disable&lock_timeout=5s&statement_timeout=30s`) or persist them with `ALTER ROLE`/`ALTER DATABASE ... SET lock_timeout`/`statement_timeout`.
 
 ## Documentation
 

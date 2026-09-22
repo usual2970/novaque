@@ -298,6 +298,9 @@ func (s *Store) RequeueDead(ctx context.Context, deliveryID, channelID int64, fr
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := setTxTimeouts(ctx, tx); err != nil {
+		return err
+	}
 
 	res, err := tx.ExecContext(ctx, `
 		UPDATE novaque_deliveries
@@ -419,6 +422,9 @@ func (s *Store) runCascade(ctx context.Context, steps []cascadeStep, id int64) e
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := setTxTimeouts(ctx, tx); err != nil {
+		return err
+	}
 	for _, step := range steps {
 		if _, err := tx.ExecContext(ctx, step.sql, id); err != nil {
 			return fmt.Errorf("postgres admin cascade (%s): %w", step.name, err)

@@ -3,6 +3,7 @@
 package postgres_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -746,6 +747,77 @@ func TestAdminListDeadPagination(t *testing.T) {
 		if len(d.Body) != 4 || d.BodyLen != 12 {
 			t.Fatalf("prefix row %d: body=%d bytes bodyLen=%d, want 4/12", d.ID, len(d.Body), d.BodyLen)
 		}
+	}
+}
+
+// TestAdminListDeadBinaryBodyPrefix covers the byte (not character)
+// semantics of the body-prefix truncation: the body is BYTEA and the read
+// uses substring(m.body FROM 1 FOR $n) together with OCTET_LENGTH(m.body),
+// so a prefix must cut on exact byte boundaries even when the payload holds
+// a multibyte UTF-8 sequence split mid-character and invalid UTF-8 bytes
+// (0xff, 0x00).
+func TestAdminListDeadBinaryBodyPrefix(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "admbin_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 7 bytes: ASCII, a 2-byte UTF-8 sequence (0xc3 0xa9), then invalid
+	// UTF-8 (0xff), a NUL, and ASCII.
+	body := []byte{'a', 'b', 0xc3, 0xa9, 0xff, 0x00, 'z'}
+	if _, err := s.Publish(ctx, topicID, body, store.PublishOpts{TTL: time.Hour, MaxAttempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// Same dead path as the pagination test: claim (attempts 1, returned),
+	// requeue, claim again (attempts 2 > max 1 -> dead).
+	first, err := s.Claim(ctx, chID, "w", time.Minute, 10)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first claim = %v err=%v, want 1", first, err)
+	}
+	if err := s.Requeue(ctx, first[0].ID, first[0].LeaseToken, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := s.Claim(ctx, chID, "w", time.Minute, 10); err != nil || len(again) != 0 {
+		t.Fatalf("terminal claim = %v err=%v, want 0 (dead)", again, err)
+	}
+
+	// Prefix 3: exactly the first three bytes, cutting before the second
+	// half of the 2-byte UTF-8 sequence; octet length stays the full 7.
+	pref, err := s.ListDead(ctx, chID, 0, 50, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pref) != 1 {
+		t.Fatalf("prefix page = %d rows, want 1", len(pref))
+	}
+	wantPrefix := []byte{'a', 'b', 0xc3}
+	if !bytes.Equal(pref[0].Body, wantPrefix) {
+		t.Fatalf("prefix body = %#v, want %#v", pref[0].Body, wantPrefix)
+	}
+	if pref[0].BodyLen != 7 {
+		t.Fatalf("BodyLen = %d, want 7", pref[0].BodyLen)
+	}
+
+	// Prefix 0 means the whole body per the CASE WHEN $1=0 contract.
+	full, err := s.ListDead(ctx, chID, 0, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) != 1 || !bytes.Equal(full[0].Body, body) {
+		t.Fatalf("full body = %#v (rows=%d), want %#v", full, len(full), body)
+	}
+	if full[0].BodyLen != 7 {
+		t.Fatalf("full BodyLen = %d, want 7", full[0].BodyLen)
 	}
 }
 

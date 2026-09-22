@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS novaque_deliveries (
   CONSTRAINT fk_novaque_deliveries_channel FOREIGN KEY (channel_id) REFERENCES novaque_channels (id)
 );
 CREATE INDEX IF NOT EXISTS idx_novaque_deliveries_claim ON novaque_deliveries (channel_id, status, available_at, id);
+-- InnoDB auto-indexes FK columns; Postgres does not, so the FK-backed
+-- lookups below need explicit indexes.
+CREATE INDEX IF NOT EXISTS idx_novaque_deliveries_message ON novaque_deliveries (message_id);
+CREATE INDEX IF NOT EXISTS idx_novaque_deliveries_expires ON novaque_deliveries (expires_at);
+CREATE INDEX IF NOT EXISTS idx_novaque_deliveries_reap ON novaque_deliveries (status, lease_until);
 
 -- Day-bucket event counters (UTC day; the one non-Unix-second clock on purpose).
 -- channel_id = 0 is the sentinel for topic-only publish rows (zero-channel

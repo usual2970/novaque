@@ -40,6 +40,9 @@ func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseF
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := setTxTimeouts(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	// Covering-style poll on the ready slice only (Solid Queue ready_executions analogue).
 	rows, err := tx.QueryContext(ctx, `

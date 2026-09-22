@@ -25,7 +25,12 @@ func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error)
 	}
 	// Postgres has no UPDATE ... ORDER BY/LIMIT: an IN subquery selects the
 	// doomed ids (evaluated first, so updating the same table is legal),
-	// ordered by lease_until and capped like the MySQL statement.
+	// ordered by lease_until and capped like the MySQL statement. The
+	// eligibility predicates are repeated in the outer WHERE so READ
+	// COMMITTED rechecks them against the newest row version (EvalPlanQual):
+	// a row requeued and reclaimed with a fresh lease after the subquery
+	// materialized is matched by id but fails the outer predicates and
+	// survives, matching InnoDB's semantically-checked UPDATE.
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE novaque_deliveries
 		SET status = $1, available_at = `+sqlNow+`,
@@ -36,7 +41,11 @@ func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error)
 			WHERE status = $2 AND lease_until IS NOT NULL AND lease_until < `+sqlNow+`
 			ORDER BY lease_until ASC
 			LIMIT $3
-		)`,
+		)
+		  AND status = $2
+		  AND lease_until IS NOT NULL
+		  AND lease_until < `+sqlNow+`
+		`,
 		store.StatusPending, store.StatusInFlight, limit)
 	if err != nil {
 		return 0, fmt.Errorf("postgres: reap expired leases: %w", err)

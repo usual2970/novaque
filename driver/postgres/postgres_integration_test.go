@@ -374,22 +374,34 @@ func TestPublishLateChannelNoHistory(t *testing.T) {
 	}
 }
 
-// TestPublishDelayExceedsTTLRejected: delay validation runs inside the
-// publish transaction before the message insert, so the rejected publish
-// leaves no rows behind (mirrors the reject half of the MySQL delay test).
-func TestPublishDelayExceedsTTLRejected(t *testing.T) {
+// TestPublishDelayClaimAndReject ports the MySQL test of the same name:
+// a publish whose delay exceeds the TTL is rejected inside the publish
+// transaction before the message insert (no rows left behind), while a
+// delayed publish (Delay 2s, TTL 1h) is invisible to Claim on every
+// fan-out channel until the delay passes and then delivers exactly once
+// per channel with the original body.
+func TestPublishDelayClaimAndReject(t *testing.T) {
 	db := testpostgres.Open(t)
 	s := postgres.New(db)
 	ctx := context.Background()
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	topic := "delayrej_" + time.Now().Format("150405.000")
+	topic := "delayclaim_" + time.Now().Format("150405.000")
+	aID, err := s.EnsureChannel(ctx, topic, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bID, err := s.EnsureChannel(ctx, topic, "B")
+	if err != nil {
+		t.Fatal(err)
+	}
 	topicID, err := s.EnsureTopic(ctx, topic)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	// Reject half: delay longer than the TTL.
 	_, err = s.Publish(ctx, topicID, []byte("too-long"), store.PublishOpts{
 		Delay: 8 * 24 * time.Hour,
 		TTL:   7 * 24 * time.Hour,
@@ -400,6 +412,60 @@ func TestPublishDelayExceedsTTLRejected(t *testing.T) {
 	if n := countRow(t, ctx, db,
 		`SELECT COUNT(*) FROM novaque_messages WHERE topic_id = $1`, topicID); n != 0 {
 		t.Fatalf("rejected publish left %d message rows, want 0", n)
+	}
+
+	// Delayed publish fans out to both channels but is not yet claimable.
+	msgID, err := s.Publish(ctx, topicID, []byte("later"), store.PublishOpts{
+		Delay:       2 * time.Second,
+		TTL:         time.Hour,
+		MaxAttempts: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgID == 0 {
+		t.Fatal("expected message id")
+	}
+
+	earlyA, err := s.Claim(ctx, aID, "w1", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlyB, err := s.Claim(ctx, bID, "w1", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(earlyA) != 0 || len(earlyB) != 0 {
+		t.Fatalf("expected empty claims before delay, got A=%d B=%d", len(earlyA), len(earlyB))
+	}
+
+	time.Sleep(2500 * time.Millisecond)
+
+	readyA, err := s.Claim(ctx, aID, "w1", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyB, err := s.Claim(ctx, bID, "w1", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(readyA) != 1 || len(readyB) != 1 {
+		t.Fatalf("want one delivery each after delay, got A=%d B=%d", len(readyA), len(readyB))
+	}
+	if string(readyA[0].Body) != "later" || string(readyB[0].Body) != "later" {
+		t.Fatalf("bodies %#v %#v, want \"later\"", readyA[0].Body, readyB[0].Body)
+	}
+
+	// Immediate requeue after the delayed claim (AE7).
+	if err := s.Requeue(ctx, readyA[0].ID, readyA[0].LeaseToken, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.Claim(ctx, aID, "w2", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 || again[0].MessageID != readyA[0].MessageID {
+		t.Fatalf("expected immediate reclaim, got %#v", again)
 	}
 }
 

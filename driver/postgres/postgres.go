@@ -24,6 +24,18 @@ var schemaFS embed.FS
 // DefaultMaxAttempts is the default used when publish opts leave MaxAttempts unset.
 const DefaultMaxAttempts = 5
 
+// lockTimeout bounds how long a transaction statement waits for a row lock
+// before aborting with lock_not_available. PostgreSQL defaults lock_timeout
+// to 0 (wait forever); without this a maintenance UPDATE/DELETE can block
+// behind a large DeleteTopic cascade on a deadline-free context. Applied per
+// transaction with SET LOCAL semantics.
+const lockTimeout = "5s"
+
+// statementTimeout bounds the wall-clock duration of any single statement in
+// a transaction. PostgreSQL defaults statement_timeout to 0 (no limit).
+// Applied per transaction with SET LOCAL semantics.
+const statementTimeout = "30s"
+
 // Store is the PostgreSQL implementation of store.Store.
 type Store struct {
 	db *sql.DB
@@ -189,6 +201,22 @@ func mapTopicGone(err error) error {
 	return err
 }
 
+// setTxTimeouts applies lockTimeout and statementTimeout for the remainder
+// of the transaction only (they revert at commit/rollback). It uses
+// set_config(..., is_local => true), the functional equivalent of SET LOCAL:
+// PostgreSQL rejects bind parameters in a SET statement under the extended
+// protocol pgx stdlib uses ("syntax error at or near $1"), while the
+// parameterized SELECT form binds normally.
+func setTxTimeouts(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('lock_timeout', $1, true)`, lockTimeout); err != nil {
+		return fmt.Errorf("postgres: set lock_timeout: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('statement_timeout', $1, true)`, statementTimeout); err != nil {
+		return fmt.Errorf("postgres: set statement_timeout: %w", err)
+	}
+	return nil
+}
+
 // Publish inserts message + per-channel deliveries atomically for a known
 // topic id. A nil body is stored as empty. When the topic row vanished after
 // the caller resolved topicID (an admin delete in another process), the topic
@@ -220,6 +248,9 @@ func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts st
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := setTxTimeouts(ctx, tx); err != nil {
+		return 0, err
+	}
 
 	var nowUnix int64
 	if err := tx.QueryRowContext(ctx, `SELECT `+sqlNow).Scan(&nowUnix); err != nil {
@@ -229,42 +260,27 @@ func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts st
 		return 0, err
 	}
 
-	ttlSec := store.DurationSec(store.DefaultPublishTTL)
+	// Compute expiry once, in seconds against the server clock scanned
+	// above, so all three publish paths share one INSERT: explicit TTL is
+	// relative to now, an absolute ExpiresAt stands alone, and neither set
+	// falls back to DefaultPublishTTL. TTL wins when both are set (switch
+	// order) — the precedence of the former per-branch INSERTs.
+	expiresAtSec := nowUnix + store.DurationSec(store.DefaultPublishTTL)
 	switch {
 	case opts.TTL > 0:
-		ttlSec = store.DurationSec(opts.TTL)
+		expiresAtSec = nowUnix + store.DurationSec(opts.TTL)
 	case !opts.ExpiresAt.IsZero():
-		ttlSec = 0 // absolute path below
+		expiresAtSec = timeToSec(opts.ExpiresAt)
 	}
 
-	// pgx stdlib does not support sql.Result.LastInsertId, so every branch
-	// inserts ... RETURNING id and scans it.
+	// pgx stdlib does not support sql.Result.LastInsertId, so the insert
+	// uses ... RETURNING id and scans it.
 	var messageID int64
-	switch {
-	case opts.TTL > 0:
-		err = tx.QueryRowContext(ctx, `
-			INSERT INTO novaque_messages (topic_id, body, expires_at)
-			VALUES ($1, $2, $3::bigint + $4::bigint) RETURNING id`,
-			topicID, body, nowUnix, ttlSec).Scan(&messageID)
-		if err != nil {
-			return 0, err
-		}
-	case !opts.ExpiresAt.IsZero():
-		err = tx.QueryRowContext(ctx, `
-			INSERT INTO novaque_messages (topic_id, body, expires_at)
-			VALUES ($1, $2, $3) RETURNING id`,
-			topicID, body, timeToSec(opts.ExpiresAt)).Scan(&messageID)
-		if err != nil {
-			return 0, err
-		}
-	default:
-		err = tx.QueryRowContext(ctx, `
-			INSERT INTO novaque_messages (topic_id, body, expires_at)
-			VALUES ($1, $2, $3::bigint + $4::bigint) RETURNING id`,
-			topicID, body, nowUnix, ttlSec).Scan(&messageID)
-		if err != nil {
-			return 0, err
-		}
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO novaque_messages (topic_id, body, expires_at)
+		VALUES ($1, $2, $3::bigint) RETURNING id`,
+		topicID, body, expiresAtSec).Scan(&messageID); err != nil {
+		return 0, err
 	}
 
 	delaySec := store.DelaySec(opts.Delay)
