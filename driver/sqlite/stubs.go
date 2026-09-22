@@ -12,14 +12,6 @@ import (
 // replace them one file at a time (publish/claim, maintenance, stats, admin).
 // Every stub returns an error rather than panicking or faking success.
 
-func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error) {
-	return 0, fmt.Errorf("sqlite: ReapExpiredLeases not implemented yet")
-}
-
-func (s *Store) PurgeExpired(ctx context.Context, limit int) (int64, error) {
-	return 0, fmt.Errorf("sqlite: PurgeExpired not implemented yet")
-}
-
 func (s *Store) ChannelCounters(ctx context.Context, channelID int64) (store.ChannelCounters, error) {
 	return store.ChannelCounters{}, fmt.Errorf("sqlite: ChannelCounters not implemented yet")
 }

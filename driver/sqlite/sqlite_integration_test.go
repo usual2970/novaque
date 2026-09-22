@@ -444,6 +444,270 @@ func isClaimBusy(err error) bool {
 	return false
 }
 
+// TestMaintenanceReapExpiredLeases covers the lease half of maintenance: an
+// in_flight delivery whose lease_until is past is reset to a claimable pending
+// row (lease fields cleared, available_at <= now), reclaiming redelivers it,
+// and the stale lease token can no longer ack. The reap itself records no
+// stats (that is asserted at the stats layer in U5, like MySQL's suite).
+func TestMaintenanceReapExpiredLeases(t *testing.T) {
+	db := testsqlite.Open(t)
+	s := sqlite.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "reap_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "workers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgID, err := s.Publish(ctx, topicID, []byte("job"), store.PublishOpts{TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Claim(ctx, chID, "w1", time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 {
+		t.Fatalf("claim got %d deliveries, want 1", len(first))
+	}
+	d := first[0]
+
+	time.Sleep(2500 * time.Millisecond)
+
+	n, err := s.ReapExpiredLeases(ctx, 100)
+	if err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("reap affected %d rows, want >= 1", n)
+	}
+
+	// Back to a claimable pending row with every lease field cleared.
+	var ready int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM novaque_deliveries
+		WHERE id = ? AND status = ?
+		  AND available_at <= unixepoch()
+		  AND lease_owner IS NULL AND lease_token IS NULL AND lease_until IS NULL`,
+		d.ID, store.StatusPending).Scan(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready != 1 {
+		t.Fatalf("reaped delivery not a clean pending row (count=%d)", ready)
+	}
+
+	again, err := s.Claim(ctx, chID, "w2", 10*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 || again[0].MessageID != msgID {
+		t.Fatalf("expected redelivery of message %d, got %#v", msgID, again)
+	}
+
+	if err := s.Ack(ctx, d.ID, d.LeaseToken); err == nil {
+		t.Fatal("expected stale ack after reap to fail")
+	}
+}
+
+// TestMaintenancePurgeExpired covers AE6 with raw-SQL past-expiry staging:
+// pending and dead expired deliveries disappear, cannot be claimed, and their
+// now-orphaned messages go on the same call's orphan pass; an unexpired
+// control survives; a seed orphan expired message is collected; an expired
+// message whose delivery is still unexpired survives (delivery state guard)
+// until its delivery is expired and the next purge takes both.
+func TestMaintenancePurgeExpired(t *testing.T) {
+	db := testsqlite.Open(t)
+	s := sqlite.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Now().Format("150405.000")
+	aID, err := s.EnsureChannel(ctx, "purgeA_"+ts, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bID, err := s.EnsureChannel(ctx, "purgeB_"+ts, "B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicAID, err := s.EnsureTopic(ctx, "purgeA_"+ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicBID, err := s.EnsureTopic(ctx, "purgeB_"+ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Three doomed deliveries on A: two pending, one dead.
+	pend1, err := publishDeliveryIDs(ctx, s, db, topicAID, aID, []byte("p1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pend2, err := publishDeliveryIDs(ctx, s, db, topicAID, aID, []byte("p2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead1, err := publishDeliveryIDs(ctx, s, db, topicAID, aID, []byte("d1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unexpired control on A.
+	ctrl, err := publishDeliveryIDs(ctx, s, db, topicAID, aID, []byte("ctrl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Expired message with an unexpired delivery on B (state-guard pair).
+	guarded, err := publishDeliveryIDs(ctx, s, db, topicBID, bID, []byte("guard"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stage dead status, then expire the doomed rows (message + delivery)
+	// strictly into the past with raw SQL.
+	if _, err := db.ExecContext(ctx, `
+		UPDATE novaque_deliveries SET status = ? WHERE id = ?`,
+		store.StatusDead, dead1.deliveryID); err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range []pubPair{pend1, pend2, dead1} {
+		if _, err := db.ExecContext(ctx, `
+			UPDATE novaque_messages SET expires_at = unixepoch() - 10 WHERE id = ?`,
+			x.messageID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			UPDATE novaque_deliveries SET expires_at = unixepoch() - 10 WHERE id = ?`,
+			x.deliveryID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The guarded pair: message expired, delivery not.
+	if _, err := db.ExecContext(ctx, `
+		UPDATE novaque_messages SET expires_at = unixepoch() - 10 WHERE id = ?`,
+		guarded.messageID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed orphan: expired message with no deliveries at all.
+	var orphanID int64
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO novaque_messages (topic_id, body, expires_at)
+		VALUES (?, ?, unixepoch() - 10) RETURNING id`,
+		topicAID, []byte("orphan")).Scan(&orphanID); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.PurgeExpired(ctx, 100)
+	if err != nil {
+		t.Fatalf("PurgeExpired: %v", err)
+	}
+	// 3 expired deliveries + seed orphan + the 3 messages orphaned by the
+	// delivery delete (orphan pass runs after it in the same call) = 7.
+	if n != 7 {
+		t.Fatalf("purge affected %d rows, want 7", n)
+	}
+
+	// Doomed deliveries and their messages are gone; the seed orphan is gone.
+	for _, x := range []pubPair{pend1, pend2, dead1} {
+		if n := countRows(ctx, t, db, `SELECT COUNT(*) FROM novaque_deliveries WHERE id = ?`, x.deliveryID); n != 0 {
+			t.Fatalf("expired delivery %d survived purge, count=%d", x.deliveryID, n)
+		}
+		if n := countRows(ctx, t, db, `SELECT COUNT(*) FROM novaque_messages WHERE id = ?`, x.messageID); n != 0 {
+			t.Fatalf("orphaned message %d survived purge, count=%d", x.messageID, n)
+		}
+	}
+	if n := countRows(ctx, t, db, `SELECT COUNT(*) FROM novaque_messages WHERE id = ?`, orphanID); n != 0 {
+		t.Fatalf("seed orphan message %d survived purge, count=%d", orphanID, n)
+	}
+
+	// The purged deliveries are not claimable: A claims only the control.
+	gotA, err := s.Claim(ctx, aID, "w", 10*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotA) != 1 || gotA[0].ID != ctrl.deliveryID {
+		t.Fatalf("claim on A after purge = %#v, want only control %d", gotA, ctrl.deliveryID)
+	}
+
+	// The guarded pair on B survives: expired message, unexpired delivery.
+	if n := countRows(ctx, t, db, `SELECT COUNT(*) FROM novaque_messages WHERE id = ?`, guarded.messageID); n != 1 {
+		t.Fatalf("guarded message count=%d, want 1", n)
+	}
+	if n := countRows(ctx, t, db, `SELECT COUNT(*) FROM novaque_deliveries WHERE id = ?`, guarded.deliveryID); n != 1 {
+		t.Fatalf("guarded delivery count=%d, want 1", n)
+	}
+
+	// Once the delivery is expired too, the next purge takes both: the
+	// delivery delete orphans the message and the same call's orphan pass
+	// collects it.
+	if _, err := db.ExecContext(ctx, `
+		UPDATE novaque_deliveries SET expires_at = unixepoch() - 10
+		WHERE id = ? AND channel_id = ?`, guarded.deliveryID, bID); err != nil {
+		t.Fatal(err)
+	}
+	n2, err := s.PurgeExpired(ctx, 100)
+	if err != nil {
+		t.Fatalf("second PurgeExpired: %v", err)
+	}
+	if n2 != 2 {
+		t.Fatalf("second purge affected %d rows, want 2", n2)
+	}
+	if n := countRows(ctx, t, db, `SELECT COUNT(*) FROM novaque_messages WHERE id = ?`, guarded.messageID); n != 0 {
+		t.Fatalf("guarded message survived second purge, count=%d", n)
+	}
+	if n := countRows(ctx, t, db, `SELECT COUNT(*) FROM novaque_deliveries WHERE id = ?`, guarded.deliveryID); n != 0 {
+		t.Fatalf("guarded delivery survived second purge, count=%d", n)
+	}
+
+	// The unexpired control still exists (claimed above, in_flight).
+	if n := countRows(ctx, t, db, `SELECT COUNT(*) FROM novaque_messages WHERE id = ?`, ctrl.messageID); n != 1 {
+		t.Fatalf("control message count=%d, want 1", n)
+	}
+	if n := countRows(ctx, t, db, `SELECT COUNT(*) FROM novaque_deliveries WHERE id = ?`, ctrl.deliveryID); n != 1 {
+		t.Fatalf("control delivery count=%d, want 1", n)
+	}
+}
+
+type pubPair struct {
+	messageID  int64
+	deliveryID int64
+}
+
+// publishDeliveryIDs publishes one message (1h TTL) and returns its message
+// id and the delivery id created for channelID.
+func publishDeliveryIDs(ctx context.Context, s *sqlite.Store, db *sql.DB, topicID, channelID int64, body []byte) (pubPair, error) {
+	msgID, err := s.Publish(ctx, topicID, body, store.PublishOpts{TTL: time.Hour})
+	if err != nil {
+		return pubPair{}, err
+	}
+	var deliveryID int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT id FROM novaque_deliveries WHERE message_id = ? AND channel_id = ?`,
+		msgID, channelID).Scan(&deliveryID); err != nil {
+		return pubPair{}, err
+	}
+	return pubPair{messageID: msgID, deliveryID: deliveryID}, nil
+}
+
+// countRows runs a COUNT(*) query with the given args.
+func countRows(ctx context.Context, t *testing.T, db *sql.DB, q string, args ...any) int64 {
+	t.Helper()
+	var n int64
+	if err := db.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
+		t.Fatalf("count query %q: %v", q, err)
+	}
+	return n
+}
+
 // reapExpiredLeasesRaw applies the ReapExpiredLeases update (U4) with raw SQL
 // so pre-U4 tests can stage lease expiry without depending on the driver
 // method. The eligibility clause mirrors driver/mysql/maintenance.go; unlike
