@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"errors"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -460,5 +462,560 @@ func TestPublishDeletedTopicErrTopicGone(t *testing.T) {
 	}
 	if _, err := s.Publish(ctx, newID, []byte("healed"), store.PublishOpts{TTL: time.Hour}); err != nil {
 		t.Fatalf("retry publish on re-ensured topic: %v", err)
+	}
+}
+
+// TestClaimCompetePartition (AE2): two distinguishable consumers repeatedly
+// Claim on one channel; the N messages must partition with no overlap (union
+// size N, intersection empty), and every delivery must be ackable exactly once.
+func TestClaimCompetePartition(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "compete_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "workers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 6
+	for i := 0; i < n; i++ {
+		if _, err := s.Publish(ctx, topicID, []byte{byte(i)}, store.PublishOpts{TTL: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var a, b []store.Delivery
+	// Two consumers alternate claims until the channel drains completely,
+	// so each claims repeatedly rather than just once.
+	turn := 0
+	for {
+		owner := "consumer-a"
+		if turn%2 == 1 {
+			owner = "consumer-b"
+		}
+		got, err := s.Claim(ctx, chID, owner, 30*time.Second, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) == 0 {
+			break
+		}
+		if turn%2 == 0 {
+			a = append(a, got...)
+		}
+		if turn%2 == 1 {
+			b = append(b, got...)
+		}
+		turn++
+		if turn > 2*n {
+			t.Fatal("claim loop did not drain")
+		}
+	}
+
+	setA := map[int64]store.Delivery{}
+	for _, d := range a {
+		setA[d.ID] = d
+	}
+	setB := map[int64]store.Delivery{}
+	for _, d := range b {
+		setB[d.ID] = d
+	}
+	union := map[int64]bool{}
+	for id := range setA {
+		union[id] = true
+	}
+	for id := range setB {
+		union[id] = true
+	}
+	if len(union) != n {
+		t.Fatalf("union size = %d, want %d (A=%d B=%d)", len(union), n, len(a), len(b))
+	}
+	for id := range setA {
+		if _, dup := setB[id]; dup {
+			t.Fatalf("delivery %d claimed by both consumers", id)
+		}
+	}
+	if len(a) == 0 || len(b) == 0 {
+		t.Fatalf("expected both consumers to lease work, got A=%d B=%d", len(a), len(b))
+	}
+
+	// Every delivery is ackable exactly once with its own token.
+	for _, dls := range [][]store.Delivery{a, b} {
+		for _, d := range dls {
+			if err := s.Ack(ctx, d.ID, d.LeaseToken); err != nil {
+				t.Fatalf("ack delivery %d: %v", d.ID, err)
+			}
+			if err := s.Ack(ctx, d.ID, d.LeaseToken); err == nil {
+				t.Fatalf("delivery %d acked twice", d.ID)
+			}
+		}
+	}
+	if left := countRow(t, ctx, db,
+		`SELECT COUNT(*) FROM novaque_deliveries WHERE channel_id = $1`, chID); left != 0 {
+		t.Fatalf("want 0 deliveries after acks, got %d", left)
+	}
+}
+
+// TestClaimAckRequeueWrongToken: Ack and Requeue with a bogus lease token are
+// rejected, and the delivery row is unchanged (still in_flight under the
+// original lease); the genuine token then fences correctly.
+func TestClaimAckRequeueWrongToken(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "wrongtok_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish(ctx, topicID, []byte("x"), store.PublishOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Claim(ctx, chID, "w1", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 claim, got %d", len(got))
+	}
+	d := got[0]
+	const bogus = "0123456789abcdef0123456789abcdef"
+
+	if err := s.Ack(ctx, d.ID, bogus); err == nil {
+		t.Fatal("Ack with bogus token: want error, got nil")
+	}
+	if err := s.Requeue(ctx, d.ID, bogus, time.Time{}); err == nil {
+		t.Fatal("Requeue with bogus token: want error, got nil")
+	}
+
+	// Row unchanged: still in_flight with the original lease coordinates.
+	var status, token, owner string
+	var attempts int
+	var leaseUntil sql.NullInt64
+	if err := db.QueryRowContext(ctx, `
+		SELECT status, attempts, lease_token, lease_owner, lease_until
+		FROM novaque_deliveries WHERE id = $1`, d.ID).
+		Scan(&status, &attempts, &token, &owner, &leaseUntil); err != nil {
+		t.Fatal(err)
+	}
+	if status != store.StatusInFlight || token != d.LeaseToken || owner != "w1" || attempts != 1 {
+		t.Fatalf("row mutated by rejected calls: status=%s attempts=%d token=%s owner=%s",
+			status, attempts, token, owner)
+	}
+	if !leaseUntil.Valid || leaseUntil.Int64 <= time.Now().Unix() {
+		t.Fatalf("lease_until not in the future: %#v", leaseUntil)
+	}
+
+	// Genuine requeue works and makes the delivery claimable again.
+	if err := s.Requeue(ctx, d.ID, d.LeaseToken, time.Time{}); err != nil {
+		t.Fatalf("Requeue with real token: %v", err)
+	}
+	again, err := s.Claim(ctx, chID, "w2", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 || again[0].ID != d.ID {
+		t.Fatalf("expected reclaim of %d, got %#v", d.ID, again)
+	}
+	if again[0].Attempts != 2 {
+		t.Fatalf("want attempts=2 after requeue, got %d", again[0].Attempts)
+	}
+	if err := s.Ack(ctx, again[0].ID, again[0].LeaseToken); err != nil {
+		t.Fatalf("final ack: %v", err)
+	}
+}
+
+// TestRequeueFlows covers the handler-error flow: an immediate requeue
+// (zero time) resets available_at to now, and a delayed requeue stamps the
+// given time which Claim honors until it passes.
+func TestRequeueFlows(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "rqflows_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Immediate requeue after a handler error.
+	if _, err := s.Publish(ctx, topicID, []byte("one"), store.PublishOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	d1, err := s.Claim(ctx, chID, "w1", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d1) != 1 {
+		t.Fatalf("want 1 claim, got %d", len(d1))
+	}
+	if err := s.Requeue(ctx, d1[0].ID, d1[0].LeaseToken, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	var avail int64
+	var leaseTok sql.NullString
+	if err := db.QueryRowContext(ctx, `
+		SELECT available_at, lease_token FROM novaque_deliveries WHERE id = $1`, d1[0].ID).
+		Scan(&avail, &leaseTok); err != nil {
+		t.Fatal(err)
+	}
+	if avail < time.Now().Unix()-1 || avail > time.Now().Unix()+1 {
+		t.Fatalf("immediate requeue available_at = %d, want ~now", avail)
+	}
+	if leaseTok.Valid {
+		t.Fatal("immediate requeue did not clear lease_token")
+	}
+	back, err := s.Claim(ctx, chID, "w1", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(back) != 1 || back[0].ID != d1[0].ID {
+		t.Fatalf("expected immediate reclaim, got %#v", back)
+	}
+
+	// Delayed requeue: delivery hidden until the given available time.
+	if _, err := s.Publish(ctx, topicID, []byte("two"), store.PublishOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	d2, err := s.Claim(ctx, chID, "w1", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d2) != 1 {
+		t.Fatalf("want 1 claim, got %d", len(d2))
+	}
+	wakeAt := time.Now().Add(2 * time.Second)
+	if err := s.Requeue(ctx, d2[0].ID, d2[0].LeaseToken, wakeAt); err != nil {
+		t.Fatal(err)
+	}
+	early, err := s.Claim(ctx, chID, "w2", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(early) != 0 {
+		t.Fatalf("delayed requeue visible early: %#v", early)
+	}
+	time.Sleep(2500 * time.Millisecond)
+	ready, err := s.Claim(ctx, chID, "w2", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, x := range ready {
+		if x.ID == d2[0].ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("delivery %d not claimable after delayed available_at (got %#v)", d2[0].ID, ready)
+	}
+}
+
+// TestClaimLeaseExpiryNoReaper (AE3, U3 slice): Claim with a tiny lease, wait
+// for lease_until to pass. Without the U4 reaper the row stays in_flight, so a
+// fresh Claim must NOT redeliver it (the poll filters on status=pending).
+// Because Ack fences only on token + in_flight status (never lease_until —
+// matching driver/mysql), the OLD token still acks. The full AE3 redelivery
+// flow (ReapExpiredLeases -> reclaim -> stale token rejected) is ported in U4.
+func TestClaimLeaseExpiryNoReaper(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "leaseexp_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish(ctx, topicID, []byte("x"), store.PublishOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Claim(ctx, chID, "w1", time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 claim, got %d", len(got))
+	}
+	d := got[0]
+
+	time.Sleep(2500 * time.Millisecond)
+
+	// Reaper absent (U4): row still in_flight and Claim will not touch it.
+	var status string
+	if err := db.QueryRowContext(ctx, `
+		SELECT status FROM novaque_deliveries WHERE id = $1`, d.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != store.StatusInFlight {
+		t.Fatalf("status = %s, want in_flight (reaper is U4)", status)
+	}
+	again, err := s.Claim(ctx, chID, "w2", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range again {
+		if x.ID == d.ID {
+			t.Fatal("fresh Claim redelivered an in_flight row without the reaper")
+		}
+	}
+
+	// Ack ignores lease_until: the old token still fences while status is
+	// in_flight (identical to driver/mysql Ack). The stale-ack-rejected
+	// assertion in the MySQL AE3 test happens post-reaper and lands in U4.
+	if err := s.Ack(ctx, d.ID, d.LeaseToken); err != nil {
+		t.Fatalf("old-token ack after lease expiry: %v", err)
+	}
+}
+
+// TestClaimPoisonToDead (edge supplement): when a delivery's attempts exceeds
+// max_attempts on a claim, the claim flips it to dead with lease fields nulled
+// and it never reaches the consumer.
+func TestClaimPoisonToDead(t *testing.T) {
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "poison_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish(ctx, topicID, []byte("x"), store.PublishOpts{
+		TTL:         time.Hour,
+		MaxAttempts: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := s.Claim(ctx, chID, "w1", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Attempts != 1 {
+		t.Fatalf("first claim = %#v", first)
+	}
+	if err := s.Requeue(ctx, first[0].ID, first[0].LeaseToken, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	// Second claim leases attempts=2 > max=1: poison. No delivery returned;
+	// the row is dead with nulled lease fields.
+	second, err := s.Claim(ctx, chID, "w2", 30*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("poison delivery handed to consumer: %#v", second)
+	}
+	var status string
+	var leaseOwner, leaseToken sql.NullString
+	var leaseUntil sql.NullInt64
+	if err := db.QueryRowContext(ctx, `
+		SELECT status, lease_owner, lease_token, lease_until
+		FROM novaque_deliveries WHERE id = $1`, first[0].ID).
+		Scan(&status, &leaseOwner, &leaseToken, &leaseUntil); err != nil {
+		t.Fatal(err)
+	}
+	if status != store.StatusDead {
+		t.Fatalf("status = %s, want dead", status)
+	}
+	if leaseOwner.Valid || leaseToken.Valid || leaseUntil.Valid {
+		t.Fatal("poison row kept lease fields")
+	}
+}
+
+// TestClaimConcurrentHammer (AE5, Execution note): two separate *sql.DB pools
+// and many goroutines hammer concurrent Claim on ONE channel (limit 3) until
+// all N=200 messages are leased. Against a single real PostgreSQL database,
+// FOR UPDATE SKIP LOCKED must guarantee no delivery is leased twice.
+func TestClaimConcurrentHammer(t *testing.T) {
+	dsn := testpostgres.DSN(t)
+	db := testpostgres.Open(t)
+	s := postgres.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	topic := "hammer_" + time.Now().Format("150405.000")
+	chID, err := s.EnsureChannel(ctx, topic, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := s.EnsureTopic(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 200
+	for i := 0; i < n; i++ {
+		if _, err := s.Publish(ctx, topicID, []byte{byte(i % 256)}, store.PublishOpts{TTL: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Two independent pools, both pointed at the one database.
+	pool1, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool2, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool1.SetMaxOpenConns(8)
+	pool2.SetMaxOpenConns(8)
+	t.Cleanup(func() {
+		_ = pool1.Close()
+		_ = pool2.Close()
+	})
+
+	var mu sync.Mutex
+	leased := make([]store.Delivery, 0, n)
+	var claimErr error
+	var leasedCount int64
+	var wg sync.WaitGroup
+
+	hammer := func(storeOnPool *postgres.Store, owner string) {
+		defer wg.Done()
+		for atomic.LoadInt64(&leasedCount) < int64(n) {
+			got, err := storeOnPool.Claim(ctx, chID, owner, 30*time.Second, 3)
+			if err != nil {
+				mu.Lock()
+				if claimErr == nil {
+					claimErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			if len(got) == 0 {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			mu.Lock()
+			leased = append(leased, got...)
+			mu.Unlock()
+			atomic.AddInt64(&leasedCount, int64(len(got)))
+		}
+	}
+
+	s1 := postgres.New(pool1)
+	s2 := postgres.New(pool2)
+	const workersPerPool = 8
+	for i := 0; i < workersPerPool; i++ {
+		wg.Add(2)
+		go hammer(s1, "pool1-w")
+		go hammer(s2, "pool2-w")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatalf("hammer timed out; leased %d of %d", atomic.LoadInt64(&leasedCount), n)
+	}
+	if claimErr != nil {
+		t.Fatalf("concurrent Claim error: %v", claimErr)
+	}
+
+	// No delivery leased twice: unique delivery ids == N.
+	ids := make(map[int64]bool, len(leased))
+	for _, d := range leased {
+		if ids[d.ID] {
+			t.Fatalf("delivery %d leased twice", d.ID)
+		}
+		ids[d.ID] = true
+	}
+	if len(ids) != n {
+		t.Fatalf("unique leased = %d, want %d (total claims %d)", len(ids), n, len(leased))
+	}
+
+	// Exact in_flight accounting: every leased row in_flight with attempts=1;
+	// no pending or dead leftovers (each row leased exactly once, well under
+	// max_attempts, so nothing could go dead).
+	statusRows, err := db.QueryContext(ctx, `
+		SELECT status, COUNT(*) FROM novaque_deliveries WHERE channel_id = $1 GROUP BY status`, chID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int64{}
+	for statusRows.Next() {
+		var st string
+		var c int64
+		if err := statusRows.Scan(&st, &c); err != nil {
+			t.Fatal(err)
+		}
+		counts[st] = c
+	}
+	if err := statusRows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if counts[store.StatusInFlight] != n {
+		t.Fatalf("in_flight = %d, want %d (counts=%v)", counts[store.StatusInFlight], n, counts)
+	}
+	if counts[store.StatusPending] != 0 {
+		t.Fatalf("pending leftovers = %d, want 0", counts[store.StatusPending])
+	}
+	if counts[store.StatusDead] != 0 {
+		t.Fatalf("dead leftovers = %d, want 0", counts[store.StatusDead])
+	}
+	var multiAttempt int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM novaque_deliveries
+		WHERE channel_id = $1 AND attempts <> 1`, chID).Scan(&multiAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if multiAttempt != 0 {
+		t.Fatalf("%d rows with attempts != 1", multiAttempt)
+	}
+
+	// Every leased delivery acks exactly once under real contention.
+	var ackFail int64
+	for _, d := range leased {
+		if err := s.Ack(ctx, d.ID, d.LeaseToken); err != nil {
+			ackFail++
+		}
+	}
+	if ackFail != 0 {
+		t.Fatalf("%d acks rejected after hammer", ackFail)
+	}
+	if left := countRow(t, ctx, db,
+		`SELECT COUNT(*) FROM novaque_deliveries WHERE channel_id = $1`, chID); left != 0 {
+		t.Fatalf("want 0 deliveries after acks, got %d", left)
 	}
 }

@@ -324,21 +324,6 @@ func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts st
 	return messageID, nil
 }
 
-// Claim leases up to limit eligible deliveries for a known channel id.
-func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseFor time.Duration, limit int) ([]store.Delivery, error) {
-	return nil, errNotImplemented("Claim")
-}
-
-// Ack completes a delivery when lease_token still matches.
-func (s *Store) Ack(ctx context.Context, deliveryID int64, leaseToken string) error {
-	return errNotImplemented("Ack")
-}
-
-// Requeue returns an in-flight delivery to pending when lease_token matches.
-func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string, availableAt time.Time) error {
-	return errNotImplemented("Requeue")
-}
-
 // ReapExpiredLeases resets in_flight rows whose lease_until is in the past.
 func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error) {
 	return 0, errNotImplemented("ReapExpiredLeases")
