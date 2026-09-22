@@ -315,9 +315,12 @@ func (h *handler) pageDeadDelivery(w http.ResponseWriter, r *http.Request) {
 // --- action handlers (mutations are POST-only, KTD4) ---
 
 // formRequeueDead answers POST /channels/{id}/dead/{deliveryID}/requeue
-// (R7): attempts reset and a fresh TTL via the Client. A wrapped
-// ErrDeadGone — someone else requeued or deleted first — is idempotent
-// success (R11): a notice back on the list, never an error page.
+// (R7): attempts reset and a fresh TTL via the Client. The store's guarded
+// mutation is scoped to the URL's channel (review #10) — a delivery dead
+// under a different channel matches 0 rows — and a wrapped ErrDeadGone
+// (someone else requeued or deleted first, or the id was never this
+// channel's) is idempotent success (R11): a notice back on the list, never
+// an error page.
 func (h *handler) formRequeueDead(w http.ResponseWriter, r *http.Request) {
 	channelID, deliveryID, ok := h.deadPathIDs(r)
 	if !ok {
@@ -328,13 +331,14 @@ func (h *handler) formRequeueDead(w http.ResponseWriter, r *http.Request) {
 		h.deadChannelError(w, r, err)
 		return
 	}
-	h.deadActionDone(w, r, channelID, h.client.RequeueDead(r.Context(), deliveryID), "requeued")
+	h.deadActionDone(w, r, channelID, h.client.RequeueDead(r.Context(), deliveryID, channelID), "requeued")
 }
 
 // formDeleteDead answers POST /channels/{id}/dead/{deliveryID}/delete (R7):
 // the dead delivery row is removed; the shared message row is reclaimed by
-// the orphan purge once its siblings are gone. ErrDeadGone is idempotent
-// success exactly as for requeue (R11).
+// the orphan purge once its siblings are gone. The store's guarded deletion
+// is scoped to the URL's channel exactly as for requeue (review #10), and
+// ErrDeadGone is idempotent success (R11).
 func (h *handler) formDeleteDead(w http.ResponseWriter, r *http.Request) {
 	channelID, deliveryID, ok := h.deadPathIDs(r)
 	if !ok {
@@ -345,7 +349,7 @@ func (h *handler) formDeleteDead(w http.ResponseWriter, r *http.Request) {
 		h.deadChannelError(w, r, err)
 		return
 	}
-	h.deadActionDone(w, r, channelID, h.client.DeleteDead(r.Context(), deliveryID), "deleted")
+	h.deadActionDone(w, r, channelID, h.client.DeleteDead(r.Context(), deliveryID, channelID), "deleted")
 }
 
 // deadPathIDs parses the {id} and {deliveryID} path values; false is a 404.

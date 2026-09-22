@@ -496,24 +496,27 @@ func (c *Client) ListDead(ctx context.Context, channelID, before int64, limit in
 	return rows, nil
 }
 
-// RequeueDead returns one dead delivery to pending — attempts reset, lease
-// cleared, available now — writing a fresh TTL of the client's DefaultTTL on
-// both the delivery and its message (the original per-publish TTL is not
-// stored, so the clock restarts). ErrDeadGone (wrapped) means the delivery
-// was no longer dead — already requeued or deleted — and a retry is
-// idempotent-safe.
-func (c *Client) RequeueDead(ctx context.Context, deliveryID int64) error {
-	if err := c.store.RequeueDead(ctx, deliveryID, c.opts.DefaultTTL); err != nil {
+// RequeueDead returns one dead delivery of channelID to pending — attempts
+// reset, lease cleared, available now — writing a fresh TTL of the client's
+// DefaultTTL on both the delivery and its message (the original per-publish
+// TTL is not stored, so the clock restarts). The store guard scopes the
+// mutation to that channel (review #10): a delivery dead under a different
+// channel matches 0 rows. ErrDeadGone (wrapped) means no dead row of that
+// channel matched — already requeued or deleted, or another channel's
+// delivery — and a retry is idempotent-safe.
+func (c *Client) RequeueDead(ctx context.Context, deliveryID, channelID int64) error {
+	if err := c.store.RequeueDead(ctx, deliveryID, channelID, c.opts.DefaultTTL); err != nil {
 		return fmt.Errorf("novaque requeue dead: %w", err)
 	}
 	return nil
 }
 
-// DeleteDead removes one dead delivery; the shared message row is reclaimed
-// by the orphan purge once its sibling deliveries are gone. ErrDeadGone
-// (wrapped) when the delivery was no longer dead.
-func (c *Client) DeleteDead(ctx context.Context, deliveryID int64) error {
-	if err := c.store.DeleteDead(ctx, deliveryID); err != nil {
+// DeleteDead removes one dead delivery of channelID; the shared message row
+// is reclaimed by the orphan purge once its sibling deliveries are gone. The
+// store guard scopes the deletion to that channel (review #10). ErrDeadGone
+// (wrapped) when no dead row of that channel matched.
+func (c *Client) DeleteDead(ctx context.Context, deliveryID, channelID int64) error {
+	if err := c.store.DeleteDead(ctx, deliveryID, channelID); err != nil {
 		return fmt.Errorf("novaque delete dead: %w", err)
 	}
 	return nil

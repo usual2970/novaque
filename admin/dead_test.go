@@ -16,6 +16,45 @@ import (
 	"time"
 )
 
+// TestDeadActionsCannotCrossChannels pins review #10: the write actions are
+// scoped to the channel in the URL. A dead delivery owned by another channel
+// is never requeued or deleted through this channel's URL — the scoped store
+// guard matches 0 rows, which collapses into the same idempotent
+// already-gone notice as any other ErrDeadGone (R11) rather than a distinct
+// error.
+func TestDeadActionsCannotCrossChannels(t *testing.T) {
+	ts, f := newTestServer(t, "/admin")
+	in3 := f.addDead(3, []byte("billing poison"), 5, time.Now().Add(time.Hour))
+
+	for _, path := range []string{
+		"/admin/channels/2/dead/" + strconv.FormatInt(in3, 10) + "/requeue",
+		"/admin/channels/2/dead/" + strconv.FormatInt(in3, 10) + "/delete",
+	} {
+		res, _ := doPost(t, noRedirect(), ts.URL+path, nil)
+		if res.StatusCode != http.StatusSeeOther {
+			t.Errorf("POST %s: status = %d, want 303 (scoped guard, idempotent collapse)", path, res.StatusCode)
+		}
+		if loc := res.Header.Get("Location"); loc != "/admin/channels/2/dead?done=already-gone" {
+			t.Errorf("POST %s: Location = %q, want done=already-gone", path, loc)
+		}
+	}
+
+	// No mutation ran: the row is still dead under its owning channel.
+	f.mu.Lock()
+	rows := len(f.dead[3])
+	f.mu.Unlock()
+	if rows != 1 {
+		t.Fatalf("dead rows under owning channel 3 = %d, want 1 (cross-channel action mutated state)", rows)
+	}
+
+	// The same actions through the owning channel still land as real
+	// mutations.
+	res, _ := doPost(t, noRedirect(), ts.URL+"/admin/channels/3/dead/"+strconv.FormatInt(in3, 10)+"/requeue", nil)
+	if res.StatusCode != http.StatusSeeOther || res.Header.Get("Location") != "/admin/channels/3/dead?done=requeued" {
+		t.Fatalf("own-channel requeue: %d %q, want 303 done=requeued", res.StatusCode, res.Header.Get("Location"))
+	}
+}
+
 // --- dead-letter surface (U5: R4, R7, R11, R12) ---
 
 func TestDeadListPageRendersRows(t *testing.T) {

@@ -38,8 +38,10 @@ type countingStore struct {
 	deleteTopicCalls    atomic.Int64
 	deleteChannelCalls  atomic.Int64
 	lastRequeueID       atomic.Int64
+	lastRequeueChan     atomic.Int64
 	lastRequeueTTL      atomic.Int64
 	lastDeleteDeadID    atomic.Int64
+	lastDeleteDeadChan  atomic.Int64
 	lastDeleteTopicID   atomic.Int64
 	lastDeleteChannelID atomic.Int64
 }
@@ -158,16 +160,18 @@ func (c *countingStore) ListDead(_ context.Context, channelID int64, before int6
 	return []store.DeadDelivery{{ID: before, ChannelID: channelID, Status: store.StatusDead, Attempts: limit}}, nil
 }
 
-func (c *countingStore) RequeueDead(_ context.Context, deliveryID int64, freshTTL time.Duration) error {
+func (c *countingStore) RequeueDead(_ context.Context, deliveryID, channelID int64, freshTTL time.Duration) error {
 	c.requeueDeadCalls.Add(1)
 	c.lastRequeueID.Store(deliveryID)
+	c.lastRequeueChan.Store(channelID)
 	c.lastRequeueTTL.Store(int64(freshTTL))
 	return nil
 }
 
-func (c *countingStore) DeleteDead(_ context.Context, deliveryID int64) error {
+func (c *countingStore) DeleteDead(_ context.Context, deliveryID, channelID int64) error {
 	c.deleteDeadCalls.Add(1)
 	c.lastDeleteDeadID.Store(deliveryID)
+	c.lastDeleteDeadChan.Store(channelID)
 	return nil
 }
 
@@ -377,10 +381,10 @@ func TestCachingStoreForwardsAdminSurface(t *testing.T) {
 		if len(dead) != 1 || dead[0].ID != 42 || dead[0].ChannelID != 7 || dead[0].Attempts != 50 {
 			t.Fatalf("ListDead passthrough mangled: %#v", dead)
 		}
-		if err := s.RequeueDead(ctx, 42, time.Hour); err != nil {
+		if err := s.RequeueDead(ctx, 42, 7, time.Hour); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.DeleteDead(ctx, 42); err != nil {
+		if err := s.DeleteDead(ctx, 42, 7); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -403,11 +407,17 @@ func TestCachingStoreForwardsAdminSurface(t *testing.T) {
 	if got := inner.lastRequeueID.Load(); got != 42 {
 		t.Errorf("RequeueDead deliveryID = %d, want 42", got)
 	}
+	if got := inner.lastRequeueChan.Load(); got != 7 {
+		t.Errorf("RequeueDead channelID = %d, want 7 (channel scope forwarded)", got)
+	}
 	if got := inner.lastRequeueTTL.Load(); got != int64(time.Hour) {
 		t.Errorf("RequeueDead freshTTL = %d, want %d", got, int64(time.Hour))
 	}
 	if got := inner.lastDeleteDeadID.Load(); got != 42 {
 		t.Errorf("DeleteDead deliveryID = %d, want 42", got)
+	}
+	if got := inner.lastDeleteDeadChan.Load(); got != 7 {
+		t.Errorf("DeleteDead channelID = %d, want 7 (channel scope forwarded)", got)
 	}
 }
 

@@ -191,14 +191,16 @@ func (c *CachingStore) ListDead(ctx context.Context, channelID int64, before int
 	return c.Inner.ListDead(ctx, channelID, before, limit)
 }
 
-// RequeueDead passes through to Inner.RequeueDead.
-func (c *CachingStore) RequeueDead(ctx context.Context, deliveryID int64, freshTTL time.Duration) error {
-	return c.Inner.RequeueDead(ctx, deliveryID, freshTTL)
+// RequeueDead passes through to Inner.RequeueDead (channel-scoped mutation,
+// never cached).
+func (c *CachingStore) RequeueDead(ctx context.Context, deliveryID, channelID int64, freshTTL time.Duration) error {
+	return c.Inner.RequeueDead(ctx, deliveryID, channelID, freshTTL)
 }
 
-// DeleteDead passes through to Inner.DeleteDead.
-func (c *CachingStore) DeleteDead(ctx context.Context, deliveryID int64) error {
-	return c.Inner.DeleteDead(ctx, deliveryID)
+// DeleteDead passes through to Inner.DeleteDead (channel-scoped mutation,
+// never cached).
+func (c *CachingStore) DeleteDead(ctx context.Context, deliveryID, channelID int64) error {
+	return c.Inner.DeleteDead(ctx, deliveryID, channelID)
 }
 
 // DeleteTopic evicts this process's memoized ids for the topic — its name

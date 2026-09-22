@@ -320,17 +320,20 @@ type Store interface {
 	// bounds the page, non-positive falling back to a driver default.
 	ListDead(ctx context.Context, channelID int64, before int64, limit int) ([]DeadDelivery, error)
 
-	// RequeueDead returns one dead delivery to pending — attempts reset,
-	// lease cleared, available now — writing freshTTL as its new expiry on
-	// both the delivery and its message. Guarded on status = dead:
-	// ErrDeadGone is returned when no dead row matched (already requeued or
-	// deleted), so retries land as idempotent success.
-	RequeueDead(ctx context.Context, deliveryID int64, freshTTL time.Duration) error
+	// RequeueDead returns one dead delivery of channelID to pending —
+	// attempts reset, lease cleared, available now — writing freshTTL as its
+	// new expiry on both the delivery and its message. Guarded on
+	// channel_id = channelID AND status = dead (review #10: the caller's
+	// channel scopes the mutation): ErrDeadGone is returned when no dead row
+	// of that channel matched — already requeued or deleted, or the delivery
+	// belongs to a different channel — so retries land as idempotent success.
+	RequeueDead(ctx context.Context, deliveryID, channelID int64, freshTTL time.Duration) error
 
-	// DeleteDead removes one dead delivery; the shared message row is
-	// reclaimed by the orphan purge once its sibling deliveries are gone.
-	// Guarded on status = dead: ErrDeadGone when no dead row matched.
-	DeleteDead(ctx context.Context, deliveryID int64) error
+	// DeleteDead removes one dead delivery of channelID; the shared message
+	// row is reclaimed by the orphan purge once its sibling deliveries are
+	// gone. Guarded on channel_id = channelID AND status = dead (review
+	// #10): ErrDeadGone when no dead row of that channel matched.
+	DeleteDead(ctx context.Context, deliveryID, channelID int64) error
 
 	// DeleteTopic removes the topic and everything under it — channels,
 	// messages, deliveries, and retained stats rows including the

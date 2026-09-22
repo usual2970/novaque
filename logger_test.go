@@ -66,8 +66,8 @@ func (nopStore) ChannelDailyCounters(context.Context, int64, int) ([]store.Daily
 func (nopStore) ListDead(context.Context, int64, int64, int) ([]store.DeadDelivery, error) {
 	return nil, nil
 }
-func (nopStore) RequeueDead(context.Context, int64, time.Duration) error { return nil }
-func (nopStore) DeleteDead(context.Context, int64) error                 { return nil }
+func (nopStore) RequeueDead(context.Context, int64, int64, time.Duration) error { return nil }
+func (nopStore) DeleteDead(context.Context, int64, int64) error                 { return nil }
 func (nopStore) DeleteTopic(context.Context, int64) error                { return nil }
 func (nopStore) DeleteChannel(context.Context, int64) error              { return nil }
 

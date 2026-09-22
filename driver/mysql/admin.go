@@ -256,22 +256,27 @@ func (s *Store) deadAttribution(ctx context.Context, deliveryID int64) (topicID,
 	return topicID, channelID, err
 }
 
-// RequeueDead returns one dead delivery to pending per KTD8: attempts reset
-// to zero, lease cleared, available now, and a fresh TTL written to BOTH
-// expires_at columns — the delivery column keeps the requeued row past the
-// next purge tick, the message column stops the orphan purge and the
-// message-delete cascade from eating it. Extending messages.expires_at is
-// safe for sibling deliveries: each sibling's own deliveries.expires_at
-// still governs its purge, and the message row lives until its last delivery
-// is gone (existing orphan semantics). The guarded WHERE makes the operation
-// idempotent-safe: a second call affects 0 rows and returns ErrDeadGone.
-func (s *Store) RequeueDead(ctx context.Context, deliveryID int64, freshTTL time.Duration) error {
+// RequeueDead returns one dead delivery of channelID to pending per KTD8:
+// attempts reset to zero, lease cleared, available now, and a fresh TTL
+// written to BOTH expires_at columns — the delivery column keeps the
+// requeued row past the next purge tick, the message column stops the orphan
+// purge and the message-delete cascade from eating it. Extending
+// messages.expires_at is safe for sibling deliveries: each sibling's own
+// deliveries.expires_at still governs its purge, and the message row lives
+// until its last delivery is gone (existing orphan semantics). The guarded
+// WHERE — channel-scoped as well as status-dead (review #10: the URL names
+// the channel, so a delivery dead under a different channel must never move)
+// — makes the operation idempotent-safe: a second call, or one naming
+// another channel's delivery, affects 0 rows and returns ErrDeadGone.
+func (s *Store) RequeueDead(ctx context.Context, deliveryID, channelID int64, freshTTL time.Duration) error {
 	if freshTTL <= 0 {
 		return fmt.Errorf("mysql admin: invalid fresh TTL %s", freshTTL)
 	}
 	// Read-only stats attribution before the mutation (Ack/Requeue pattern):
 	// only a RowsAffected-confirmed transition with known coordinates counts.
-	topicID, channelID, scanErr := s.deadAttribution(ctx, deliveryID)
+	// The channel comes from the parameter, not attribution — the scoped
+	// guard below confirms the two agree before the stat is recorded.
+	topicID, _, scanErr := s.deadAttribution(ctx, deliveryID)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return scanErr
 	}
@@ -288,8 +293,8 @@ func (s *Store) RequeueDead(ctx context.Context, deliveryID int64, freshTTL time
 		SET status = ?, attempts = 0, available_at = `+sqlNow+`,
 		    lease_owner = NULL, lease_token = NULL, lease_until = NULL,
 		    expires_at = `+sqlNow+` + ?
-		WHERE id = ? AND status = ?`,
-		store.StatusPending, ttlSec, deliveryID, store.StatusDead)
+		WHERE id = ? AND channel_id = ? AND status = ?`,
+		store.StatusPending, ttlSec, deliveryID, channelID, store.StatusDead)
 	if err != nil {
 		return err
 	}
@@ -319,18 +324,23 @@ func (s *Store) RequeueDead(ctx context.Context, deliveryID int64, freshTTL time
 	return nil
 }
 
-// DeleteDead removes one dead delivery; the shared message row is reclaimed
-// by the orphan purge once its sibling deliveries are gone. Guarded on
-// status = dead: ErrDeadGone when no dead row matched. Manual dead-letter
-// deletions count as purge (KTD8: purge = TTL purges + manual deletions).
-func (s *Store) DeleteDead(ctx context.Context, deliveryID int64) error {
-	topicID, channelID, scanErr := s.deadAttribution(ctx, deliveryID)
+// DeleteDead removes one dead delivery of channelID; the shared message row
+// is reclaimed by the orphan purge once its sibling deliveries are gone.
+// Guarded on channel_id = channelID AND status = dead (review #10: the URL
+// names the channel, so a delivery dead under a different channel is never
+// removed through it): ErrDeadGone when no dead row of that channel matched.
+// Manual dead-letter deletions count as purge (KTD8: purge = TTL purges +
+// manual deletions).
+func (s *Store) DeleteDead(ctx context.Context, deliveryID, channelID int64) error {
+	// The channel comes from the parameter, not attribution — the scoped
+	// guard confirms the two agree before the stat is recorded.
+	topicID, _, scanErr := s.deadAttribution(ctx, deliveryID)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return scanErr
 	}
 	res, err := s.db.ExecContext(ctx, `
-		DELETE FROM novaque_deliveries WHERE id = ? AND status = ?`,
-		deliveryID, store.StatusDead)
+		DELETE FROM novaque_deliveries WHERE id = ? AND channel_id = ? AND status = ?`,
+		deliveryID, channelID, store.StatusDead)
 	if err != nil {
 		return err
 	}

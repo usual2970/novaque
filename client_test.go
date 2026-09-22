@@ -81,8 +81,10 @@ type fakeStore struct {
 	lastDeadBefore      int64
 	lastDeadLimit       int
 	lastRequeueDeadID   int64
+	lastRequeueDeadChan int64
 	lastRequeueDeadTTL  time.Duration
 	lastDeleteDeadID    int64
+	lastDeleteDeadChan  int64
 	lastDeleteTopicID   int64
 	lastDeleteChannelID int64
 }
@@ -374,18 +376,20 @@ func (f *fakeStore) ListDead(_ context.Context, channelID int64, before int64, l
 	return f.deadRows, nil
 }
 
-func (f *fakeStore) RequeueDead(_ context.Context, deliveryID int64, freshTTL time.Duration) error {
+func (f *fakeStore) RequeueDead(_ context.Context, deliveryID, channelID int64, freshTTL time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastRequeueDeadID = deliveryID
+	f.lastRequeueDeadChan = channelID
 	f.lastRequeueDeadTTL = freshTTL
 	return nil
 }
 
-func (f *fakeStore) DeleteDead(_ context.Context, deliveryID int64) error {
+func (f *fakeStore) DeleteDead(_ context.Context, deliveryID, channelID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastDeleteDeadID = deliveryID
+	f.lastDeleteDeadChan = channelID
 	return nil
 }
 
@@ -1313,25 +1317,26 @@ func TestDeleteForwardsIDWithoutEnsure(t *testing.T) {
 	}
 }
 
-// TestDeadOpsForwardThroughClient covers R7 client wiring: RequeueDead passes
-// the client's DefaultTTL (explicit option and zero-value default) and
-// DeleteDead forwards the id.
+// TestDeadOpsForwardThroughClient covers R7 client wiring: RequeueDead
+// passes the channel scope (review #10) and the client's DefaultTTL
+// (explicit option and zero-value default); DeleteDead forwards the id and
+// channel.
 func TestDeadOpsForwardThroughClient(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("requeue passes configured DefaultTTL", func(t *testing.T) {
+	t.Run("requeue passes channel scope and configured DefaultTTL", func(t *testing.T) {
 		f := newFake()
 		c, err := novaque.Open(f, novaque.Options{DefaultTTL: 3 * time.Hour})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := c.RequeueDead(ctx, 77); err != nil {
+		if err := c.RequeueDead(ctx, 77, 5); err != nil {
 			t.Fatal(err)
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if f.lastRequeueDeadID != 77 || f.lastRequeueDeadTTL != 3*time.Hour {
-			t.Fatalf("RequeueDead saw (%d, %v), want (77, 3h)", f.lastRequeueDeadID, f.lastRequeueDeadTTL)
+		if f.lastRequeueDeadID != 77 || f.lastRequeueDeadChan != 5 || f.lastRequeueDeadTTL != 3*time.Hour {
+			t.Fatalf("RequeueDead saw (%d, chan %d, %v), want (77, chan 5, 3h)", f.lastRequeueDeadID, f.lastRequeueDeadChan, f.lastRequeueDeadTTL)
 		}
 	})
 
@@ -1341,7 +1346,7 @@ func TestDeadOpsForwardThroughClient(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := c.RequeueDead(ctx, 1); err != nil {
+		if err := c.RequeueDead(ctx, 1, 2); err != nil {
 			t.Fatal(err)
 		}
 		f.mu.Lock()
@@ -1351,19 +1356,19 @@ func TestDeadOpsForwardThroughClient(t *testing.T) {
 		}
 	})
 
-	t.Run("delete dead forwards the id", func(t *testing.T) {
+	t.Run("delete dead forwards the id and channel", func(t *testing.T) {
 		f := newFake()
 		c, err := novaque.Open(f, novaque.Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := c.DeleteDead(ctx, 99); err != nil {
+		if err := c.DeleteDead(ctx, 99, 6); err != nil {
 			t.Fatal(err)
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if f.lastDeleteDeadID != 99 {
-			t.Fatalf("DeleteDead forwarded %d, want 99", f.lastDeleteDeadID)
+		if f.lastDeleteDeadID != 99 || f.lastDeleteDeadChan != 6 {
+			t.Fatalf("DeleteDead forwarded (%d, chan %d), want (99, chan 6)", f.lastDeleteDeadID, f.lastDeleteDeadChan)
 		}
 	})
 }

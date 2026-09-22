@@ -532,12 +532,24 @@ func TestAdminRequeueDeadFreshTTL(t *testing.T) {
 		t.Fatalf("dead row = %d, want 1", n)
 	}
 
-	// Argument guards run before any mutation.
-	if err := s.RequeueDead(ctx, deadID, 0); err == nil {
+	// Argument guards run before any mutation; a wrong channel scope is the
+	// 0-rows ErrDeadGone of the scoped guard (review #10) — the delivery
+	// stays dead under its owning channel.
+	otherChID, err := s.EnsureChannel(ctx, topic, "X")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequeueDead(ctx, deadID, chID, 0); err == nil {
 		t.Fatal("RequeueDead freshTTL=0 must error")
 	}
-	if err := s.RequeueDead(ctx, 999999999, time.Hour); !errors.Is(err, store.ErrDeadGone) {
+	if err := s.RequeueDead(ctx, 999999999, chID, time.Hour); !errors.Is(err, store.ErrDeadGone) {
 		t.Fatalf("RequeueDead unknown id = %v, want ErrDeadGone", err)
+	}
+	if err := s.RequeueDead(ctx, deadID, otherChID, time.Hour); !errors.Is(err, store.ErrDeadGone) {
+		t.Fatalf("RequeueDead wrong channel = %v, want ErrDeadGone (scoped guard)", err)
+	}
+	if n := countRow(t, ctx, db, `SELECT COUNT(*) FROM novaque_deliveries WHERE id = ? AND status = 'dead'`, deadID); n != 1 {
+		t.Fatalf("dead row after wrong-channel attempt = %d, want 1 (no mutation)", n)
 	}
 
 	// 3.6s for a 3s TTL (DB-second flooring margin, same as the other timing
@@ -551,7 +563,7 @@ func TestAdminRequeueDeadFreshTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.RequeueDead(ctx, deadID, time.Hour); err != nil {
+	if err := s.RequeueDead(ctx, deadID, chID, time.Hour); err != nil {
 		t.Fatalf("RequeueDead: %v", err)
 	}
 	var newDeliveryExp, newMessageExp int64
@@ -608,7 +620,7 @@ func TestAdminRequeueDeadFreshTTL(t *testing.T) {
 
 	// The guard: the row is no longer dead, so a second requeue is
 	// ErrDeadGone (idempotent-safe for racing admins).
-	if err := s.RequeueDead(ctx, deadID, time.Hour); !errors.Is(err, store.ErrDeadGone) {
+	if err := s.RequeueDead(ctx, deadID, chID, time.Hour); !errors.Is(err, store.ErrDeadGone) {
 		t.Fatalf("second RequeueDead = %v, want ErrDeadGone", err)
 	}
 }
@@ -728,9 +740,10 @@ func TestAdminListDeadPagination(t *testing.T) {
 	}
 }
 
-// TestAdminDeleteDead: DeleteDead removes exactly the guarded row, bumps the
-// purge counter, leaves sibling dead rows, and reports ErrDeadGone when no
-// dead row matches (including for non-dead deliveries).
+// TestAdminDeleteDead: DeleteDead removes exactly the guarded row of the
+// named channel, bumps the purge counter, leaves sibling dead rows, and
+// reports ErrDeadGone when no dead row of that channel matches (non-dead
+// deliveries, and — review #10 — a dead row under a different channel).
 func TestAdminDeleteDead(t *testing.T) {
 	db := testmysql.Open(t)
 	s := mysql.New(db)
@@ -775,7 +788,7 @@ func TestAdminDeleteDead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.DeleteDead(ctx, deadIDs[1]); err != nil {
+	if err := s.DeleteDead(ctx, deadIDs[1], chID); err != nil {
 		t.Fatalf("DeleteDead: %v", err)
 	}
 	if n := countRow(t, ctx, db, `SELECT COUNT(*) FROM novaque_deliveries WHERE id = ?`, deadIDs[1]); n != 0 {
@@ -788,10 +801,22 @@ func TestAdminDeleteDead(t *testing.T) {
 	if len(left) != 2 {
 		t.Fatalf("remaining dead rows = %d, want 2 (siblings kept)", len(left))
 	}
-	if err := s.DeleteDead(ctx, deadIDs[1]); !errors.Is(err, store.ErrDeadGone) {
+	// The scoped guard (review #10): a sibling dead row is not removable
+	// through another channel's id.
+	otherChID, err := s.EnsureChannel(ctx, topic, "X")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteDead(ctx, deadIDs[0], otherChID); !errors.Is(err, store.ErrDeadGone) {
+		t.Fatalf("DeleteDead wrong channel = %v, want ErrDeadGone (scoped guard)", err)
+	}
+	if n := countRow(t, ctx, db, `SELECT COUNT(*) FROM novaque_deliveries WHERE id = ?`, deadIDs[0]); n != 1 {
+		t.Fatalf("sibling after wrong-channel delete = %d, want 1 (no mutation)", n)
+	}
+	if err := s.DeleteDead(ctx, deadIDs[1], chID); !errors.Is(err, store.ErrDeadGone) {
 		t.Fatalf("re-delete = %v, want ErrDeadGone", err)
 	}
-	if err := s.DeleteDead(ctx, aliveID); !errors.Is(err, store.ErrDeadGone) {
+	if err := s.DeleteDead(ctx, aliveID, chID); !errors.Is(err, store.ErrDeadGone) {
 		t.Fatalf("DeleteDead on pending row = %v, want ErrDeadGone", err)
 	}
 	if n := countRow(t, ctx, db, `SELECT COUNT(*) FROM novaque_deliveries WHERE id = ?`, aliveID); n != 1 {

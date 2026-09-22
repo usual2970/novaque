@@ -144,16 +144,17 @@ func (f *fakeStore) addDead(channelID int64, body []byte, attempts int, expiresA
 	return id
 }
 
-// removeDeadLocked drops a dead row by id (status-guarded semantics: the
-// row is only here while dead); false means no dead row matched — the
-// driver's 0-rows case. Callers hold f.mu.
-func (f *fakeStore) removeDeadLocked(deliveryID int64) bool {
-	for cid, rows := range f.dead {
-		for i, d := range rows {
-			if d.ID == deliveryID {
-				f.dead[cid] = append(rows[:i:i], rows[i+1:]...)
-				return true
-			}
+// removeDeadLocked drops a dead row by id under channelID — the scoped
+// guard (review #10): a row dead under a different channel is not this
+// call's to move. Status-guarded semantics hold (the row is only here while
+// dead); false means no dead row of that channel matched — the driver's
+// 0-rows case. Callers hold f.mu.
+func (f *fakeStore) removeDeadLocked(channelID, deliveryID int64) bool {
+	rows := f.dead[channelID]
+	for i, d := range rows {
+		if d.ID == deliveryID {
+			f.dead[channelID] = append(rows[:i:i], rows[i+1:]...)
+			return true
 		}
 	}
 	return false
@@ -405,30 +406,33 @@ func (f *fakeStore) ListDead(_ context.Context, channelID int64, before int64, l
 	return rows, nil
 }
 
-// RequeueDead follows the guarded-WHERE contract: the call is captured, an
-// injected failure surfaces, and a missing dead row is 0 affected rows →
-// store.ErrDeadGone (the R11 idempotent-success input).
-func (f *fakeStore) RequeueDead(_ context.Context, deliveryID int64, freshTTL time.Duration) error {
+// RequeueDead follows the channel-scoped guarded-WHERE contract (review
+// #10): the call is captured, an injected failure surfaces, and no dead row
+// under channelID is 0 affected rows → store.ErrDeadGone (the R11
+// idempotent-success input — requeued or deleted already, or another
+// channel's delivery).
+func (f *fakeStore) RequeueDead(_ context.Context, deliveryID, channelID int64, freshTTL time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requeuedDead = append(f.requeuedDead, deliveryID)
 	if f.failRequeueDead != nil {
 		return f.failRequeueDead
 	}
-	if !f.removeDeadLocked(deliveryID) {
+	if !f.removeDeadLocked(channelID, deliveryID) {
 		return store.ErrDeadGone
 	}
 	return nil
 }
 
-func (f *fakeStore) DeleteDead(_ context.Context, deliveryID int64) error {
+// DeleteDead mirrors the same channel-scoped guard as RequeueDead.
+func (f *fakeStore) DeleteDead(_ context.Context, deliveryID, channelID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deletedDead = append(f.deletedDead, deliveryID)
 	if f.failDeleteDead != nil {
 		return f.failDeleteDead
 	}
-	if !f.removeDeadLocked(deliveryID) {
+	if !f.removeDeadLocked(channelID, deliveryID) {
 		return store.ErrDeadGone
 	}
 	return nil
