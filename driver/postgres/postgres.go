@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -137,13 +136,6 @@ func idPlaceholders(ids []int64) (marks string, args []any) {
 		args = append(args, id)
 	}
 	return strings.Join(placeholders, ","), args
-}
-
-// errNotImplemented marks store.Store methods whose bodies arrive in later
-// units. U1 only implements Migrate; every other method fails loudly rather
-// than faking behavior.
-func errNotImplemented(method string) error {
-	return fmt.Errorf("postgres: %s not implemented yet", method)
 }
 
 // EnsureTopic creates the topic if missing. One round trip: ON CONFLICT with a
@@ -327,59 +319,4 @@ func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts st
 		}
 	}
 	return messageID, nil
-}
-
-// ListTopics returns every topic, ascending by name.
-func (s *Store) ListTopics(ctx context.Context) ([]store.TopicInfo, error) {
-	return nil, errNotImplemented("ListTopics")
-}
-
-// ListChannels returns every channel across all topics, topic name then channel name.
-func (s *Store) ListChannels(ctx context.Context) ([]store.ChannelInfo, error) {
-	return nil, errNotImplemented("ListChannels")
-}
-
-// Backlogs returns live per-channel backlog counts for every channel in one query.
-func (s *Store) Backlogs(ctx context.Context) ([]store.BacklogRow, error) {
-	return nil, errNotImplemented("Backlogs")
-}
-
-// BacklogsForTopic scopes the batched backlog aggregate to one topic's channels.
-func (s *Store) BacklogsForTopic(ctx context.Context, topicID int64) ([]store.BacklogRow, error) {
-	return nil, errNotImplemented("BacklogsForTopic")
-}
-
-// TopicDailyCounters returns the topic's per-day counter rows over the trailing window.
-func (s *Store) TopicDailyCounters(ctx context.Context, topicID int64, days int) ([]store.DailyCounters, error) {
-	return nil, errNotImplemented("TopicDailyCounters")
-}
-
-// ChannelDailyCounters returns one channel's per-day counter rows over the trailing window.
-func (s *Store) ChannelDailyCounters(ctx context.Context, channelID int64, days int) ([]store.DailyCounters, error) {
-	return nil, errNotImplemented("ChannelDailyCounters")
-}
-
-// ListDead returns a channel's dead deliveries newest-first, keyset-paginated.
-func (s *Store) ListDead(ctx context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]store.DeadDelivery, error) {
-	return nil, errNotImplemented("ListDead")
-}
-
-// RequeueDead returns one dead delivery to pending with a fresh expiry.
-func (s *Store) RequeueDead(ctx context.Context, deliveryID, channelID int64, freshTTL time.Duration) error {
-	return errNotImplemented("RequeueDead")
-}
-
-// DeleteDead removes one dead delivery.
-func (s *Store) DeleteDead(ctx context.Context, deliveryID, channelID int64) error {
-	return errNotImplemented("DeleteDead")
-}
-
-// DeleteTopic removes the topic and everything under it in one transaction.
-func (s *Store) DeleteTopic(ctx context.Context, topicID int64) error {
-	return errNotImplemented("DeleteTopic")
-}
-
-// DeleteChannel removes one channel's deliveries and stats rows.
-func (s *Store) DeleteChannel(ctx context.Context, channelID int64) error {
-	return errNotImplemented("DeleteChannel")
 }
