@@ -1,3 +1,9 @@
+// Package novaque provides an embeddable, NSQ-style topic→channel pub/sub
+// queue backed by a relational database. The host supplies the *sql.DB and
+// novaque runs in-process — no broker daemon. Delivery is at-least-once with
+// lease-based claiming and explicit ack, so handlers must be idempotent.
+// The MySQL driver under driver/mysql implements the dialect-agnostic
+// store.Store seam; other backends plug in the same way.
 package novaque
 
 import (
@@ -13,27 +19,41 @@ import (
 	"github.com/usual2970/novaque/store"
 )
 
-// Options configure Client defaults.
+// Options configure Client defaults. Zero-valued fields fall back to the
+// per-field defaults below; a nil Logger becomes a silent Nop.
 type Options struct {
-	DefaultTTL         time.Duration
-	DefaultLease       time.Duration
+	// DefaultTTL is message retention when a publish omits TTL. Default 7d.
+	DefaultTTL time.Duration
+	// DefaultLease is the claim lease duration and the handler context
+	// timeout. Default 30s.
+	DefaultLease time.Duration
+	// DefaultMaxAttempts is the poison threshold when a publish omits
+	// MaxAttempts; deliveries past it go dead. Default 5.
 	DefaultMaxAttempts int
-	PollInterval       time.Duration
+	// PollInterval is the consumer idle poll base, applied with ±50% jitter.
+	// Default 200ms.
+	PollInterval time.Duration
 	// MaxInFlight is concurrent claim+handle workers per Consumer (each claims 1).
 	// Raise this for in-process concurrency; add more OS processes for multi-node scale.
-	MaxInFlight      int
-	ReapInterval     time.Duration
-	PurgeInterval    time.Duration
+	// Default 1.
+	MaxInFlight int
+	// ReapInterval is the expired-lease reaper tick. Default 1s.
+	ReapInterval time.Duration
+	// PurgeInterval is the TTL cleanup tick. Default 5s.
+	PurgeInterval time.Duration
+	// MaintenanceBatch is rows per reaper/purge pass. Default 100.
 	MaintenanceBatch int
 	// StatsRetentionDays keeps day-bucket counter rows for this many UTC days
 	// before the prune tick (or an explicit PruneStats call) deletes them.
+	// Default 30.
 	StatsRetentionDays int
 	// StatsFlushInterval is how often the maintenance loop drains the driver's
-	// buffered counter deltas into the stats table.
+	// buffered counter deltas into the stats table. Default 2s.
 	StatsFlushInterval time.Duration
 	// StatsPruneInterval is how often the maintenance loop prunes day-bucket
 	// counter rows older than StatsRetentionDays. Dedicated field (not a
 	// PurgeInterval co-tick) so prune stays gentle and unit-testable.
+	// Default 1h.
 	StatsPruneInterval time.Duration
 	// Logger receives structured operational logs (Debug on success, Error on
 	// swallowed failures; message bodies are never logged). nil = silent
@@ -115,7 +135,8 @@ func (c *Client) Migrate(ctx context.Context) error {
 }
 
 // Start begins shared reaper, TTL purge, and stats maintenance loops
-// (exactly once per Client).
+// (exactly once per Client). A nil ctx defaults to context.Background();
+// a duplicate Start is a no-op.
 func (c *Client) Start(ctx context.Context) error {
 	c.mu.Lock()
 	if c.started {
@@ -141,7 +162,10 @@ func (c *Client) Start(ctx context.Context) error {
 	return nil
 }
 
-// Shutdown stops maintenance loops and waits for them to exit.
+// Shutdown stops maintenance loops and waits for them to exit, then performs
+// one final best-effort FlushStats (5s timeout). ctx is a non-nil wait
+// deadline: if it expires before the loops finish, Shutdown returns
+// ctx.Err(). Shutdown of a never-started Client is a no-op.
 func (c *Client) Shutdown(ctx context.Context) error {
 	c.mu.Lock()
 	if !c.started {
@@ -327,21 +351,39 @@ func (c *Client) FlushStats(ctx context.Context) error {
 // MaxDelay is the maximum publish Delay (re-export of store.MaxDelay).
 const MaxDelay = store.MaxDelay
 
-// Sentinel errors for publish Delay validation (re-exported from store).
 var (
-	ErrDelayNegative   = store.ErrDelayNegative
-	ErrDelayTooLong    = store.ErrDelayTooLong
+	// ErrDelayNegative is returned by Publish when Delay is negative
+	// (re-export of store.ErrDelayNegative; compare with errors.Is).
+	ErrDelayNegative = store.ErrDelayNegative
+	// ErrDelayTooLong is returned by Publish when Delay exceeds MaxDelay
+	// (re-export of store.ErrDelayTooLong; compare with errors.Is).
+	ErrDelayTooLong = store.ErrDelayTooLong
+	// ErrDelayExceedsTTL is returned by Publish when Delay would leave no
+	// claimable window before the message expires (re-export of
+	// store.ErrDelayExceedsTTL; compare with errors.Is).
 	ErrDelayExceedsTTL = store.ErrDelayExceedsTTL
 )
 
 // PublishOpts are per-message publish options.
 type PublishOpts struct {
-	TTL         time.Duration
-	Delay       time.Duration // relative; 0 = immediate; max MaxDelay
+	// TTL is retention from publish time; zero falls back to DefaultTTL.
+	TTL time.Duration
+	// Delay is relative time until deliveries become claimable (NSQ
+	// DPUB-style); zero = immediate, maximum MaxDelay, and it must leave a
+	// claimable window before expiry.
+	Delay time.Duration
+	// MaxAttempts is the poison threshold for this message's deliveries;
+	// zero falls back to DefaultMaxAttempts.
 	MaxAttempts int
 }
 
-// Publish fans out body to all existing channels on topic.
+// Publish fans out body to every channel that exists on topic at publish
+// time and returns the new message id. Delivery is at-least-once. Fan-out is
+// a snapshot: channels created later do not receive the message, and a
+// publish to a topic with no channels still stores the message. The topic is
+// created on demand. TTL and MaxAttempts default-fill from Options; a Delay
+// outside MaxDelay or the effective TTL returns ErrDelayNegative,
+// ErrDelayTooLong, or ErrDelayExceedsTTL (compare with errors.Is).
 func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts PublishOpts) (int64, error) {
 	topicID, err := c.store.EnsureTopic(ctx, topic)
 	if err != nil {
@@ -369,7 +411,15 @@ func (c *Client) Publish(ctx context.Context, topic string, body []byte, opts Pu
 	return id, nil
 }
 
-// Handler processes one message. nil error acks; non-nil requeues.
+// Handler processes one message. A nil return acks the delivery; a non-nil
+// return requeues it immediately. Redelivery is possible (crash before ack,
+// lease expiry, dropped finish), so handlers must be idempotent. The ctx is
+// a fresh context.Background() bounded by the lease timeout
+// (Options.DefaultLease) — not the Start context, so Shutdown does not
+// cancel an in-flight handler. After the handler returns, the ack or requeue
+// is retried 3 times with 50ms backoff under a 5s cap; if it still fails,
+// the failure is logged and the delivery is dropped back to its lease
+// expiry, which makes it claimable again.
 type Handler func(ctx context.Context, msg *Message) error
 
 // Message is an in-flight delivery handed to a Handler.
@@ -378,11 +428,16 @@ type Message struct {
 	deliveryID int64
 	leaseToken string
 
+	// MessageID identifies the shared published message.
 	MessageID int64
-	Topic     string
-	Channel   string
-	Body      []byte
-	Attempts  int
+	// Topic and Channel are the delivery's destination names.
+	Topic   string
+	Channel string
+	// Body is the message payload.
+	Body []byte
+	// Attempts is the number of claims so far, counting the claim that
+	// produced this delivery.
+	Attempts int
 }
 
 // Consumer polls a topic/channel and dispatches to Handler.
@@ -432,7 +487,10 @@ func (c *Client) SubscribeAndStart(ctx context.Context, topic, channel string, h
 	return co, nil
 }
 
-// Start launches one batch poller and MaxInFlight handler workers.
+// Start launches one batch poller and MaxInFlight handler workers. A nil
+// ctx defaults to context.Background(); a duplicate Start is a no-op.
+// Cancelling ctx (or Shutdown) stops claiming new work but already-claimed
+// deliveries keep draining so their leases get acked or requeued.
 func (co *Consumer) Start(ctx context.Context) error {
 	co.mu.Lock()
 	if co.started {
@@ -471,7 +529,12 @@ func (co *Consumer) logger() Logger {
 		zap.String("channel", co.channel))
 }
 
-// Shutdown stops the poller and waits for in-flight handlers.
+// Shutdown stops the poller and waits for in-flight handlers. ctx is a
+// non-nil wait deadline: if it expires before the workers finish, Shutdown
+// returns ctx.Err() while the workers keep draining in the background.
+// Stop Consumers before the Client so their final acks land before the
+// Client's last counter flush. Shutdown of a never-started Consumer is a
+// no-op.
 func (co *Consumer) Shutdown(ctx context.Context) error {
 	co.mu.Lock()
 	if !co.started {
