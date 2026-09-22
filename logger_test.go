@@ -68,8 +68,8 @@ func (nopStore) ListDead(context.Context, int64, int64, int, int) ([]store.DeadD
 }
 func (nopStore) RequeueDead(context.Context, int64, int64, time.Duration) error { return nil }
 func (nopStore) DeleteDead(context.Context, int64, int64) error                 { return nil }
-func (nopStore) DeleteTopic(context.Context, int64) error                { return nil }
-func (nopStore) DeleteChannel(context.Context, int64) error              { return nil }
+func (nopStore) DeleteTopic(context.Context, int64) error                       { return nil }
+func (nopStore) DeleteChannel(context.Context, int64) error                     { return nil }
 
 // nopStore must keep satisfying the full Store contract, stats included
 // (U4 fake completeness check).
