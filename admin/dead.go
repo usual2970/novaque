@@ -46,26 +46,18 @@ type deadRowView struct {
 }
 
 // deadDeliveryView carries the full body plus metadata for the per-delivery
-// page, whose forms double as the requeue/delete confirmation step.
+// page, whose forms double as the requeue/delete confirmation step. It embeds
+// the list row's shape, but its Body is the FULL payload — the delivery page
+// is the one surface a body is never truncated on.
 type deadDeliveryView struct {
-	ID          int64
-	MessageID   int64
-	Topic       string
-	Channel     string
-	Body        string
-	BodyBytes   int
-	Attempts    int
-	MaxAttempts int
-	Remaining   string
-	Expired     bool
-	AvailableAt time.Time
-	ExpiresAt   time.Time
+	deadRowView
+	Topic   string
+	Channel string
 }
 
 // deadView backs both dead.html branches: the list renders while Delivery is
-// nil; a non-nil Delivery renders the full-body view (adopted review fix:
-// payload viewing must be usable with JS disabled, and it stays inside the
-// dead-letter surface, so R12 holds).
+// nil; a non-nil Delivery renders the full-body view — payload viewing stays
+// usable with JS disabled (KTD10) inside the dead-letter surface (R12).
 type deadView struct {
 	baseView
 	ChannelID   int64
@@ -80,17 +72,19 @@ type deadView struct {
 	Delivery    *deadDeliveryView
 }
 
-// deadChannelMeta resolves a channel id to its names through the list
-// endpoints (KTD6: reads never Ensure); unknown ids return errNotFound.
-type deadChannelMeta struct {
+// channelMeta resolves a channel id to its names through the list endpoints
+// (KTD6: reads never Ensure); unknown ids return errNotFound.
+type channelMeta struct {
 	ChannelID   int64
 	ChannelName string
 	TopicID     int64
 	TopicName   string
 }
 
-func (h *handler) deadChannelMeta(ctx context.Context, channelID int64) (deadChannelMeta, error) {
-	var m deadChannelMeta
+// resolveChannel is the shared id→names resolution behind the dead pages and
+// the admin channel detail loader.
+func (h *handler) resolveChannel(ctx context.Context, channelID int64) (channelMeta, error) {
+	var m channelMeta
 	channels, err := h.client.ListChannels(ctx)
 	if err != nil {
 		return m, fmt.Errorf("list channels: %w", err)
@@ -115,6 +109,22 @@ func (h *handler) deadChannelMeta(ctx context.Context, channelID int64) (deadCha
 		}
 	}
 	return m, nil
+}
+
+// requireChannel is the pre-action existence check for the dead actions:
+// ListChannels only — the actions never need the topic name — with unknown
+// ids returning errNotFound.
+func (h *handler) requireChannel(ctx context.Context, channelID int64) error {
+	channels, err := h.client.ListChannels(ctx)
+	if err != nil {
+		return fmt.Errorf("list channels: %w", err)
+	}
+	for _, c := range channels {
+		if c.ID == channelID {
+			return nil
+		}
+	}
+	return errNotFound
 }
 
 // --- data assembly ---
@@ -155,7 +165,7 @@ func newDeadRowView(d novaque.DeadDelivery) deadRowView {
 // rows. One row past the page is probed so the Older link is exact without a
 // second query; the probe row is dropped.
 func (h *handler) loadDeadList(ctx context.Context, channelID, before int64) (deadView, error) {
-	meta, err := h.deadChannelMeta(ctx, channelID)
+	meta, err := h.resolveChannel(ctx, channelID)
 	if err != nil {
 		return deadView{}, err
 	}
@@ -191,8 +201,8 @@ func (h *handler) loadDeadList(ctx context.Context, channelID, before int64) (de
 // row means the delivery is not dead in this channel → errNotFound.
 // (deliveryID+1 at math.MaxInt64 wraps negative, which reads as "no bound":
 // the newest row is still returned, so the trick holds at the boundary.)
-func (h *handler) loadDeadDelivery(ctx context.Context, channelID, deliveryID int64) (deadChannelMeta, novaque.DeadDelivery, error) {
-	meta, err := h.deadChannelMeta(ctx, channelID)
+func (h *handler) loadDeadDelivery(ctx context.Context, channelID, deliveryID int64) (channelMeta, novaque.DeadDelivery, error) {
+	meta, err := h.resolveChannel(ctx, channelID)
 	if err != nil {
 		return meta, novaque.DeadDelivery{}, err
 	}
@@ -285,25 +295,17 @@ func (h *handler) pageDeadDelivery(w http.ResponseWriter, r *http.Request) {
 		h.renderError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	remaining, expired := deadRemaining(d.ExpiresAt)
+	row := newDeadRowView(d)
+	row.Body, row.Truncated = string(d.Body), false // full body: never truncated here
 	v := deadView{
 		ChannelID:   meta.ChannelID,
 		ChannelName: meta.ChannelName,
 		TopicID:     meta.TopicID,
 		TopicName:   meta.TopicName,
 		Delivery: &deadDeliveryView{
-			ID:          d.ID,
-			MessageID:   d.MessageID,
+			deadRowView: row,
 			Topic:       d.Topic,
 			Channel:     d.Channel,
-			Body:        string(d.Body),
-			BodyBytes:   len(d.Body),
-			Attempts:    d.Attempts,
-			MaxAttempts: d.MaxAttempts,
-			Remaining:   remaining,
-			Expired:     expired,
-			AvailableAt: d.AvailableAt,
-			ExpiresAt:   d.ExpiresAt,
 		},
 	}
 	v.baseView = baseView{Prefix: h.prefix, Title: fmt.Sprintf("Dead delivery #%d", deliveryID)}
@@ -322,7 +324,7 @@ func (h *handler) formRequeueDead(w http.ResponseWriter, r *http.Request) {
 		h.notFound(w, r)
 		return
 	}
-	if _, err := h.deadChannelMeta(r.Context(), channelID); err != nil {
+	if err := h.requireChannel(r.Context(), channelID); err != nil {
 		h.deadChannelError(w, r, err)
 		return
 	}
@@ -339,7 +341,7 @@ func (h *handler) formDeleteDead(w http.ResponseWriter, r *http.Request) {
 		h.notFound(w, r)
 		return
 	}
-	if _, err := h.deadChannelMeta(r.Context(), channelID); err != nil {
+	if err := h.requireChannel(r.Context(), channelID); err != nil {
 		h.deadChannelError(w, r, err)
 		return
 	}
@@ -373,7 +375,7 @@ func (h *handler) deadActionDone(w http.ResponseWriter, r *http.Request, channel
 	}
 }
 
-// deadChannelError answers the pre-action channel resolution failure.
+// deadChannelError answers the pre-action channel existence failure.
 func (h *handler) deadChannelError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, errNotFound) {
 		h.notFound(w, r)

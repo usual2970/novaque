@@ -65,18 +65,13 @@ func (s *Store) ListChannels(ctx context.Context) ([]store.ChannelInfo, error) {
 }
 
 // Backlogs returns live per-channel backlog counts for every channel in one
-// query (R2). Conditional aggregation mirrors ChannelBacklog exactly —
-// Pending counts every waiting row (delayed and expired-but-unpurged ones
-// included) while Ready is its claimable slice: due now AND not expired. Rows
-// appear only for channels with at least one delivery; callers zero-fill the
-// rest against ListChannels.
+// query (R2), interpolating the shared backlogSelectList so per-channel
+// reads (ChannelBacklog) and these batched admin totals can never disagree.
+// Rows appear only for channels with at least one delivery; callers
+// zero-fill the rest against ListChannels.
 func (s *Store) Backlogs(ctx context.Context) ([]store.BacklogRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT channel_id,
-		  COUNT(CASE WHEN status = ? THEN 1 END),
-		  COUNT(CASE WHEN status = ? AND available_at <= `+sqlNow+` AND expires_at > `+sqlNow+` THEN 1 END),
-		  COUNT(CASE WHEN status = ? THEN 1 END),
-		  COUNT(CASE WHEN status = ? THEN 1 END)
+		SELECT channel_id,`+backlogSelectList+`
 		FROM novaque_deliveries
 		GROUP BY channel_id
 		ORDER BY channel_id ASC`,
@@ -108,7 +103,7 @@ func (s *Store) TopicDailyCounters(ctx context.Context, topicID int64, days int)
 	if days < 1 {
 		return nil, fmt.Errorf("mysql admin: invalid days %d", days)
 	}
-	return s.dailyCounters(ctx, "topic_id", topicID, days)
+	return s.dailyCounters(ctx, whereTopicID, topicID, days)
 }
 
 // ChannelDailyCounters returns one channel's retained day-bucket counter rows
@@ -122,16 +117,21 @@ func (s *Store) ChannelDailyCounters(ctx context.Context, channelID int64, days 
 	if days < 1 {
 		return nil, fmt.Errorf("mysql admin: invalid days %d", days)
 	}
-	return s.dailyCounters(ctx, "channel_id", channelID, days)
+	return s.dailyCounters(ctx, whereChannelID, channelID, days)
 }
+
+// The two where-column literals dailyCounters accepts; never caller input.
+const (
+	whereTopicID   = "topic_id"
+	whereChannelID = "channel_id"
+)
 
 // dailyCounters runs the shared day-bucket read over the trailing days-day
 // UTC window ending today. The boundary comes from the DB clock — the same
 // UTC_DATE() bucketing FlushStats writes and PruneStats prunes with — never
 // host time. Day buckets cross the wire as DATE_FORMAT strings parsed into
 // UTC midnights in Go, so bucketing never depends on the DSN's parseTime or
-// loc settings. whereCol is one of the two package literals above, never
-// caller input.
+// loc settings.
 func (s *Store) dailyCounters(ctx context.Context, whereCol string, id int64, days int) ([]store.DailyCounters, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT DATE_FORMAT(day_utc, '%Y-%m-%d'),

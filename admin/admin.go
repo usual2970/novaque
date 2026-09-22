@@ -98,7 +98,7 @@ func New(client *novaque.Client, opts Options) (http.Handler, error) {
 	// define its own "content" block against the shared layout (KTD10).
 	// Every URL in markup flows through the single "url" helper (KTD3).
 	fm := template.FuncMap{"url": h.path}
-	h.pages = make(map[string]*template.Template, 4)
+	h.pages = make(map[string]*template.Template, 5)
 	for _, page := range []string{"dashboard.html", "topic.html", "channel.html", "confirm.html", "dead.html"} {
 		t, err := template.New("layout.html").Funcs(fm).ParseFS(templateFS, "templates/layout.html", "templates/"+page)
 		if err != nil {
@@ -350,6 +350,35 @@ type confirmView struct {
 
 // --- data assembly (bounded Client calls; no Ensure on read, KTD6) ---
 
+// backlogsByChannel indexes one Backlogs batch for per-channel lookup;
+// channels without a row zero-fill from the map's zero value.
+func backlogsByChannel(backlogs []novaque.BacklogRow) map[int64]novaque.BacklogRow {
+	byChannel := make(map[int64]novaque.BacklogRow, len(backlogs))
+	for _, b := range backlogs {
+		byChannel[b.ChannelID] = b
+	}
+	return byChannel
+}
+
+// channelsWithBacklog builds one topic's channel rows (in ListChannels
+// order) with zero-filled backlogs, plus the topic's summed totals.
+func channelsWithBacklog(channels []novaque.ChannelInfo, topicID int64, byChannel map[int64]novaque.BacklogRow) ([]channelView, novaque.BacklogRow) {
+	var totals novaque.BacklogRow
+	rows := []channelView{}
+	for _, c := range channels {
+		if c.TopicID != topicID {
+			continue
+		}
+		b := byChannel[c.ID] // zero value zero-fills
+		rows = append(rows, channelView{ID: c.ID, Name: c.Name, Backlog: b})
+		totals.Pending += b.Pending
+		totals.Ready += b.Ready
+		totals.InFlight += b.InFlight
+		totals.Dead += b.Dead
+	}
+	return rows, totals
+}
+
 // loadGroups assembles the dashboard/summary model from three Client calls
 // — ListTopics, ListChannels, Backlogs — grouped in Go (F1). The query count
 // is constant no matter how many channels exist (R2); Backlog rows appear
@@ -367,34 +396,20 @@ func (h *handler) loadGroups(ctx context.Context) ([]topicGroupView, error) {
 	if err != nil {
 		return nil, fmt.Errorf("backlogs: %w", err)
 	}
-	byChannel := make(map[int64]novaque.BacklogRow, len(backlogs))
-	for _, b := range backlogs {
-		byChannel[b.ChannelID] = b
-	}
-	chansByTopic := make(map[int64][]novaque.ChannelInfo, len(topics))
-	for _, c := range channels {
-		chansByTopic[c.TopicID] = append(chansByTopic[c.TopicID], c)
-	}
+	byChannel := backlogsByChannel(backlogs)
 	groups := make([]topicGroupView, 0, len(topics))
 	for _, t := range topics {
-		g := topicGroupView{ID: t.ID, Name: t.Name, Channels: []channelView{}}
-		for _, c := range chansByTopic[t.ID] {
-			b := byChannel[c.ID] // zero value zero-fills
-			g.Channels = append(g.Channels, channelView{ID: c.ID, Name: c.Name, Backlog: b})
-			g.Totals.Pending += b.Pending
-			g.Totals.Ready += b.Ready
-			g.Totals.InFlight += b.InFlight
-			g.Totals.Dead += b.Dead
-		}
-		groups = append(groups, g)
+		chans, totals := channelsWithBacklog(channels, t.ID, byChannel)
+		groups = append(groups, topicGroupView{ID: t.ID, Name: t.Name, Totals: totals, Channels: chans})
 	}
 	return groups, nil
 }
 
-// loadTopic assembles the topic detail model (channels + backlogs +
-// zero-filled daily counters), resolving the id through the list endpoint.
-// An unknown id returns errNotFound — no row is ever created.
-func (h *handler) loadTopic(ctx context.Context, id int64) (topicView, error) {
+// loadTopicBase resolves the topic through the list endpoint and assembles
+// its channels + backlogs — everything but the day-bucket counters, so the
+// delete-confirmation path can skip the counter reads. An unknown id returns
+// errNotFound — no row is ever created.
+func (h *handler) loadTopicBase(ctx context.Context, id int64) (topicView, error) {
 	var v topicView
 	topics, err := h.client.ListTopics(ctx)
 	if err != nil {
@@ -417,21 +432,15 @@ func (h *handler) loadTopic(ctx context.Context, id int64) (topicView, error) {
 	if err != nil {
 		return v, fmt.Errorf("backlogs: %w", err)
 	}
-	byChannel := make(map[int64]novaque.BacklogRow, len(backlogs))
-	for _, b := range backlogs {
-		byChannel[b.ChannelID] = b
-	}
-	v.Channels = []channelView{}
-	for _, c := range channels {
-		if c.TopicID != id {
-			continue
-		}
-		b := byChannel[c.ID]
-		v.Channels = append(v.Channels, channelView{ID: c.ID, Name: c.Name, Backlog: b})
-		v.Totals.Pending += b.Pending
-		v.Totals.Ready += b.Ready
-		v.Totals.InFlight += b.InFlight
-		v.Totals.Dead += b.Dead
+	v.Channels, v.Totals = channelsWithBacklog(channels, id, backlogsByChannel(backlogs))
+	return v, nil
+}
+
+// loadTopic adds the zero-filled daily counters on top of loadTopicBase.
+func (h *handler) loadTopic(ctx context.Context, id int64) (topicView, error) {
+	v, err := h.loadTopicBase(ctx, id)
+	if err != nil {
+		return v, err
 	}
 	rows, err := h.client.TopicDailyCounters(ctx, id, trendDays)
 	if err != nil {
@@ -441,42 +450,33 @@ func (h *handler) loadTopic(ctx context.Context, id int64) (topicView, error) {
 	return v, nil
 }
 
-// loadChannel assembles the channel detail model; an unknown id returns
-// errNotFound.
-func (h *handler) loadChannel(ctx context.Context, id int64) (channelDetailView, error) {
-	var v channelDetailView
-	channels, err := h.client.ListChannels(ctx)
+// loadChannelBase resolves the channel — names plus live backlog — without
+// the day-bucket counters; the delete-confirmation path needs no counters.
+// An unknown id returns errNotFound.
+func (h *handler) loadChannelBase(ctx context.Context, id int64) (channelDetailView, error) {
+	m, err := h.resolveChannel(ctx, id)
 	if err != nil {
-		return v, fmt.Errorf("list channels: %w", err)
+		return channelDetailView{}, err
 	}
-	for _, c := range channels {
-		if c.ID == id {
-			v.ID, v.Name, v.TopicID = c.ID, c.Name, c.TopicID
-			break
-		}
-	}
-	if v.ID == 0 {
-		return v, errNotFound
-	}
-	topics, err := h.client.ListTopics(ctx)
-	if err != nil {
-		return v, fmt.Errorf("list topics: %w", err)
-	}
-	for _, t := range topics {
-		if t.ID == v.TopicID {
-			v.TopicName = t.Name
-			break
-		}
+	v := channelDetailView{
+		ID:        m.ChannelID,
+		Name:      m.ChannelName,
+		TopicID:   m.TopicID,
+		TopicName: m.TopicName,
 	}
 	backlogs, err := h.client.Backlogs(ctx)
 	if err != nil {
 		return v, fmt.Errorf("backlogs: %w", err)
 	}
-	for _, b := range backlogs {
-		if b.ChannelID == id {
-			v.Backlog = b
-			break
-		}
+	v.Backlog = backlogsByChannel(backlogs)[id] // zero value zero-fills
+	return v, nil
+}
+
+// loadChannel adds the zero-filled daily counters on top of loadChannelBase.
+func (h *handler) loadChannel(ctx context.Context, id int64) (channelDetailView, error) {
+	v, err := h.loadChannelBase(ctx, id)
+	if err != nil {
+		return v, err
 	}
 	rows, err := h.client.ChannelDailyCounters(ctx, id, trendDays)
 	if err != nil {
@@ -572,19 +572,12 @@ func (h *handler) pathID(r *http.Request, name string) (int64, bool) {
 // --- page handlers ---
 
 func (h *handler) pageDashboard(w http.ResponseWriter, r *http.Request) {
-	groups, err := h.loadGroups(r.Context())
-	if err != nil {
-		h.renderError(w, r, http.StatusInternalServerError, err.Error())
-		return
-	}
-	h.render(w, r, "dashboard.html", http.StatusOK, dashboardView{
-		baseView: baseView{Prefix: h.prefix, Title: "Dashboard", Poll: "/api/summary"},
-		Groups:   groups,
-	})
+	h.renderDashboardForm(w, r, "", "")
 }
 
-// renderDashboardForm re-renders the dashboard carrying the create-topic
-// form state (submitted name + error) after a failed create.
+// renderDashboardForm renders the dashboard — the plain page (empty form
+// state) and the re-render carrying the create-topic form state (submitted
+// name + error) after a failed create.
 func (h *handler) renderDashboardForm(w http.ResponseWriter, r *http.Request, name, errMsg string) {
 	groups, err := h.loadGroups(r.Context())
 	if err != nil {
@@ -605,21 +598,12 @@ func (h *handler) pageTopic(w http.ResponseWriter, r *http.Request) {
 		h.notFound(w, r)
 		return
 	}
-	v, err := h.loadTopic(r.Context(), id)
-	if errors.Is(err, errNotFound) {
-		h.notFound(w, r)
-		return
-	}
-	if err != nil {
-		h.renderError(w, r, http.StatusInternalServerError, err.Error())
-		return
-	}
-	v.baseView = baseView{Prefix: h.prefix, Title: "Topic " + v.Name, Poll: fmt.Sprintf("/api/topics/%d", id)}
-	h.render(w, r, "topic.html", http.StatusOK, v)
+	h.renderTopicForm(w, r, id, "", "")
 }
 
-// renderTopicForm re-renders the topic page carrying the create-channel
-// form state after a failed create.
+// renderTopicForm renders the topic page — the plain detail view (empty
+// form state) and the re-render carrying the create-channel form state
+// (submitted name + error) after a failed create.
 func (h *handler) renderTopicForm(w http.ResponseWriter, r *http.Request, id int64, name, errMsg string) {
 	v, err := h.loadTopic(r.Context(), id)
 	if errors.Is(err, errNotFound) {
@@ -662,7 +646,7 @@ func (h *handler) pageConfirmDeleteTopic(w http.ResponseWriter, r *http.Request)
 		h.notFound(w, r)
 		return
 	}
-	v, err := h.loadTopic(r.Context(), id)
+	v, err := h.loadTopicBase(r.Context(), id)
 	if errors.Is(err, errNotFound) {
 		h.notFound(w, r)
 		return
@@ -681,7 +665,7 @@ func (h *handler) pageConfirmDeleteTopic(w http.ResponseWriter, r *http.Request)
 			fmt.Sprintf("Deliveries deleted: %d (pending %d · in-flight %d · dead %d)",
 				v.Totals.Pending+v.Totals.InFlight+v.Totals.Dead, v.Totals.Pending, v.Totals.InFlight, v.Totals.Dead),
 			"Messages deleted: every retained message under this topic.",
-			fmt.Sprintf("Stats deleted: retained day-bucket rows for every channel plus the zero-channel sentinel rows (%d day buckets in window).", len(v.Days)),
+			fmt.Sprintf("Stats deleted: retained day-bucket rows for every channel plus the zero-channel sentinel rows (%d day buckets in window).", trendDays),
 		},
 		Warnings: []string{
 			"This permanently removes the topic and everything under it in one transaction.",
@@ -699,7 +683,7 @@ func (h *handler) pageConfirmDeleteChannel(w http.ResponseWriter, r *http.Reques
 		h.notFound(w, r)
 		return
 	}
-	v, err := h.loadChannel(r.Context(), id)
+	v, err := h.loadChannelBase(r.Context(), id)
 	if errors.Is(err, errNotFound) {
 		h.notFound(w, r)
 		return
@@ -714,7 +698,7 @@ func (h *handler) pageConfirmDeleteChannel(w http.ResponseWriter, r *http.Reques
 		Lines: []string{
 			fmt.Sprintf("Deliveries deleted: %d (pending %d · in-flight %d · dead %d)",
 				v.Backlog.Pending+v.Backlog.InFlight+v.Backlog.Dead, v.Backlog.Pending, v.Backlog.InFlight, v.Backlog.Dead),
-			fmt.Sprintf("Stats deleted: this channel's day-bucket rows (%d day buckets in window).", len(v.Days)),
+			fmt.Sprintf("Stats deleted: this channel's day-bucket rows (%d day buckets in window).", trendDays),
 			"Messages kept: shared message rows survive, so sibling channels keep their deliveries.",
 		},
 		Warnings: []string{

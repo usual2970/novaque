@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+
+	"github.com/usual2970/novaque"
 )
 
 // The JSON endpoints mirror page data for the fetch poller (KTD10): the
@@ -67,24 +69,32 @@ func jsonError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+func backlogToJSON(b novaque.BacklogRow) backlogJSON {
+	return backlogJSON{Pending: b.Pending, Ready: b.Ready, InFlight: b.InFlight, Dead: b.Dead}
+}
+
+func channelsToJSON(topicID int64, chans []channelView) []channelJSON {
+	out := make([]channelJSON, 0, len(chans))
+	for _, c := range chans {
+		out = append(out, channelJSON{
+			ID:      c.ID,
+			TopicID: topicID,
+			Name:    c.Name,
+			Backlog: backlogToJSON(c.Backlog),
+		})
+	}
+	return out
+}
+
 func groupsToJSON(groups []topicGroupView) []topicJSON {
 	out := make([]topicJSON, 0, len(groups))
 	for _, g := range groups {
-		tj := topicJSON{
+		out = append(out, topicJSON{
 			ID:       g.ID,
 			Name:     g.Name,
-			Totals:   backlogJSON{Pending: g.Totals.Pending, Ready: g.Totals.Ready, InFlight: g.Totals.InFlight, Dead: g.Totals.Dead},
-			Channels: make([]channelJSON, 0, len(g.Channels)),
-		}
-		for _, c := range g.Channels {
-			tj.Channels = append(tj.Channels, channelJSON{
-				ID:      c.ID,
-				TopicID: g.ID,
-				Name:    c.Name,
-				Backlog: backlogJSON{Pending: c.Backlog.Pending, Ready: c.Backlog.Ready, InFlight: c.Backlog.InFlight, Dead: c.Backlog.Dead},
-			})
-		}
-		out = append(out, tj)
+			Totals:   backlogToJSON(g.Totals),
+			Channels: channelsToJSON(g.ID, g.Channels),
+		})
 	}
 	return out
 }
@@ -135,21 +145,10 @@ func (h *handler) apiTopic(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, topicDetailJSON{
 		topicJSON: topicJSON{
-			ID:     v.ID,
-			Name:   v.Name,
-			Totals: backlogJSON{Pending: v.Totals.Pending, Ready: v.Totals.Ready, InFlight: v.Totals.InFlight, Dead: v.Totals.Dead},
-			Channels: func() []channelJSON {
-				out := make([]channelJSON, 0, len(v.Channels))
-				for _, c := range v.Channels {
-					out = append(out, channelJSON{
-						ID:      c.ID,
-						TopicID: v.ID,
-						Name:    c.Name,
-						Backlog: backlogJSON{Pending: c.Backlog.Pending, Ready: c.Backlog.Ready, InFlight: c.Backlog.InFlight, Dead: c.Backlog.Dead},
-					})
-				}
-				return out
-			}(),
+			ID:       v.ID,
+			Name:     v.Name,
+			Totals:   backlogToJSON(v.Totals),
+			Channels: channelsToJSON(v.ID, v.Channels),
 		},
 		Days: daysToJSON(v.Days),
 	})
@@ -177,7 +176,7 @@ func (h *handler) apiChannel(w http.ResponseWriter, r *http.Request) {
 			ID:      v.ID,
 			TopicID: v.TopicID,
 			Name:    v.Name,
-			Backlog: backlogJSON{Pending: v.Backlog.Pending, Ready: v.Backlog.Ready, InFlight: v.Backlog.InFlight, Dead: v.Backlog.Dead},
+			Backlog: backlogToJSON(v.Backlog),
 		},
 		TopicName: v.TopicName,
 		Days:      daysToJSON(v.Days),

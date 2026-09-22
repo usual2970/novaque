@@ -391,9 +391,9 @@ func (f *fakeStore) DeleteDead(_ context.Context, deliveryID int64) error {
 
 // --- harness helpers ---
 
-// newTestServer builds a Client over the fake, an admin handler at prefix,
-// and an httptest server. prefix "/admin" is the explicit default mount.
-func newTestServer(t *testing.T, prefix string) (*httptest.Server, *fakeStore) {
+// newTestHandler builds the fake-backed admin handler at prefix — the shared
+// construction behind every test server here and in the mount matrix.
+func newTestHandler(t *testing.T, prefix string) (http.Handler, *fakeStore) {
 	t.Helper()
 	f := newFake()
 	f.seedOrders()
@@ -406,6 +406,14 @@ func newTestServer(t *testing.T, prefix string) (*httptest.Server, *fakeStore) {
 	if err != nil {
 		t.Fatalf("admin.New: %v", err)
 	}
+	return h, f
+}
+
+// newTestServer serves newTestHandler over httptest. prefix "/admin" is the
+// explicit default mount.
+func newTestServer(t *testing.T, prefix string) (*httptest.Server, *fakeStore) {
+	t.Helper()
+	h, f := newTestHandler(t, prefix)
 	ts := httptest.NewServer(h)
 	t.Cleanup(ts.Close)
 	return ts, f

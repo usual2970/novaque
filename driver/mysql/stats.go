@@ -229,6 +229,18 @@ func (s *Store) TopicCounters(ctx context.Context, topicID int64) (store.Channel
 	return s.sumDailyCounters(ctx, "topic_id", topicID)
 }
 
+// backlogSelectList is the one conditional-aggregation select list for live
+// backlog counts, shared by ChannelBacklog (one channel) and the admin
+// Backlogs batch (every channel): Pending counts every waiting row (delayed
+// and expired-but-unpurged ones included) while Ready is its claimable slice
+// — due now AND not expired, mirroring Claim's eligibility exactly. Both
+// queries interpolate this string so the two can never drift apart.
+const backlogSelectList = `
+		  COUNT(CASE WHEN status = ? THEN 1 END),
+		  COUNT(CASE WHEN status = ? AND available_at <= ` + sqlNow + ` AND expires_at > ` + sqlNow + ` THEN 1 END),
+		  COUNT(CASE WHEN status = ? THEN 1 END),
+		  COUNT(CASE WHEN status = ? THEN 1 END)`
+
 // ChannelBacklog counts live delivery rows for one channel in a single pass
 // over the idx_novaque_deliveries_claim prefix (channel_id, status,
 // available_at). Ready is the claimable slice of Pending and mirrors Claim's
@@ -242,11 +254,7 @@ func (s *Store) ChannelBacklog(ctx context.Context, channelID int64) (store.Chan
 	}
 	var b store.ChannelBacklog
 	err := s.db.QueryRowContext(ctx, `
-		SELECT
-		  COUNT(CASE WHEN status = ? THEN 1 END),
-		  COUNT(CASE WHEN status = ? AND available_at <= `+sqlNow+` AND expires_at > `+sqlNow+` THEN 1 END),
-		  COUNT(CASE WHEN status = ? THEN 1 END),
-		  COUNT(CASE WHEN status = ? THEN 1 END)
+		SELECT`+backlogSelectList+`
 		FROM novaque_deliveries
 		WHERE channel_id = ?`,
 		store.StatusPending, store.StatusPending, store.StatusInFlight, store.StatusDead, channelID).

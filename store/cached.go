@@ -37,8 +37,13 @@ func WithCache(inner Store) Store {
 	return &CachingStore{Inner: inner}
 }
 
+// channelKeySep joins a topic and channel name into one cache key; topic
+// names cannot contain it (driver name rules), so a topic+sep prefix cannot
+// straddle two topics.
+const channelKeySep = "\x00"
+
 func channelKey(topic, channel string) string {
-	return topic + "\x00" + channel
+	return topic + channelKeySep + channel
 }
 
 // Migrate runs Inner.Migrate verbatim; schema state is never cached.
@@ -200,7 +205,7 @@ func (c *CachingStore) DeleteTopic(ctx context.Context, topicID int64) error {
 	c.topics.Range(func(name, id any) bool {
 		if id.(int64) == topicID {
 			c.topics.Delete(name)
-			prefixes = append(prefixes, name.(string)+"\x00")
+			prefixes = append(prefixes, name.(string)+channelKeySep)
 		}
 		return true
 	})
@@ -222,12 +227,7 @@ func (c *CachingStore) DeleteTopic(ctx context.Context, topicID int64) error {
 // channelID before forwarding to Inner.DeleteChannel; entries for sibling
 // channels and the topic itself are untouched.
 func (c *CachingStore) DeleteChannel(ctx context.Context, channelID int64) error {
-	c.channels.Range(func(key, id any) bool {
-		if id.(int64) == channelID {
-			c.channels.Delete(key)
-		}
-		return true
-	})
+	c.InvalidateChannelID(channelID)
 	return c.Inner.DeleteChannel(ctx, channelID)
 }
 

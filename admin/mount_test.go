@@ -17,28 +17,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-chi/chi/v5"
 	"github.com/labstack/echo/v5"
-
-	"github.com/usual2970/novaque"
-	"github.com/usual2970/novaque/admin"
 )
 
-// newTestHandler builds the fake-backed handler the matrix registers in each
-// router — the same fake and seeding newTestServer uses in admin_test.go.
-func newTestHandler(t *testing.T, prefix string) (http.Handler, *fakeStore) {
-	t.Helper()
-	f := newFake()
-	f.seedOrders()
-	f.seedDaily()
-	c, err := novaque.Open(f, novaque.Options{})
-	if err != nil {
-		t.Fatalf("novaque.Open: %v", err)
-	}
-	h, err := admin.New(c, admin.Options{Prefix: prefix})
-	if err != nil {
-		t.Fatalf("admin.New: %v", err)
-	}
-	return h, f
-}
+// newTestHandler (admin_test.go) builds the fake-backed handler the matrix
+// registers in each router; serve wraps one in an httptest server.
 
 func serve(t *testing.T, h http.Handler) *httptest.Server {
 	t.Helper()
