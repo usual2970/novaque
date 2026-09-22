@@ -8,9 +8,12 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+
+	mysqldriver "github.com/go-sql-driver/mysql"
 
 	"github.com/usual2970/novaque/store"
 )
@@ -164,9 +167,37 @@ func (s *Store) EnsureChannel(ctx context.Context, topic, channel string) (int64
 	return id, err
 }
 
+// mysqlErrNoReferencedRow is MySQL error 1452 (ER_NO_REFERENCED_ROW_2): an
+// INSERT referenced a parent row that does not exist — for Publish, a topic
+// id another process deleted after this one resolved it.
+const mysqlErrNoReferencedRow = 1452
+
+// mapTopicGone translates Publish's topic-FK violation into the
+// dialect-agnostic store.ErrTopicGone sentinel, matching the MySQL error
+// number only (never message strings). Every other error passes through
+// untouched.
+func mapTopicGone(err error) error {
+	var myErr *mysqldriver.MySQLError
+	if errors.As(err, &myErr) && myErr.Number == mysqlErrNoReferencedRow {
+		return store.ErrTopicGone
+	}
+	return err
+}
+
 // Publish inserts message + per-channel deliveries atomically for a known
-// topic id. A nil body is stored as empty.
+// topic id. A nil body is stored as empty. When the topic row vanished after
+// the caller resolved topicID (an admin delete in another process), the topic
+// FK fails with MySQL error 1452 and Publish returns store.ErrTopicGone;
+// callers evict the memoized id, re-Ensure the name, and retry once (KTD9).
 func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts store.PublishOpts) (int64, error) {
+	messageID, err := s.publish(ctx, topicID, body, opts)
+	if err != nil {
+		return 0, mapTopicGone(err)
+	}
+	return messageID, nil
+}
+
+func (s *Store) publish(ctx context.Context, topicID int64, body []byte, opts store.PublishOpts) (int64, error) {
 	if body == nil {
 		body = []byte{}
 	}

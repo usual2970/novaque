@@ -282,3 +282,53 @@ func TestPublishNoDelayStillImmediate(t *testing.T) {
 		t.Fatalf("want immediate claim, got %d", len(got))
 	}
 }
+
+// TestPublishDeletedTopicErrTopicGone seeds the KTD9 self-heal flow at the
+// driver level: publishing to a topic id whose row was deleted (raw SQL,
+// bypassing the driver) fails the topic FK with MySQL error 1452, which
+// Publish maps to the dialect-agnostic store.ErrTopicGone sentinel by error
+// number — never by string matching. Re-ensuring the name yields a fresh id
+// the same publish succeeds against (the Client evict-retry of U3 builds on
+// exactly this).
+func TestPublishDeletedTopicErrTopicGone(t *testing.T) {
+	db := testmysql.Open(t)
+	s := mysql.New(db)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	name := "gone_" + time.Now().Format("150405.000")
+	topicID, err := s.EnsureTopic(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Delete the topic out from under the resolved id, child-first (KTD7
+	// ordering) with raw SQL so the driver sees only the vanished parent.
+	for _, q := range []string{
+		`DELETE FROM novaque_messages WHERE topic_id = ?`,
+		`DELETE FROM novaque_channels WHERE topic_id = ?`,
+		`DELETE FROM novaque_stats_daily WHERE topic_id = ?`,
+		`DELETE FROM novaque_topics WHERE id = ?`,
+	} {
+		if _, err := db.ExecContext(ctx, q, topicID); err != nil {
+			t.Fatalf("raw delete %q: %v", q, err)
+		}
+	}
+
+	_, err = s.Publish(ctx, topicID, []byte("too late"), store.PublishOpts{TTL: time.Hour})
+	if !errors.Is(err, store.ErrTopicGone) {
+		t.Fatalf("publish to deleted topic = %v, want store.ErrTopicGone", err)
+	}
+
+	// Self-heal seed: re-ensure resolves a new id and the retry publish lands.
+	newID, err := s.EnsureTopic(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newID == topicID {
+		t.Fatalf("re-ensure returned the deleted id %d", newID)
+	}
+	if _, err := s.Publish(ctx, newID, []byte("healed"), store.PublishOpts{TTL: time.Hour}); err != nil {
+		t.Fatalf("retry publish on re-ensured topic: %v", err)
+	}
+}
