@@ -12,22 +12,6 @@ import (
 // replace them one file at a time (publish/claim, maintenance, stats, admin).
 // Every stub returns an error rather than panicking or faking success.
 
-func (s *Store) Publish(ctx context.Context, topicID int64, body []byte, opts store.PublishOpts) (int64, error) {
-	return 0, fmt.Errorf("sqlite: Publish not implemented yet")
-}
-
-func (s *Store) Claim(ctx context.Context, channelID int64, owner string, leaseFor time.Duration, limit int) ([]store.Delivery, error) {
-	return nil, fmt.Errorf("sqlite: Claim not implemented yet")
-}
-
-func (s *Store) Ack(ctx context.Context, deliveryID int64, leaseToken string) error {
-	return fmt.Errorf("sqlite: Ack not implemented yet")
-}
-
-func (s *Store) Requeue(ctx context.Context, deliveryID int64, leaseToken string, availableAt time.Time) error {
-	return fmt.Errorf("sqlite: Requeue not implemented yet")
-}
-
 func (s *Store) ReapExpiredLeases(ctx context.Context, limit int) (int64, error) {
 	return 0, fmt.Errorf("sqlite: ReapExpiredLeases not implemented yet")
 }

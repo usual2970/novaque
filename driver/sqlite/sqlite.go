@@ -31,6 +31,11 @@ type Store struct {
 	// so no mutation transaction ever carries a stats write.
 	statMu  sync.Mutex
 	statBuf map[statKey]int64
+
+	// versionOnce caches the runtime SQLite version gate (3.39.0+): the check
+	// is a single SELECT, but Migrate may run more than once; run it once.
+	versionOnce sync.Once
+	versionErr  error
 }
 
 // New wraps a caller-owned *sql.DB.
@@ -52,7 +57,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 			return fmt.Errorf("sqlite migrate: %w\nstmt: %s", err, stmt)
 		}
 	}
-	return nil
+	// Fail fast if the runtime SQLite is older than the supported floor,
+	// 3.39.0 (KTD2, OQ2).
+	return s.ensureSQLiteVersion(ctx)
 }
 
 func splitSQL(s string) []string {
