@@ -1,7 +1,8 @@
 // The examples in this file demonstrate the primary embedder flows. Each one
 // needs a live MySQL at the DSN below, so none carry an Output comment: go
-// test compiles them without running. With a running database, every example
-// completes as its body comments describe.
+// test compiles them without running. The examples are compile-verified;
+// with a running database each executes as an ordinary Go program whose
+// body comments describe the expected behavior (no output comparison).
 package novaque_test
 
 import (
@@ -46,7 +47,6 @@ func ExampleOpen() {
 }
 
 func ExampleClient_Publish() {
-	// Schema assumed migrated once at startup (see ExampleOpen).
 	db, err := sql.Open("mysql", "user:pass@tcp(127.0.0.1:3306)/app?parseTime=true&loc=UTC")
 	if err != nil {
 		log.Fatal(err)
@@ -57,6 +57,9 @@ func ExampleClient_Publish() {
 	}
 
 	ctx := context.Background()
+	if err := client.Migrate(ctx); err != nil { // schema setup; idempotent, safe every startup
+		log.Fatal(err)
+	}
 	messageID, err := client.Publish(ctx, "events", []byte(`{"kind":"user.created"}`), novaque.PublishOpts{
 		TTL:         24 * time.Hour,   // retention from publish time; zero would mean DefaultTTL (7d)
 		Delay:       30 * time.Minute, // claimable in 30 minutes, not before
@@ -83,17 +86,22 @@ func ExampleClient_SubscribeAndStart() {
 	}
 
 	ctx := context.Background()
+	if err := client.Migrate(ctx); err != nil { // schema setup; idempotent, safe every startup
+		log.Fatal(err)
+	}
 	if err := client.Start(ctx); err != nil { // maintenance loops; consuming works without them too
 		log.Fatal(err)
 	}
 
 	// One consumer on ("events", "indexer"); MaxInFlight workers compete
 	// within the channel.
+	done := make(chan struct{}) // closed by the handler below
 	handler := func(ctx context.Context, msg *novaque.Message) error {
 		// Handlers must be idempotent: delivery is at-least-once, so the
 		// same message may arrive more than once. ctx is bounded by the
 		// lease timeout, not by the ctx passed to SubscribeAndStart.
 		log.Printf("indexing message %d (attempt %d)", msg.MessageID, msg.Attempts)
+		close(done)
 		return nil // nil acks; a non-nil error requeues for redelivery
 	}
 	consumer, err := client.SubscribeAndStart(ctx, "events", "indexer", handler)
@@ -106,6 +114,7 @@ func ExampleClient_SubscribeAndStart() {
 	}
 	// With a live database the handler receives the message within a poll
 	// interval (~200ms base with ±50% jitter) and acks it.
+	<-done // wait for the handler to receive and ack the published message
 
 	// Stop the consumer before the client so its final acks land first.
 	if err := consumer.Shutdown(context.Background()); err != nil {
@@ -126,14 +135,21 @@ func ExampleClient_ChannelBacklog() {
 		log.Fatal(err)
 	}
 
+	ctx := context.Background()
+	if err := client.Migrate(ctx); err != nil { // schema setup; idempotent, safe every startup
+		log.Fatal(err)
+	}
+
 	// Live counts for one channel right now. The call also creates the
 	// channel if it does not exist yet — it then joins future fan-out.
-	backlog, err := client.ChannelBacklog(context.Background(), "events", "indexer")
+	backlog, err := client.ChannelBacklog(ctx, "events", "indexer")
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("pending=%d ready=%d in_flight=%d dead=%d\n",
 		backlog.Pending, backlog.Ready, backlog.InFlight, backlog.Dead)
-	// With a live database holding one published, not-yet-claimed message
-	// this prints: pending=1 ready=1 in_flight=0 dead=0
+	// With a live database this prints the live counts for the channel —
+	// zeros here: the channel was just created and no message has been
+	// fanned out to it yet. Publishing to the topic fans out to subscribed
+	// channels; read again after publishing to see pending grow.
 }
