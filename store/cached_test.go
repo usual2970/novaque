@@ -30,8 +30,9 @@ type countingStore struct {
 	listChannelsCalls   atomic.Int64
 	backlogsCalls       atomic.Int64
 	backlogsTopicCalls  atomic.Int64
-	topicDailyCalls     atomic.Int64
-	channelDailyCalls   atomic.Int64
+	topicDailyCalls      atomic.Int64
+	channelDailyCalls    atomic.Int64
+	clusterDailyCalls    atomic.Int64
 	listDeadCalls       atomic.Int64
 	lastListDeadPrefix  atomic.Int64
 	requeueDeadCalls    atomic.Int64
@@ -154,6 +155,11 @@ func (c *countingStore) TopicDailyCounters(_ context.Context, topicID int64, day
 func (c *countingStore) ChannelDailyCounters(_ context.Context, channelID int64, days int) ([]store.DailyCounters, error) {
 	c.channelDailyCalls.Add(1)
 	return []store.DailyCounters{{Day: time.Unix(0, 0).UTC(), Publish: channelID, Claim: int64(days)}}, nil
+}
+
+func (c *countingStore) ClusterDailyCounters(_ context.Context, days int) ([]store.DailyCounters, error) {
+	c.clusterDailyCalls.Add(1)
+	return []store.DailyCounters{{Day: time.Unix(0, 0).UTC(), Publish: int64(days), Claim: 1}}, nil
 }
 
 func (c *countingStore) ListDead(_ context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]store.DeadDelivery, error) {
@@ -376,6 +382,13 @@ func TestCachingStoreForwardsAdminSurface(t *testing.T) {
 		if _, err := s.ChannelDailyCounters(ctx, 7, 14); err != nil {
 			t.Fatal(err)
 		}
+		cluster, err := s.ClusterDailyCounters(ctx, 30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cluster) != 1 || cluster[0].Publish != 30 || cluster[0].Claim != 1 {
+			t.Fatalf("ClusterDailyCounters passthrough mangled: %#v", cluster)
+		}
 		dead, err := s.ListDead(ctx, 7, 42, 50, 33)
 		if err != nil {
 			t.Fatal(err)
@@ -396,9 +409,10 @@ func TestCachingStoreForwardsAdminSurface(t *testing.T) {
 		"ListChannels":         inner.listChannelsCalls.Load(),
 		"Backlogs":             inner.backlogsCalls.Load(),
 		"BacklogsForTopic":     inner.backlogsTopicCalls.Load(),
-		"TopicDailyCounters":   inner.topicDailyCalls.Load(),
-		"ChannelDailyCounters": inner.channelDailyCalls.Load(),
-		"ListDead":             inner.listDeadCalls.Load(),
+		"TopicDailyCounters":    inner.topicDailyCalls.Load(),
+		"ChannelDailyCounters":  inner.channelDailyCalls.Load(),
+		"ClusterDailyCounters":  inner.clusterDailyCalls.Load(),
+		"ListDead":              inner.listDeadCalls.Load(),
 		"RequeueDead":          inner.requeueDeadCalls.Load(),
 		"DeleteDead":           inner.deleteDeadCalls.Load(),
 	} {

@@ -135,3 +135,35 @@
 		} catch (e) {}
 	});
 })();
+
+// Modal dialogs for create-topic / create-channel forms.
+(function () {
+	"use strict";
+	if (typeof HTMLDialogElement === "undefined") {
+		return;
+	}
+	function openDialog(id) {
+		var el = document.getElementById(id);
+		if (el && typeof el.showModal === "function") {
+			el.showModal();
+		}
+	}
+	document.querySelectorAll("[data-dialog-open]").forEach(function (btn) {
+		btn.addEventListener("click", function () {
+			openDialog(btn.getAttribute("data-dialog-open"));
+		});
+	});
+	document.querySelectorAll("[data-dialog-close]").forEach(function (btn) {
+		btn.addEventListener("click", function () {
+			var dialog = btn.closest("dialog");
+			if (dialog) {
+				dialog.close();
+			}
+		});
+	});
+	document.querySelectorAll("dialog.admin-dialog[open]").forEach(function (dialog) {
+		if (typeof dialog.showModal === "function") {
+			dialog.showModal();
+		}
+	});
+})();

@@ -39,10 +39,11 @@ type fakeStore struct {
 	topics   map[string]int64
 	channels map[string]map[string]int64 // topic name -> channel name -> id
 
-	backlogs     []store.BacklogRow
-	topicDaily   map[int64][]store.DailyCounters
-	channelDaily map[int64][]store.DailyCounters
-	dead         map[int64][]store.DeadDelivery // channel id -> dead rows
+	backlogs      []store.BacklogRow
+	topicDaily    map[int64][]store.DailyCounters
+	channelDaily  map[int64][]store.DailyCounters
+	clusterDaily  []store.DailyCounters
+	dead          map[int64][]store.DeadDelivery // channel id -> dead rows
 
 	deletedTopics   []int64
 	deletedChannels []int64
@@ -55,6 +56,7 @@ type fakeStore struct {
 
 	backlogsForTopicN int
 	channelBacklogN   int
+	clusterDailyN     int
 
 	requeuedDead []int64
 	deletedDead  []int64
@@ -107,6 +109,11 @@ func (f *fakeStore) seedDaily() {
 	f.channelDaily[2] = []store.DailyCounters{
 		{Day: today, Publish: 5, Ack: 4},
 		{Day: today.AddDate(0, 0, -3), Publish: 2},
+	}
+	f.clusterDaily = []store.DailyCounters{
+		{Day: today, Publish: 5, Ack: 4},
+		{Day: today.AddDate(0, 0, -2), Publish: 3},
+		{Day: today.AddDate(0, 0, -5), Publish: 8, Dead: 1},
 	}
 }
 
@@ -354,6 +361,13 @@ func (f *fakeStore) ChannelDailyCounters(_ context.Context, channelID int64, day
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.channelDaily[channelID], nil
+}
+
+func (f *fakeStore) ClusterDailyCounters(_ context.Context, days int) ([]store.DailyCounters, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clusterDailyN++
+	return f.clusterDaily, nil
 }
 
 func (f *fakeStore) DeleteTopic(_ context.Context, topicID int64) error {
@@ -631,6 +645,29 @@ func TestDefaultPrefixIsAdmin(t *testing.T) {
 
 // --- dashboard (R2) ---
 
+func TestDashboardClusterHeatmap(t *testing.T) {
+	ts, f := newTestServer(t, "/admin")
+	_, body := doGet(t, ts.Client(), ts.URL+"/admin/")
+	if got := strings.Count(body, `class="contrib-cell contrib-cell--l`); got < 180 {
+		t.Fatalf("dashboard heatmap cells = %d, want at least 180", got)
+	}
+	if !strings.Contains(body, `aria-label="Breadcrumb"`) || !strings.Contains(body, `aria-current="page">Dashboard<`) {
+		t.Fatal("dashboard missing breadcrumb current page")
+	}
+	if strings.Contains(body, `aria-label="Admin"`) {
+		t.Fatal("dashboard must not render the removed top menu")
+	}
+	if !strings.Contains(body, `(16 publishes total)`) {
+		t.Fatal("dashboard heatmap summary missing cluster publish total 16")
+	}
+	if strings.Contains(body, `class="day-row"`) {
+		t.Fatal("dashboard must not render the per-day counter table (heatmap only)")
+	}
+	if f.clusterDailyN != 1 {
+		t.Fatalf("ClusterDailyCounters calls = %d, want 1", f.clusterDailyN)
+	}
+}
+
 func TestDashboardRendersBacklogGroupedByTopic(t *testing.T) {
 	ts, _ := newTestServer(t, "/admin")
 	res, body := doGet(t, ts.Client(), ts.URL+"/admin/")
@@ -667,6 +704,9 @@ func TestDashboardQueryCountBounded(t *testing.T) {
 	lt, lc, lb := f.counts()
 	if lt != 1 || lc != 1 || lb != 1 {
 		t.Fatalf("first render: ListTopics=%d ListChannels=%d Backlogs=%d, want 1/1/1", lt, lc, lb)
+	}
+	if f.clusterDailyN != 1 {
+		t.Fatalf("first render: ClusterDailyCounters=%d, want 1", f.clusterDailyN)
 	}
 	// Grow the channel count; the dashboard must not add queries.
 	f.addChannels("orders", "webhooks", "slack", "audit", "sms")
@@ -764,6 +804,12 @@ func TestTopicPageLateChannelNote(t *testing.T) {
 	// The create-channel form posts the topic id.
 	if !strings.Contains(body, `name="topic_id" value="1"`) {
 		t.Fatal("topic page: create-channel form lacks hidden topic_id")
+	}
+	if !strings.Contains(body, `id="create-channel-dialog"`) {
+		t.Fatal("topic page: create-channel dialog missing")
+	}
+	if !strings.Contains(body, `aria-label="Breadcrumb"`) || !strings.Contains(body, `>orders<`) {
+		t.Fatal("topic page: breadcrumb missing topic name")
 	}
 }
 

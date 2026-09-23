@@ -550,6 +550,18 @@ func (c *Client) ChannelDailyCounters(ctx context.Context, channelID int64, days
 	return rows, nil
 }
 
+// ClusterDailyCounters returns every retained day-bucket row rolled up per
+// UTC day over the trailing days-day window. Flush/lag semantics and
+// zero-filling match TopicDailyCounters.
+func (c *Client) ClusterDailyCounters(ctx context.Context, days int) ([]DailyCounters, error) {
+	c.flushStatsBestEffort(ctx)
+	rows, err := c.store.ClusterDailyCounters(ctx, days)
+	if err != nil {
+		return nil, fmt.Errorf("novaque cluster daily counters: %w", err)
+	}
+	return rows, nil
+}
+
 // flushStatsBestEffort drains this process's buffered counter deltas so the
 // daily-counter reads see them (KTD12: the sink is per-process). Failure is
 // logged and swallowed — a read must not fail because a flush did.

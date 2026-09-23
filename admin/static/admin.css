@@ -276,6 +276,30 @@ input:focus-visible {
 	gap: 1rem;
 }
 
+.breadcrumb {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.35rem;
+	margin: 0 0 0.85rem;
+	font-size: 0.82rem;
+	color: var(--muted-foreground);
+}
+.breadcrumb a { color: var(--muted-foreground); }
+.breadcrumb a:hover { color: var(--primary); }
+.breadcrumb [aria-current="page"] { color: var(--foreground); font-weight: 500; }
+.breadcrumb__sep { opacity: 0.5; user-select: none; }
+
+.page-head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.75rem;
+	margin-bottom: 0.25rem;
+}
+.page-head h1 { margin: 0; }
+
 .brand {
 	color: var(--foreground);
 	font-weight: 700;
@@ -423,6 +447,50 @@ button {
 	transition: background var(--duration-fast) var(--ease);
 }
 button:hover { background: color-mix(in oklab, var(--primary) 88%, black); }
+
+button.secondary {
+	background: var(--secondary);
+	color: var(--secondary-foreground);
+	border: 1px solid var(--border);
+}
+button.secondary:hover {
+	background: color-mix(in oklab, var(--secondary) 92%, var(--foreground));
+}
+
+.admin-dialog {
+	border: 1px solid var(--border);
+	border-radius: var(--radius-card);
+	padding: 1.25rem 1.35rem;
+	max-width: 28rem;
+	width: calc(100% - 2rem);
+	background: var(--card);
+	color: var(--foreground);
+	box-shadow: var(--shadow-elev-lg);
+}
+.admin-dialog::backdrop {
+	background: oklch(0.2 0.02 255 / 0.45);
+}
+.admin-dialog h2 {
+	margin: 0 0 0.85rem;
+	font-size: 1.05rem;
+}
+.admin-dialog label {
+	display: block;
+	font-weight: 600;
+	margin-bottom: 0.35rem;
+}
+.admin-dialog input[type="text"] {
+	width: 100%;
+	min-width: 0;
+	box-sizing: border-box;
+}
+.dialog-actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 0.5rem;
+	margin-top: 1rem;
+}
 
 .form-error {
 	color: var(--status-danger-foreground);

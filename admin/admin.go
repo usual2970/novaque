@@ -282,13 +282,20 @@ func (h *handler) basicAuth(next http.Handler, user, pass string) http.Handler {
 
 // --- view models ---
 
+// navCrumb is one breadcrumb segment in the layout header.
+type navCrumb struct {
+	Label string
+	Href  string // empty = current page (no link)
+}
+
 // baseView carries the fields every layout render needs. Poll is the
 // page's un-prefixed JSON endpoint (e.g. /api/summary): the poller builds
 // the full URL as BASE + Poll, with BASE the injected prefix constant.
 type baseView struct {
-	Prefix string
-	Title  string
-	Poll   string
+	Prefix      string
+	Title       string
+	Poll        string
+	Breadcrumbs []navCrumb
 }
 
 // channelView is one channel row with its live backlog (zero-filled).
@@ -314,6 +321,7 @@ type dayView struct {
 type dashboardView struct {
 	baseView
 	Groups      []topicGroupView
+	Days        []dayView
 	CreateName  string
 	CreateError string
 }
@@ -404,6 +412,14 @@ func (h *handler) loadGroups(ctx context.Context) ([]topicGroupView, error) {
 		groups = append(groups, topicGroupView{ID: t.ID, Name: t.Name, Totals: totals, Channels: chans})
 	}
 	return groups, nil
+}
+
+func (h *handler) loadClusterDays(ctx context.Context) ([]dayView, error) {
+	rows, err := h.client.ClusterDailyCounters(ctx, trendDays)
+	if err != nil {
+		return nil, fmt.Errorf("cluster daily counters: %w", err)
+	}
+	return zeroFillDaily(rows, trendDays, time.Now()), nil
 }
 
 // loadTopicBase resolves the topic through the list endpoint and assembles
@@ -577,9 +593,22 @@ func (h *handler) renderDashboardForm(w http.ResponseWriter, r *http.Request, na
 		h.renderError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
+	days, err := h.loadClusterDays(r.Context())
+	if err != nil {
+		h.renderError(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
 	h.render(w, r, "dashboard.html", http.StatusOK, dashboardView{
-		baseView:    baseView{Prefix: h.prefix, Title: "Dashboard", Poll: "/api/summary"},
+		baseView: baseView{
+			Prefix: h.prefix,
+			Title:  "Dashboard",
+			Poll:   "/api/summary",
+			Breadcrumbs: []navCrumb{
+				{Label: "Dashboard"},
+			},
+		},
 		Groups:      groups,
+		Days:        days,
 		CreateName:  name,
 		CreateError: errMsg,
 	})
@@ -607,7 +636,15 @@ func (h *handler) renderTopicForm(w http.ResponseWriter, r *http.Request, id int
 		h.renderError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	v.baseView = baseView{Prefix: h.prefix, Title: "Topic " + v.Name, Poll: fmt.Sprintf("/api/topics/%d", id)}
+	v.baseView = baseView{
+		Prefix: h.prefix,
+		Title:  "Topic " + v.Name,
+		Poll:   fmt.Sprintf("/api/topics/%d", id),
+		Breadcrumbs: []navCrumb{
+			{Label: "Dashboard", Href: "/"},
+			{Label: v.Name},
+		},
+	}
 	v.ChannelName, v.ChannelError = name, errMsg
 	h.render(w, r, "topic.html", http.StatusOK, v)
 }
@@ -627,7 +664,16 @@ func (h *handler) pageChannel(w http.ResponseWriter, r *http.Request) {
 		h.renderError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	v.baseView = baseView{Prefix: h.prefix, Title: "Channel " + v.TopicName + "/" + v.Name, Poll: fmt.Sprintf("/api/channels/%d", id)}
+	v.baseView = baseView{
+		Prefix: h.prefix,
+		Title:  "Channel " + v.TopicName + "/" + v.Name,
+		Poll:   fmt.Sprintf("/api/channels/%d", id),
+		Breadcrumbs: []navCrumb{
+			{Label: "Dashboard", Href: "/"},
+			{Label: v.TopicName, Href: fmt.Sprintf("/topics/%d", v.TopicID)},
+			{Label: v.Name},
+		},
+	}
 	h.render(w, r, "channel.html", http.StatusOK, v)
 }
 
@@ -651,8 +697,16 @@ func (h *handler) pageConfirmDeleteTopic(w http.ResponseWriter, r *http.Request)
 	// Backlog rows are per channel, so totals have no double count; a
 	// zero-channel topic sums to zero, which is correct.
 	h.render(w, r, "confirm.html", http.StatusOK, confirmView{
-		baseView: baseView{Prefix: h.prefix, Title: "Delete topic " + v.Name + "?"},
-		Heading:  "Delete topic “" + v.Name + "”?",
+		baseView: baseView{
+			Prefix: h.prefix,
+			Title:  "Delete topic " + v.Name + "?",
+			Breadcrumbs: []navCrumb{
+				{Label: "Dashboard", Href: "/"},
+				{Label: v.Name, Href: fmt.Sprintf("/topics/%d", id)},
+				{Label: "Delete"},
+			},
+		},
+		Heading: "Delete topic “" + v.Name + "”?",
 		Lines: []string{
 			fmt.Sprintf("Channels deleted: %d", len(v.Channels)),
 			fmt.Sprintf("Deliveries deleted: %d (pending %d · in-flight %d · dead %d)",
@@ -686,8 +740,17 @@ func (h *handler) pageConfirmDeleteChannel(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	h.render(w, r, "confirm.html", http.StatusOK, confirmView{
-		baseView: baseView{Prefix: h.prefix, Title: "Delete channel " + v.Name + "?"},
-		Heading:  "Delete channel “" + v.Name + "” (topic " + v.TopicName + ")?",
+		baseView: baseView{
+			Prefix: h.prefix,
+			Title:  "Delete channel " + v.Name + "?",
+			Breadcrumbs: []navCrumb{
+				{Label: "Dashboard", Href: "/"},
+				{Label: v.TopicName, Href: fmt.Sprintf("/topics/%d", v.TopicID)},
+				{Label: v.Name, Href: fmt.Sprintf("/channels/%d", id)},
+				{Label: "Delete"},
+			},
+		},
+		Heading: "Delete channel “" + v.Name + "” (topic " + v.TopicName + ")?",
 		Lines: []string{
 			fmt.Sprintf("Deliveries deleted: %d (pending %d · in-flight %d · dead %d)",
 				v.Backlog.Pending+v.Backlog.InFlight+v.Backlog.Dead, v.Backlog.Pending, v.Backlog.InFlight, v.Backlog.Dead),

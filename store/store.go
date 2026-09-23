@@ -320,6 +320,13 @@ type Store interface {
 	// zero-filling the window is the caller's job. days must be >= 1.
 	ChannelDailyCounters(ctx context.Context, channelID int64, days int) ([]DailyCounters, error)
 
+	// ClusterDailyCounters returns every retained day-bucket row in the
+	// database rolled up per UTC day over the trailing days-day window
+	// ending today (day boundary from the DB clock). Existing-day rows only,
+	// ascending by day; zero-filling the window is the caller's job. days
+	// must be >= 1.
+	ClusterDailyCounters(ctx context.Context, days int) ([]DailyCounters, error)
+
 	// ListDead returns a channel's dead deliveries newest-first (id DESC),
 	// keyset-paginated: before > 0 returns only rows with id < before; limit
 	// bounds the page, non-positive falling back to a driver default.

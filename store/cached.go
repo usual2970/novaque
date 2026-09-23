@@ -186,6 +186,12 @@ func (c *CachingStore) ChannelDailyCounters(ctx context.Context, channelID int64
 	return c.Inner.ChannelDailyCounters(ctx, channelID, days)
 }
 
+// ClusterDailyCounters passes through to Inner.ClusterDailyCounters; never
+// cached (plan 004 / admin posture for stats reads).
+func (c *CachingStore) ClusterDailyCounters(ctx context.Context, days int) ([]DailyCounters, error) {
+	return c.Inner.ClusterDailyCounters(ctx, days)
+}
+
 // ListDead passes through to Inner.ListDead; dead rows are live state,
 // never cached.
 func (c *CachingStore) ListDead(ctx context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]DeadDelivery, error) {

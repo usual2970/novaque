@@ -24,6 +24,7 @@ try {
 	</button>
 </header>
 <main{{if .Poll}} data-poll="{{.Poll}}"{{end}}>
+{{if .Breadcrumbs}}<nav class="breadcrumb" aria-label="Breadcrumb">{{range $i, $c := .Breadcrumbs}}{{if $i}}<span class="breadcrumb__sep" aria-hidden="true">/</span>{{end}}{{if $c.Href}}<a href="{{url $c.Href}}">{{$c.Label}}</a>{{else}}<span aria-current="page">{{$c.Label}}</span>{{end}}{{end}}</nav>{{end}}
 {{template "content" .}}
 </main>
 <footer class="foot">
@@ -34,9 +35,8 @@ try {
 </body>
 </html>
 
-{{define "days"}}
+{{define "daysHeatmapInner"}}
 {{$graph := heatmap .}}
-<section class="card">
 	<header class="contrib-summary">
 		<h2>Day-bucket counters · trailing {{$graph.WindowDays}} UTC days <span class="muted">({{$graph.Total}} publishes total)</span></h2>
 	</header>
@@ -68,6 +68,17 @@ try {
 			<span>More</span>
 		</div>
 	</div>
+{{end}}
+
+{{define "daysHeatmap"}}
+<section class="card">
+{{template "daysHeatmapInner" .}}
+</section>
+{{end}}
+
+{{define "days"}}
+<section class="card">
+{{template "daysHeatmapInner" .}}
 	<table class="counters">
 		<thead>
 			<tr>

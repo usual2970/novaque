@@ -1,5 +1,8 @@
 {{define "content"}}
-<h1>Topic <span class="entity">{{.Name}}</span></h1>
+<div class="page-head">
+	<h1>Topic <span class="entity">{{.Name}}</span></h1>
+	<button type="button" class="secondary" data-dialog-open="create-channel-dialog">Add channel</button>
+</div>
 <p class="muted">Topic #{{.ID}} · totals: <span data-t="{{.ID}}-pending">{{.Totals.Pending}}</span> pending · <span data-t="{{.ID}}-ready">{{.Totals.Ready}}</span> ready · <span data-t="{{.ID}}-in_flight">{{.Totals.InFlight}}</span> in flight · <span data-t="{{.ID}}-dead">{{.Totals.Dead}}</span> dead</p>
 
 <section class="card">
@@ -32,15 +35,24 @@
 	{{else}}
 	<p class="note">No channels. Publishes to a zero-channel topic keep the message and count on the topic's sentinel stats row only.</p>
 	{{end}}
-	{{if .ChannelError}}<p class="form-error" role="alert">{{.ChannelError}}</p>{{end}}
-	<form class="inline-form" method="post" action="{{url "/channels"}}">
-		<input type="hidden" name="topic_id" value="{{.ID}}">
-		<label for="channel-name">Add channel</label>
-		<input id="channel-name" type="text" name="name" value="{{.ChannelName}}" maxlength="64" required>
-		<button type="submit">Create channel</button>
-	</form>
-	<p class="note">A channel created after a publish receives only future publishes — messages already published are not retroactively delivered.</p>
 </section>
+
+<dialog id="create-channel-dialog" class="admin-dialog"{{if .ChannelError}} open{{end}}>
+	<form method="post" action="{{url "/channels"}}">
+		<h2>Add channel</h2>
+		{{if .ChannelError}}<p class="form-error" role="alert">{{.ChannelError}}</p>{{end}}
+		<input type="hidden" name="topic_id" value="{{.ID}}">
+		<p>
+			<label for="channel-name">Name</label>
+			<input id="channel-name" type="text" name="name" value="{{.ChannelName}}" maxlength="64" required>
+		</p>
+		<p class="note">A channel created after a publish receives only future publishes — messages already published are not retroactively delivered.</p>
+		<div class="dialog-actions">
+			<button type="button" class="secondary" data-dialog-close>Cancel</button>
+			<button type="submit">Create channel</button>
+		</div>
+	</form>
+</dialog>
 
 {{template "days" .Days}}
 

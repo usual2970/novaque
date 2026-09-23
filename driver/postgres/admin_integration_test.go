@@ -321,6 +321,22 @@ func TestAdminDailyCounters(t *testing.T) {
 	if _, err = s.ChannelDailyCounters(ctx, 0, 5); err == nil {
 		t.Fatal("ChannelDailyCounters channel=0 must error")
 	}
+
+	gotCl, err := s.ClusterDailyCounters(ctx, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotCl) != len(want) {
+		t.Fatalf("ClusterDailyCounters(7) = %+v, want %+v", gotCl, want)
+	}
+	for i := range want {
+		if gotCl[i] != want[i] {
+			t.Fatalf("ClusterDailyCounters(7)[%d] = %+v, want %+v", i, gotCl[i], want[i])
+		}
+	}
+	if _, err = s.ClusterDailyCounters(ctx, 0); err == nil {
+		t.Fatal("ClusterDailyCounters days=0 must error")
+	}
 }
 
 // TestAdminDeleteTopicCascade covers AE2: deleting a topic removes channels,

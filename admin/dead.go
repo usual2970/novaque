@@ -274,6 +274,12 @@ func (h *handler) pageDead(w http.ResponseWriter, r *http.Request) {
 	v.baseView = baseView{
 		Prefix: h.prefix,
 		Title:  "Dead letters — " + v.TopicName + "/" + v.ChannelName,
+		Breadcrumbs: []navCrumb{
+			{Label: "Dashboard", Href: "/"},
+			{Label: v.TopicName, Href: fmt.Sprintf("/topics/%d", v.TopicID)},
+			{Label: v.ChannelName, Href: fmt.Sprintf("/channels/%d", v.ChannelID)},
+			{Label: "Dead letters"},
+		},
 	}
 	v.Notice = deadNotice(r.URL.Query().Get("done"))
 	h.render(w, r, "dead.html", http.StatusOK, v)
@@ -315,7 +321,17 @@ func (h *handler) pageDeadDelivery(w http.ResponseWriter, r *http.Request) {
 			Channel:     d.Channel,
 		},
 	}
-	v.baseView = baseView{Prefix: h.prefix, Title: fmt.Sprintf("Dead delivery #%d", deliveryID)}
+	v.baseView = baseView{
+		Prefix: h.prefix,
+		Title:  fmt.Sprintf("Dead delivery #%d", deliveryID),
+		Breadcrumbs: []navCrumb{
+			{Label: "Dashboard", Href: "/"},
+			{Label: v.TopicName, Href: fmt.Sprintf("/topics/%d", v.TopicID)},
+			{Label: v.ChannelName, Href: fmt.Sprintf("/channels/%d", v.ChannelID)},
+			{Label: "Dead letters", Href: fmt.Sprintf("/channels/%d/dead", channelID)},
+			{Label: fmt.Sprintf("#%d", deliveryID)},
+		},
+	}
 	h.render(w, r, "dead.html", http.StatusOK, v)
 }
 

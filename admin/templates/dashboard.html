@@ -1,18 +1,30 @@
 {{define "content"}}
-<h1>Dashboard</h1>
+<div class="page-head">
+	<h1>Dashboard</h1>
+	<button type="button" class="secondary" data-dialog-open="create-topic-dialog">Create topic</button>
+</div>
 
-<section class="card">
-	<h2>Create topic</h2>
-	{{if .CreateError}}<p class="form-error" role="alert">{{.CreateError}}</p>{{end}}
-	<form class="inline-form" method="post" action="{{url "/topics"}}">
-		<label for="topic-name">Name</label>
-		<input id="topic-name" type="text" name="name" value="{{.CreateName}}" maxlength="64" required>
-		<button type="submit">Create topic</button>
+<div id="trends">
+{{template "daysHeatmap" .Days}}
+</div>
+
+<dialog id="create-topic-dialog" class="admin-dialog"{{if .CreateError}} open{{end}}>
+	<form method="post" action="{{url "/topics"}}">
+		<h2>Create topic</h2>
+		{{if .CreateError}}<p class="form-error" role="alert">{{.CreateError}}</p>{{end}}
+		<p>
+			<label for="topic-name">Name</label>
+			<input id="topic-name" type="text" name="name" value="{{.CreateName}}" maxlength="64" required>
+		</p>
+		<p class="hint">Names are 1–64 characters of letters, digits, dot, underscore, and dash (driver rule). Creating an existing topic resolves to it — idempotent.</p>
+		<div class="dialog-actions">
+			<button type="button" class="secondary" data-dialog-close>Cancel</button>
+			<button type="submit">Create topic</button>
+		</div>
 	</form>
-	<p class="hint">Names are 1–64 characters of letters, digits, dot, underscore, and dash (driver rule). Creating an existing topic resolves to it — idempotent.</p>
-</section>
+</dialog>
 
-<section class="card">
+<section class="card" id="topics">
 	<h2>Topics &amp; channels</h2>
 	{{if .Groups}}
 	<table>

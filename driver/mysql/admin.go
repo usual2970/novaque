@@ -154,6 +154,15 @@ func (s *Store) ChannelDailyCounters(ctx context.Context, channelID int64, days 
 	return s.dailyCounters(ctx, whereChannelID, channelID, days)
 }
 
+// ClusterDailyCounters returns every retained day-bucket row rolled up per
+// UTC day over the trailing days-day window ending today.
+func (s *Store) ClusterDailyCounters(ctx context.Context, days int) ([]store.DailyCounters, error) {
+	if days < 1 {
+		return nil, fmt.Errorf("mysql admin: invalid days %d", days)
+	}
+	return s.clusterDailyCounters(ctx, days)
+}
+
 // The two where-column literals dailyCounters accepts; never caller input.
 const (
 	whereTopicID   = "topic_id"
@@ -174,6 +183,35 @@ func (s *Store) dailyCounters(ctx context.Context, whereCol string, id int64, da
 		WHERE `+whereCol+` = ? AND day_utc > UTC_DATE() - INTERVAL ? DAY
 		GROUP BY day_utc
 		ORDER BY day_utc ASC`, id, days)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []store.DailyCounters
+	for rows.Next() {
+		var dayStr string
+		var d store.DailyCounters
+		if err := rows.Scan(&dayStr, &d.Publish, &d.Claim, &d.Ack, &d.Requeue, &d.Dead, &d.Purge); err != nil {
+			return nil, err
+		}
+		day, err := time.Parse("2006-01-02", dayStr)
+		if err != nil {
+			return nil, fmt.Errorf("mysql admin: parse day bucket %q: %w", dayStr, err)
+		}
+		d.Day = day
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) clusterDailyCounters(ctx context.Context, days int) ([]store.DailyCounters, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DATE_FORMAT(day_utc, '%Y-%m-%d'),
+		       SUM(publish), SUM(claim), SUM(ack), SUM(requeue), SUM(dead), SUM(purged)
+		FROM novaque_stats_daily
+		WHERE day_utc > UTC_DATE() - INTERVAL ? DAY
+		GROUP BY day_utc
+		ORDER BY day_utc ASC`, days)
 	if err != nil {
 		return nil, err
 	}

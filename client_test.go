@@ -68,12 +68,14 @@ type fakeStore struct {
 	// verbatim and record the id/window args each call saw; dead ops and
 	// deletes record their targets. Under mu.
 	backlogs     []store.BacklogRow
-	topicDaily   []store.DailyCounters
-	channelDaily []store.DailyCounters
-	deadRows     []store.DeadDelivery
+	topicDaily    []store.DailyCounters
+	channelDaily  []store.DailyCounters
+	clusterDaily  []store.DailyCounters
+	deadRows      []store.DeadDelivery
 
-	lastDailyTopicID    int64
-	lastDailyTopicDays  int
+	lastDailyTopicID     int64
+	lastDailyTopicDays   int
+	lastClusterDailyDays int
 	lastBacklogsTopicID int64
 	lastDailyChannelID  int64
 	lastDailyChanDays   int
@@ -366,6 +368,13 @@ func (f *fakeStore) ChannelDailyCounters(_ context.Context, channelID int64, day
 	f.lastDailyChannelID = channelID
 	f.lastDailyChanDays = days
 	return f.channelDaily, nil
+}
+
+func (f *fakeStore) ClusterDailyCounters(_ context.Context, days int) ([]store.DailyCounters, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastClusterDailyDays = days
+	return f.clusterDaily, nil
 }
 
 func (f *fakeStore) ListDead(_ context.Context, channelID int64, before int64, limit int, bodyPrefix int) ([]store.DeadDelivery, error) {
