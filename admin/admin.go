@@ -489,9 +489,9 @@ func (h *handler) loadChannel(ctx context.Context, id int64) (channelDetailView,
 }
 
 // zeroFillDaily expands the store's existing-day rows over the full trailing
-// window ending today UTC, zero-filling missing days (R3). The store returns
-// only days with recorded rows; the trend renders a bar for every window
-// day, so the fill happens here in Go.
+// window ending today UTC, zero-filling missing days (R3). Rows are
+// newest-first (today first). The store returns only days with recorded rows;
+// the trend renders a bar for every window day, so the fill happens here in Go.
 func zeroFillDaily(rows []novaque.DailyCounters, days int, now time.Time) []dayView {
 	byDay := make(map[string]novaque.DailyCounters, len(rows))
 	for _, row := range rows {
@@ -499,7 +499,7 @@ func zeroFillDaily(rows []novaque.DailyCounters, days int, now time.Time) []dayV
 	}
 	today := now.UTC().Truncate(24 * time.Hour)
 	out := make([]dayView, 0, days)
-	for i := days - 1; i >= 0; i-- {
+	for i := 0; i < days; i++ {
 		day := today.AddDate(0, 0, -i)
 		row := byDay[day.Format(dateFormat)] // zero value zero-fills
 		row.Day = day

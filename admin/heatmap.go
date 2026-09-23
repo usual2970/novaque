@@ -87,15 +87,34 @@ func deadCounterLevel(value, max int64) int {
 	return lvl
 }
 
+// chronologicalDayViews returns days oldest-first. zeroFillDaily emits
+// newest-first for tables and JSON; heatmaps keep chronological left-to-right.
+func chronologicalDayViews(days []dayView) []dayView {
+	if len(days) < 2 {
+		return days
+	}
+	first, last := days[0].Day.UTC(), days[len(days)-1].Day.UTC()
+	if !first.After(last) {
+		return days
+	}
+	out := make([]dayView, len(days))
+	for i := range days {
+		out[i] = days[len(days)-1-i]
+	}
+	return out
+}
+
 func buildContributionGraph(days []dayView) contributionGraph {
 	if len(days) == 0 {
 		return contributionGraph{}
 	}
-	months := make([]monthColumn, len(days))
+	// Detail pages list days newest-first; the strip reads left-to-right as time.
+	chrono := chronologicalDayViews(days)
+	months := make([]monthColumn, len(chrono))
 	var total int64
-	for i, d := range days {
+	for i, d := range chrono {
 		day := d.Day.UTC().Truncate(24 * time.Hour)
-		if i == 0 || day.Month() != days[i-1].Day.UTC().Truncate(24*time.Hour).Month() {
+		if i == 0 || day.Month() != chrono[i-1].Day.UTC().Truncate(24*time.Hour).Month() {
 			months[i].MonthLabel = day.Format("Jan")
 		}
 		total += d.Publish
@@ -104,8 +123,8 @@ func buildContributionGraph(days []dayView) contributionGraph {
 	metrics := make([]metricRow, 0, len(heatmapMetrics))
 	for _, def := range heatmapMetrics {
 		var max int64
-		vals := make([]int64, len(days))
-		for i, d := range days {
+		vals := make([]int64, len(chrono))
+		for i, d := range chrono {
 			v := def.value(d)
 			vals[i] = v
 			if v > max {
@@ -116,8 +135,8 @@ func buildContributionGraph(days []dayView) contributionGraph {
 		if def.id == "dead" {
 			levelFn = deadCounterLevel
 		}
-		cells := make([]metricCell, len(days))
-		for i, d := range days {
+		cells := make([]metricCell, len(chrono))
+		for i, d := range chrono {
 			day := d.Day.UTC().Truncate(24 * time.Hour)
 			cells[i] = metricCell{
 				Day:   day,

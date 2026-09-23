@@ -1143,9 +1143,9 @@ func TestAPITopicAndChannelDetailZeroFilled(t *testing.T) {
 	if len(topic.Days) != 30 {
 		t.Fatalf("topic days = %d, want 30 (zero-filled)", len(topic.Days))
 	}
-	last := topic.Days[len(topic.Days)-1]
-	if last.Day != today || last.Publish != 5 {
-		t.Fatalf("last day = %+v, want %s publish=5", last, today)
+	first := topic.Days[0]
+	if first.Day != today || first.Publish != 5 {
+		t.Fatalf("first day = %+v, want %s publish=5 (newest-first)", first, today)
 	}
 
 	res, raw = doGet(t, ts.Client(), ts.URL+"/admin/api/channels/2")
