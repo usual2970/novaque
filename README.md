@@ -2,30 +2,23 @@
 
 Embeddable Go library for **topic → channel pub/sub** on a relational database.
 
-You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. Topics fan out to channels; consumers on the same channel compete. Delivery is **at-least-once** with lease + ack.
+You bring a `*sql.DB`; novaque runs in-process — no broker daemon. Topics fan out to channels; consumers on the same channel compete. Delivery is **at-least-once** with lease + ack (handlers must be idempotent).
 
 ## Why novaque?
 
-Many apps already need a relational database for their core data. Adding a separate message broker (Kafka, NSQ, RabbitMQ, and similar) means another cluster to provision, secure, monitor, and upgrade — plus the glue (clients, credentials, networking, back-pressure) between your app and that second system.
-
-**Fewer moving parts.** novaque is an embeddable Go library, not a daemon. Queue semantics live in the same database connection pool you already operate. Deployment stays “app + DB”; there is no broker fleet beside them.
-
-**Databases are ready for queue workloads.** Modern engines expose the primitives queue implementations need: durable rows, transactional fan-out, and safe concurrent claiming (`FOR UPDATE SKIP LOCKED` on MySQL and PostgreSQL; serializable transactions on SQLite). You keep one durability and backup story instead of splitting it across broker and DB.
-
-novaque maps **topic → channel** pub/sub (multicast to every channel plus competing consumers within a channel) onto those patterns — at-least-once delivery with explicit ack — so you can defer a dedicated broker until scale or product requirements truly require one.
+Many apps already run a relational database. A separate message broker adds another cluster to operate. novaque keeps queue rows in that same DB — deployment stays **app + DB**, with transactional fan-out and safe multi-process claiming (`SKIP LOCKED` on MySQL/PostgreSQL; serializable transactions on SQLite).
 
 | | |
 |---|---|
 | Topology | topic → channels (multicast); compete within a channel |
-| Durability | rows in MySQL or PostgreSQL (`SKIP LOCKED`) or SQLite (serializable transactions) |
-| Extensibility | `store.Store` seam — MySQL, PostgreSQL, and SQLite drivers all ship |
-| Form | library module, not a long-running service |
+| Durability | MySQL ≥ 8.0.1, PostgreSQL ≥ 14, or SQLite ≥ 3.39.0 |
+| Form | Go library + `store.Store` drivers (all three ship) |
 
 ## Architecture
 
 <img src="docs/architecture/images/novaque-publish-to-consumer-en.png" alt="Publish → Topic → Channel → Consumer" width="560" />
 
-One **Publish** writes a message under a **Topic** and fans out one **delivery** row per existing **Channel**. **Consumers** claim work on a channel (`SKIP LOCKED` or equivalent), run your handler, then **Ack** or **Requeue** with a lease token.
+**Publish** writes one message and one **delivery** per existing **channel**. **Consumers** **Claim** with a lease, run your handler, then **Ack** or **Requeue** (lease token required). Details: [docs/guide.md](docs/guide.md) and [workspace architecture diagrams](https://github.com/usual2970/novaque-workspace/blob/main/docs/architecture/novaque-architecture-and-dataflow.md).
 
 ## Install
 
@@ -33,19 +26,9 @@ One **Publish** writes a message under a **Topic** and fans out one **delivery**
 go get github.com/usual2970/novaque
 ```
 
-Requires **Go 1.26.5+** and one of the shipped drivers: **MySQL ≥ 8.0.1** (InnoDB), **PostgreSQL ≥ 14**, or **SQLite ≥ 3.39.0** (the embedded pure-Go modernc driver bundles a recent SQLite, so no system library is needed).
+Requires **Go 1.26.5+**.
 
-## Upgrading to v0.0.7
-
-v0.0.7 ships the mountable admin UI and grows the exported surface. Existing `*Client` callers keep compiling; out-of-tree implementors of the `store.Store` seam must add the new methods.
-
-- **`store.Store`**: `BacklogsForTopic(ctx, topicID int64) ([]BacklogRow, error)` — the batched pending/ready/in-flight/dead read per channel, replacing N separate `ChannelBacklog` calls — and `ListDead(ctx, channelID, before int64, limit, bodyPrefix int) ([]DeadDelivery, error)`.
-- **`store.DeadDelivery`**: new `BodyLen int64` is the `OCTET_LENGTH` of the full stored body. `Body` is the complete body when `bodyPrefix == 0` and at most `bodyPrefix` bytes otherwise, so a prefixed row can still report its true size.
-- **Dead-letter writes are channel-scoped**: `Client.RequeueDead(ctx, deliveryID, channelID)` and `Client.DeleteDead(ctx, deliveryID, channelID)` — pass the owning channel id alongside the delivery id; an id under a different channel is a no-op.
-
-Run `Client.Migrate` on deploy as usual; the admin UI adds no separate migration.
-
-## Quick start
+## Quick start (MySQL)
 
 ```go
 package main
@@ -70,17 +53,15 @@ func main() {
 	}
 	db.SetMaxOpenConns(32)
 
-	client, err := novaque.Open(mysql.New(db), novaque.Options{
-		MaxInFlight: 8, // concurrent handlers per consumer
-	})
+	client, err := novaque.Open(mysql.New(db), novaque.Options{MaxInFlight: 8})
 	if err != nil {
 		log.Fatal(err)
 	}
 	ctx := context.Background()
 	if err := client.Migrate(ctx); err != nil {
-		log.Fatal(err) // schema setup; idempotent, safe every startup
+		log.Fatal(err)
 	}
-	if err := client.Start(ctx); err != nil { // lease reaper + TTL purge + stats flush/prune
+	if err := client.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 	defer client.Shutdown(context.Background())
@@ -93,7 +74,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer cons.Shutdown(context.Background()) // stop the consumer before the client
+	defer cons.Shutdown(context.Background())
 
 	if _, err := client.Publish(ctx, "events", []byte(`{"ok":true}`),
 		novaque.PublishOpts{}); err != nil {
@@ -103,306 +84,38 @@ func main() {
 }
 ```
 
-`Subscribe` + `Start` is available when you need to wire several consumers before polling.
+PostgreSQL and SQLite: same lifecycle with `driver/postgres` or `driver/sqlite` — see [docs/guide.md](docs/guide.md).
 
-## SQLite driver
+## API surface (short)
 
-`driver/sqlite` runs the full queue on a single database file via the pure-Go **modernc.org/sqlite** driver — no cgo, no native library. It implements the same `store.Store` surface as the MySQL driver: fan-out publish, lease-based competing claim, ack/requeue fencing, lease reap, TTL purge, buffered daily stats, admin/dead-letter surface, and cascade deletes.
-
-```go
-import (
-	"database/sql"
-
-	_ "modernc.org/sqlite"
-
-	"github.com/usual2970/novaque"
-	"github.com/usual2970/novaque/driver/sqlite"
-)
-
-db, err := sql.Open("sqlite",
-	"file:data/novaque.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)")
-if err != nil {
-	log.Fatal(err)
-}
-db.SetMaxOpenConns(10)
-
-client, err := novaque.Open(sqlite.New(db), novaque.Options{MaxInFlight: 4})
-// ...Migrate / Start / Subscribe as in the quick start
-```
-
-**Required pragmas.** Open file databases with `foreign_keys(1)` (cascade deletes depend on it — SQLite ships with FK enforcement off by default), `journal_mode(WAL)` (allows readers while a maintenance write runs), and `busy_timeout(10000)` (writers wait on the single writer lock instead of failing immediately).
-
-**Version floor: SQLite ≥ 3.39.0.** `Migrate` checks `sqlite_version()` and fails fast on older runtimes. The bundled modernc driver always satisfies this; the floor only matters if you register a different SQLite build.
-
-**Concurrency — different from MySQL.** SQLite has no row locks and never supports `FOR UPDATE SKIP LOCKED` in any version. Competing claim is still multi-process safe: transactions are serializable, the pending→in_flight lease update is status-guarded (`WHERE id=? AND status='pending'`), and stale-snapshot conflicts (`SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`) retry the whole claim transaction. A busy timeout covers ordinary lock waits.
-
-**When not to use SQLite.** It allows **one writer at a time** database-wide, so high-throughput or many-process deployments should stay on MySQL or PostgreSQL. SQLite is the right fit for embedded/edge/single-node deployments, local tools and demos, and test suites (the SQLite integration tests need no Docker) — not for a fleet of publisher processes.
-
-## PostgreSQL driver
-
-`driver/postgres` implements the same `store.Store` semantics on **PostgreSQL 14+**: topic→channel fan-out, `FOR UPDATE SKIP LOCKED` claiming, lease/ack, TTL purge, day-bucket stats, and the admin/dead-letter surface behave identically to the MySQL driver. `Migrate` checks `server_version_num` and refuses any server below 14, then applies the embedded schema.
-
-```bash
-go get github.com/jackc/pgx/v5
-```
-
-```go
-import (
-	"database/sql"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
-
-	"github.com/usual2970/novaque"
-	"github.com/usual2970/novaque/driver/postgres"
-)
-
-db, err := sql.Open("pgx",
-	"postgres://user:pass@127.0.0.1:5432/app?sslmode=disable&TimeZone=UTC")
-if err != nil {
-	log.Fatal(err)
-}
-db.SetMaxOpenConns(32)
-
-client, err := novaque.Open(postgres.New(db), novaque.Options{
-	MaxInFlight: 8, // concurrent handlers per consumer
-})
-```
-
-- **DSN.** pgx v5 connection string over `database/sql`. `sslmode=disable` is for local dev only — require TLS (`sslmode=require` or stricter) for any off-host database.
-- **UTC.** Every clock on the hot path is derived server-side (`clock_timestamp()` and `NOW() AT TIME ZONE 'UTC'`), so correctness does not depend on the session time zone; setting `TimeZone=UTC` in the DSN keeps manual inspection and logs aligned.
-- **Case sensitivity.** Unlike MySQL's default utf8mb4 collation, PostgreSQL names are case-sensitive: `Orders` and `orders` are distinct topics.
-- **Connection pool.** Same sizing rule as MySQL: `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroom, and a primary-writable connection (no read replicas) for claim/ack/publish.
-- **Statement timeouts.** Driver transactions set `lock_timeout=5s` and `statement_timeout=30s` locally (the settings revert at commit/rollback), so a maintenance `UPDATE`/`DELETE` cannot wait forever behind a large topic cascade. Autocommit statements issued outside transactions are not covered; set pool-wide defaults with runtime parameters on the connection string (e.g. `?sslmode=disable&lock_timeout=5s&statement_timeout=30s`) or persist them with `ALTER ROLE`/`ALTER DATABASE ... SET lock_timeout`/`statement_timeout`.
-
-## Documentation
-
-Every exported symbol in `novaque`, `novaque/store`, `novaque/admin`, `novaque/driver/mysql`, `novaque/driver/postgres`, and `novaque/driver/sqlite` carries identifier-first godoc. The root package ships compile-verified `Example` functions (`example_test.go`) covering the open → migrate → start lifecycle, publish options, the consume loop, and backlog reads — they need a live MySQL, so they run as ordinary programs rather than under `go test` output comparison.
-
-```bash
-go doc github.com/usual2970/novaque.Client
-go doc github.com/usual2970/novaque.PublishOpts
-```
-
-## Concepts
-
-```
-Publisher ──Publish──▶ topic ──fan-out──▶ channel A ──compete──▶ consumers
-                                   └──▶ channel B ──compete──▶ consumers
-```
-
-- **Topic** — named stream; created lazily on first publish/subscribe.
-- **Channel** — named subscription on a topic; each existing channel gets its own delivery row at publish time.
-- **Late subscribe** — a channel created after messages were published does **not** receive history.
-- **Handler** — must be **idempotent** (at-least-once; crash before ack → redelivery after lease expiry).
-
-## Options
-
-| Field | Default | Role |
-|-------|---------|------|
-| `DefaultTTL` | 7d | message retention when publish omits TTL |
-| `DefaultLease` | 30s | claim lease duration |
-| `DefaultMaxAttempts` | 5 | poison threshold (then `dead`) |
-| `PollInterval` | 200ms | consumer idle poll base (±50% jitter) |
-| `MaxInFlight` | 1 | handler workers + batch claim size per consumer |
-| `ReapInterval` | 1s | expired-lease reaper tick |
-| `PurgeInterval` | 5s | TTL cleanup tick |
-| `MaintenanceBatch` | 100 | rows per reaper/purge pass |
-| `StatsRetentionDays` | 30 | UTC days a counter day bucket is kept before prune |
-| `StatsFlushInterval` | 2s | stats counter flush tick (buffered deltas → DB) |
-| `StatsPruneInterval` | 1h | stats retention prune tick |
-| `Logger` | zap Nop (silent) | structured operational logs; inject e.g. `Zap(yourZapLogger)` |
-
-### PublishOpts
-
-| Field | Role |
-|-------|------|
-| `TTL` | retention from publish time (overrides `DefaultTTL` when set) |
-| `Delay` | relative defer until first claim; max **90 days** (`MaxDelay`) |
-| `MaxAttempts` | poison threshold for this message |
-
-`Delay` must be **strictly less than** effective TTL (after `DefaultTTL` fill), measured in whole Unix seconds — otherwise Publish returns `ErrDelayExceedsTTL`. Over-max returns `ErrDelayTooLong`; negative returns `ErrDelayNegative`. Handler failure still requeues **immediately** (publish delay only).
-
-Example: a 2-day delay needs an explicit TTL longer than 2 days (default TTL is 7d, so omit is fine; an 8-day delay needs `TTL` > 8d).
-
-Size `*sql.DB` `MaxOpenConns` ≥ `MaxInFlight` plus publish/maintenance headroom. Use a **primary-writable** DSN (no read replicas) for claim/ack/publish.
-
-### Logging
-
-`Options.Logger` takes the public `Logger` interface — `Debug`/`Info`/`Warn`/`Error(msg, ...zap.Field)` plus `With` for child loggers. When unset, novaque binds a **silent `zap.NewNop()` default**: the library produces no console noise until you inject one.
-
-```go
-client, err := novaque.Open(mysql.New(db), novaque.Options{
-	Logger: novaque.Zap(zapLogger), // adapt your configured *zap.Logger
-})
-```
-
-- **Lifecycle `Info`** — Client and Consumer Start/Shutdown, once per actual transition (duplicate Start / Shutdown-when-not-started stay silent).
-- **Hot path `Debug`** — successful publish (`topic`, `message_id`) and non-empty claim (`topic`, `channel`, `count`). Expect high volume if you enable Debug in production.
-- **`Error` only for swallowed failures** — claim backoff, reap, purge, stats flush/prune, and final ack/requeue after retries. Errors returned to your caller (e.g. Publish) are not duplicate-logged; shutdown cancels are silent.
-- **Payload privacy** — message bodies are **never logged**; only ids, topic, channel, counts, and errors.
-
-The quick start's stdlib `log.Printf` is caller-side printing, separate from this library logging.
-
-## Stats
-
-novaque keeps two kinds of numbers, and the split matters:
-
-- **Counters** — `publish` / `claim` / `ack` / `requeue` / `dead` / `purge` event totals stored as **UTC day buckets** keyed by topic/channel. They survive ack deletes and message TTL purges; they only fall when the retention prune removes old day buckets.
-- **Backlog** — a **live count** of `novaque_deliveries` rows right now. It drops as work is acked, purged, or dead-lettered, and is never day-bucketed.
-
-| Method | Returns |
-|--------|---------|
-| `ChannelCounters(ctx, topic, channel)` | summed counters over retained days for one channel |
-| `TopicCounters(ctx, topic)` | counters rolled up over the topic (per-channel rows plus the topic-level row) |
-| `ChannelBacklog(ctx, topic, channel)` | live `Pending` / `Ready` / `InFlight` / `Dead` counts |
-| `FlushStats(ctx)` | drains buffered counter deltas into the DB now |
-| `PruneStats(ctx)` | deletes day buckets older than `StatsRetentionDays`; returns rows deleted |
-
-```go
-cc, err := client.ChannelCounters(ctx, "events", "indexer")
-bl, err := client.ChannelBacklog(ctx, "events", "indexer")
-log.Printf("publish=%d ack=%d pending=%d ready=%d",
-    cc.Publish, cc.Ack, bl.Pending, bl.Ready)
-```
-
-Semantics worth knowing:
-
-- **Stats reads create on read.** The stats read APIs resolve names the same way `Publish`/`Subscribe` do, so reading a topic or channel that does not exist yet creates it — a typo'd name shows zeros and permanently joins future publish fan-out. Double-check names in monitoring code.
-- **Async counters.** Mutations buffer counter deltas in-process; the maintenance loop flushes them every `StatsFlushInterval` (default 2s). Reads are eventually consistent within that window; a hard crash loses at most the unflushed window. A flush that landed server-side but *looked* failed is retried and can double-count — at-least-once, never loses counts. Graceful `Shutdown` performs one final flush.
-- **Reap is not requeue.** Only a handler-driven `Requeue` counts. A lease that expires and is re-claimed counts `claim` again — the same at-least-once rule as delivery.
-- **Ready vs Pending.** Delayed publishes (`PublishOpts.Delay`) count as `Pending` but not `Ready` until `available_at` passes; claim only takes `Ready`. `Ready` mirrors claim eligibility exactly, so pending rows whose TTL has expired (not yet purged) stay in `Pending` but drop out of `Ready`.
-- **Zero-channel publishes** count on a topic-level row (visible in `TopicCounters`; no channel backlog changes).
-- **Retention.** Day buckets older than `StatsRetentionDays` (default 30) are pruned every `StatsPruneInterval` (default 1h). Prune needs `Start` — or call `PruneStats` / `FlushStats` explicitly when you host novaque without maintenance loops.
-- **Privacy.** Stats store ids and counts only — never message payloads.
-- **Shutdown order.** Stop Consumers before the Client so their final acks land before the Client's last counter flush.
-
-## Admin UI
-
-`novaque/admin` ships a zero-build admin UI and JSON API as one stdlib `http.Handler`: a dashboard with live backlog, topic/channel detail pages with day-bucket trends, create and cascade-delete flows, and dead-letter browse (truncated list, full body on demand) with requeue/delete. Templates, CSS, and vanilla JS are embedded — no Node toolchain, no new runtime dependencies.
-
-```go
-h, err := admin.New(client, admin.Options{
-	Prefix:        "/admin", // default; "/" mounts at the root
-	BasicAuthUser: "ops",    // optional single pair — both or neither
-	BasicAuthPass: "hunter2",
-})
-```
-
-The handler strips its own prefix and re-applies it to every generated URL and redirect, so the host never wraps `http.StripPrefix`. Mount recipes:
-
-```go
-r.Any("/admin/*any", gin.WrapH(h))       // gin
-e.Any("/admin/*", echo.WrapHandler(h))   // echo — needs the bare route too:
-e.Any("/admin", echo.WrapHandler(h))
-r.Mount("/admin", h)                     // chi
-mux.Handle("/admin/", h)                 // net/http
-```
-
-### Auth and CSRF
-
-The only auth the package provides is the optional single basic-auth pair — no sessions, no RBAC. Real authentication belongs in host middleware mounted before the admin handler. **Basic auth without TLS on the host sends decodable credentials on every request**: serve the admin path over HTTPS whenever the pair is set.
-
-Every mutation is a POST (no mutating GET). Cross-origin browser mutations are rejected by the stdlib `http.CrossOriginProtection`: a POST with a mismatched `Origin` header answers 403, while same-origin forms and curl (no `Origin`) pass.
-
-### Delete semantics
-
-- **Topic delete cascades** in one transaction: the topic's channels, messages, deliveries, and retained day-bucket stats rows (including the zero-channel sentinel rows) all go. It is idempotent on an already-deleted id, and publishers self-heal — the next publish to the topic name re-creates it.
-- **Channel delete removes only that channel's deliveries and stats rows.** Shared message rows survive, so sibling channels keep their deliveries.
-- **Remove the channel from your consumer configuration before restarting consumers.** A consumer restarted while still subscribed re-creates the channel (create-on-subscribe), and a running consumer left subscribed idles forever until restarted. The delete confirmation page warns about this.
-
-### Dead letters
-
-Dead deliveries are browsable per channel — body preview truncated in the list, full body on demand — with attempts, remaining TTL, and per-delivery requeue/delete. Two semantics worth knowing:
-
-- **Requeue restarts the clock.** The original per-publish TTL is not stored: a requeued dead delivery gets a fresh TTL from the Client's `DefaultTTL`, with attempts reset and available now.
-- **Requeue is a retry, not immortality.** The fresh TTL is bounded by the message's remaining life / `DefaultTTL` — the TTL purge still reclaims any row whose `expires_at` passes. Dead-letter requeue buys another processing window; it does not exempt the message from expiry.
-
-### Caveats
-
-- **Collation.** MySQL's default utf8mb4 collation is case-insensitive: `Orders` and `orders` are the same topic. Duplicate creates resolve idempotently to the existing entity either way.
-- **Counter lag.** Counters buffer in-process and flush every `StatsFlushInterval` (default 2s); each process flushes only its own deltas, so with multiple publisher processes the UI's numbers may lag by a few seconds (the page footer notes this). Backlog is a live COUNT and does not lag.
-- **`purge` counter.** The `purge` day-bucket counter totals TTL purges **plus manual dead-letter deletions** from the admin UI — deleting a dead delivery bumps `purge`.
+| Area | Notes |
+|------|--------|
+| **Client** | `Open`, `Migrate`, `Start`/`Shutdown`, `Publish`, `Subscribe`/`SubscribeAndStart` |
+| **Options** | TTL, lease, poll, `MaxInFlight`, maintenance, stats, injectable `Logger` — [guide](docs/guide.md#options-full) |
+| **Stats** | Day-bucket counters + live backlog — [guide](docs/guide.md#stats) |
+| **Admin** | `novaque/admin` mountable UI + JSON API — [guide](docs/guide.md#admin-ui-novaqueadmin) |
+| **Godoc** | `go doc github.com/usual2970/novaque.Client` · compile-verified examples in `example_test.go` |
 
 ## Guarantees
 
 | Behavior | Contract |
 |----------|----------|
-| Fan-out | One pending delivery per **existing** channel, same transaction as the message |
+| Fan-out | One delivery per **existing** channel, same transaction as the message |
 | Late channel | No retroactive history |
-| Delivery | At-least-once; ack requires matching `lease_token` |
-| Compete | Multi-process safe: MySQL via `FOR UPDATE SKIP LOCKED`; SQLite via serializable txns, status-guarded leases and busy retries |
-| Poison | After `max_attempts` claims → `dead`, not returned |
-| TTL | `Client.Start` purges expired messages/deliveries |
-| Delay | Relative publish defer via `available_at`; max 90d; requires TTL > Delay |
-| Stats | counters in UTC day buckets (flushed async, pruned after `StatsRetentionDays`); backlog is a live COUNT — see [Stats](#stats) |
+| Delivery | At-least-once; ack needs matching `lease_token` |
+| Compete | Multi-process safe per driver (see guide) |
+| Poison | After `max_attempts` → `dead` |
+| TTL / delay | Background purge; publish-time delay up to 90d |
 
-## Architecture
-
-```
-novaque/
-  client.go           # Client, Consumer, Publish / Subscribe
-  example_test.go     # godoc Example functions (compile-verified)
-  logger.go           # Logger interface, zap adapter, silent Nop default
-  store/
-    store.go          # Store interface (dialect-agnostic)
-    cached.go         # WithCache — memoize EnsureTopic / EnsureChannel
-  driver/mysql/       # MySQL Store + schema.sql
-  driver/postgres/    # PostgreSQL 14+ Store + schema.sql
-  driver/sqlite/      # SQLite Store + schema.sql (pure-Go modernc driver)
-  admin/              # mountable admin UI + JSON API (stdlib http.Handler)
-  cmd/example/        # local HTTP demo: admin UI + publish/subscribe hooks
-  cmd/loadtest/       # local publish/consume stress tool
-  internal/testmysql/    # testcontainers helper (MySQL integration tests)
-  internal/testpostgres/ # testcontainers helper (PostgreSQL integration tests)
-  internal/testsqlite/   # temp-file helper (SQLite integration tests; no Docker)
-```
-
-- Domain code talks only to `store.Store`; dialect SQL/locking stays inside each `driver/` package.
-- `Open` wraps the driver with `store.WithCache` so steady-state publish/subscribe skips name→id round-trips.
-- Claim path uses **channel id** and denormalized `expires_at` on `novaque_deliveries` (no hot-path JOIN).
-- Each consumer runs **one batch poller** + `MaxInFlight` workers (Solid Queue–style), not N independent empty polls.
-
-## Testing
+## Development
 
 ```bash
 go test ./...
-
-# MySQL/PostgreSQL integration need Docker; SQLite integration needs none
-go test -tags=integration ./...
-
-# one dialect at a time
-go test -tags=integration ./driver/sqlite/...
-go test -tags=integration ./driver/postgres/...
-go test -tags=integration ./driver/mysql/...
+go test -tags=integration ./...   # MySQL/Postgres: Docker; SQLite: none
 ```
 
-### Example server (admin + publish/subscribe)
+## Status
 
-```bash
-# boots MySQL 8 via testcontainers, serves admin at /admin/
-go run ./cmd/example
+**Shipped:** three SQL drivers, fan-out publish, claim/ack/requeue, delay, reaper, TTL, stats, admin UI, loadtest.
 
-# publish and inspect the demo consumer
-curl -sS -X POST http://127.0.0.1:8080/demo/publish -d 'hello'
-curl -sS http://127.0.0.1:8080/demo/stats
-```
-
-Flags: `-addr`, `-dsn`, `-topic`, `-channel`, `-admin-user`, `-admin-pass`, `-pool`. Open `http://127.0.0.1:8080/admin/` for the dashboard.
-
-### Load test
-
-```bash
-# boots MySQL 8 via testcontainers
-go run ./cmd/loadtest
-
-NOVAQUE_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/novaque?parseTime=true&loc=UTC' \
-  go run ./cmd/loadtest -n 10000 -publishers 8 -max-inflight 32
-```
-
-Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
-
-## Status / non-goals
-
-Shipped: MySQL, PostgreSQL 14+, and SQLite drivers, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), mountable admin UI (`novaque/admin`), loadtest, complete identifier-first godoc with compile-verified examples.
-
-Not supported: third-party broker wire protocols, standalone broker daemon, deferred requeue/backoff.
+**Not supported:** third-party broker wire protocols, standalone broker daemon, deferred requeue/backoff.
