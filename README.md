@@ -4,6 +4,16 @@ Embeddable Go library for **NSQ-style pub/sub** on a relational database.
 
 You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. Topics fan out to channels; consumers on the same channel compete. Delivery is **at-least-once** with lease + ack.
 
+## Why novaque?
+
+Many apps already need a relational database for their core data. Adding a separate message broker (Kafka, NSQ, RabbitMQ, and similar) means another cluster to provision, secure, monitor, and upgrade — plus the glue (clients, credentials, networking, back-pressure) between your app and that second system.
+
+**Fewer moving parts.** novaque is an embeddable Go library, not a daemon. Queue semantics live in the same database connection pool you already operate. Deployment stays “app + DB”; there is no broker fleet beside them.
+
+**Databases are ready for queue workloads.** Modern engines expose the primitives queue implementations need: durable rows, transactional fan-out, and safe concurrent claiming (`FOR UPDATE SKIP LOCKED` on MySQL and PostgreSQL; serializable transactions on SQLite). You keep one durability and backup story instead of splitting it across broker and DB.
+
+novaque maps familiar **topic → channel** pub/sub (NSQ-style multicast + competing consumers within a channel) onto those patterns — at-least-once delivery with explicit ack — so you can defer a dedicated broker until scale or product requirements truly require one.
+
 | | |
 |---|---|
 | Topology | topic → channels (multicast); compete within a channel |
