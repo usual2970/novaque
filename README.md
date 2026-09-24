@@ -1,6 +1,6 @@
 # novaque
 
-Embeddable Go library for **NSQ-style pub/sub** on a relational database.
+Embeddable Go library for **topic → channel pub/sub** on a relational database.
 
 You bring a `*sql.DB`; novaque runs inside your process — no broker daemon. Topics fan out to channels; consumers on the same channel compete. Delivery is **at-least-once** with lease + ack.
 
@@ -12,7 +12,7 @@ Many apps already need a relational database for their core data. Adding a separ
 
 **Databases are ready for queue workloads.** Modern engines expose the primitives queue implementations need: durable rows, transactional fan-out, and safe concurrent claiming (`FOR UPDATE SKIP LOCKED` on MySQL and PostgreSQL; serializable transactions on SQLite). You keep one durability and backup story instead of splitting it across broker and DB.
 
-novaque maps familiar **topic → channel** pub/sub (NSQ-style multicast + competing consumers within a channel) onto those patterns — at-least-once delivery with explicit ack — so you can defer a dedicated broker until scale or product requirements truly require one.
+novaque maps **topic → channel** pub/sub (multicast to every channel plus competing consumers within a channel) onto those patterns — at-least-once delivery with explicit ack — so you can defer a dedicated broker until scale or product requirements truly require one.
 
 | | |
 |---|---|
@@ -20,6 +20,12 @@ novaque maps familiar **topic → channel** pub/sub (NSQ-style multicast + compe
 | Durability | rows in MySQL or PostgreSQL (`SKIP LOCKED`) or SQLite (serializable transactions) |
 | Extensibility | `store.Store` seam — MySQL, PostgreSQL, and SQLite drivers all ship |
 | Form | library module, not a long-running service |
+
+## Architecture
+
+<img src="docs/architecture/images/novaque-publish-to-consumer-en.png" alt="Publish → Topic → Channel → Consumer" width="560" />
+
+One **Publish** writes a message under a **Topic** and fans out one **delivery** row per existing **Channel**. **Consumers** claim work on a channel (`SKIP LOCKED` or equivalent), run your handler, then **Ack** or **Requeue** with a lease token.
 
 ## Install
 
@@ -211,7 +217,7 @@ Publisher ──Publish──▶ topic ──fan-out──▶ channel A ──co
 | Field | Role |
 |-------|------|
 | `TTL` | retention from publish time (overrides `DefaultTTL` when set) |
-| `Delay` | relative defer until first claim (NSQ `DPUB`-style); max **90 days** (`MaxDelay`) |
+| `Delay` | relative defer until first claim; max **90 days** (`MaxDelay`) |
 | `MaxAttempts` | poison threshold for this message |
 
 `Delay` must be **strictly less than** effective TTL (after `DefaultTTL` fill), measured in whole Unix seconds — otherwise Publish returns `ErrDelayExceedsTTL`. Over-max returns `ErrDelayTooLong`; negative returns `ErrDelayNegative`. Handler failure still requeues **immediately** (publish delay only).
@@ -399,4 +405,4 @@ Flags: `-n`, `-publishers`, `-max-inflight`, `-body`, `-pool`, `-dsn`.
 
 Shipped: MySQL, PostgreSQL 14+, and SQLite drivers, publish fan-out, subscribe/claim/ack/requeue, publish-time Delay (max 90d), reaper, TTL, in-process name cache, injectable logging (zap Nop default), DB-backed queue stats (day-bucket counters + live backlog), mountable admin UI (`novaque/admin`), loadtest, complete identifier-first godoc with compile-verified examples.
 
-Not in MVP: NSQ wire protocol, standalone broker, deferred requeue/backoff.
+Not supported: third-party broker wire protocols, standalone broker daemon, deferred requeue/backoff.
